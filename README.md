@@ -14,13 +14,25 @@ not need. The backend works directly on the IR instead.
 
 ## Pipeline
 
-| Pass | File | What it does |
-|------|------|--------------|
-| Analysis | `src/analysis.rs` | RPO, deduplicated CFG edges, dominators, loop headers, merge nodes, reducibility, value-level DCE, use counts |
-| Stackify | `src/stackify.rs` | Greedy backwards tree building: a single-use def in the same block is folded into its user unless that would reorder side effects. The check is O(1) using Cranelift-style side-effect colors. Constants are rematerialized at every use |
-| Locals | `src/locals.rs` | Values not passed on the stack get locals. Live ranges are per-block segments from SSA liveness; greedy coloring per wasm type that first tries the local of a branch argument's partner (parameter ↔ argument), so most block-argument moves disappear |
-| Structure | `src/structure.rs` | Ramsey's "Beyond Relooper" (ICFP 2022) over the dominator tree, run with an explicit task stack. Irreducible CFGs fall back to a `loop` + `br_table` dispatcher |
-| Lower | `src/lower.rs` | Per-opcode emission, plus a `local.set x; local.get x` → `local.tee x` peephole |
+| Pass | File | What it does | Switch |
+|------|------|--------------|--------|
+| Analysis | `src/analysis.rs` | RPO, deduplicated CFG edges, dominators, loop headers, merge nodes, reducibility, value-level DCE, use counts | |
+| Stackify | `src/stackify.rs` | Greedy backwards tree building: a single-use def in the same block is folded into its user unless that would reorder side effects. The check is O(1) using Cranelift-style side-effect colors. Constants are rematerialized at every use. `operands()` here defines evaluation order for every later pass | `stackify` |
+| Liveness | `src/liveness.rs` | Positions, and per-block live-range segments for the values that need a local; collects block-argument moves | |
+| Locals | `src/locals.rs` | Greedy coloring per wasm type. A value first tries its move partner's local (argument ↔ parameter), so most block-argument moves disappear | `coalesce` |
+| Structure | `src/structure.rs` | Ramsey's "Beyond Relooper" (ICFP 2022) over the dominator tree, run with an explicit task stack. Irreducible CFGs fall back to a `loop` + `br_table` dispatcher | |
+| Emit | `src/emit.rs` | Emitter state, value emission, and the operand cursor that lowering takes operands from | |
+| Lower | `src/lower.rs` | One case per opcode | |
+| Encode | `src/encode.rs` | Byte encoding with a `local.set x; local.get x` → `local.tee x` peephole; scratch and other extra locals | `use_tee` |
+
+Cross-module contracts are each stated in one place:
+
+- **Evaluation order:** `stackify::operands` defines it, and lowering pulls
+  operands from it through `Emitter::operand`. Branches are the one
+  documented exception.
+- **When a block-argument move can be skipped:** `Locals::move_needed`
+  depends on the live-range conventions documented at the top of
+  `liveness.rs`.
 
 The stackifier's safety condition: `color[i]` counts the effectful
 instructions before `i` in its block. An effectful def `d` may join the tree
@@ -65,7 +77,8 @@ memory, a funcref table, globals, exports) for simple cases and tests.
 
 `Config` options: `memory64`, `memory_index`, `table_index`,
 `stack_pointer_global`, `tail_calls` (use `return_call`, or fall back to
-call + return), and `use_tee`.
+call + return). The optimizations can be switched off individually,
+mainly for comparisons: `stackify`, `coalesce` and `use_tee`.
 
 ## Supported
 
@@ -125,7 +138,8 @@ cargo run --example wasm2wat -- target/bench/kernels-default.wasm
 ```
 
 `benches/codegen.rs` compares a `naive` configuration (`stackify: false`,
-`use_tee: false`) with the default one on three corpora:
+`use_tee: false`), a `no-coalesce` one and the default one on three
+corpora:
 
 - nine kernels in `tests/harness/kernels.rs` (fib, sieve, matmul, crc32,
   insertion sort, mandelbrot, collatz, a `br_table` state machine, recursive
@@ -154,6 +168,10 @@ before → after):
 | `local.get` | 128,546 → 92,772 (−28%) | 210 → 201 |
 | `local.set` | 70,171 → 34,397 (−51%) | 116 → 107 |
 | compile time | 57 → 64 µs/function (+12%) | |
+
+Of these gains, the move hints alone (`coalesce: false` vs. default, on 200 random
+functions) account for 33% fewer `local.set`s and 6% fewer bytes. The rest
+comes from the precise live ranges.
 
 Kernel runtime, median ms:
 
