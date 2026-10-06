@@ -19,6 +19,9 @@ fn main() {
     paths.sort();
 
     let (mut passed, mut failed, mut clean_files) = (0, 0, 0);
+    // Files that only run under Cranelift's interpreter (`test interpret`
+    // without `test run`) may encode interpreter-specific behavior.
+    let mut interp_only_failures = Vec::new();
     let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
     let mut failing_files = Vec::new();
     std::panic::set_hook(Box::new(|_| {}));
@@ -60,6 +63,10 @@ fn main() {
                     println!("{file}: {first}");
                 }
             }
+            Ok(Ok(out)) if !out.failures.is_empty() && !text.contains("test run") => {
+                passed += out.passed;
+                interp_only_failures.push(format!("{file}:\n    {}", out.failures.join("\n    ")));
+            }
             Ok(Ok(out)) => {
                 passed += out.passed;
                 failed += out.failures.len();
@@ -92,6 +99,12 @@ fn main() {
     println!("== failures ==");
     for f in &failing_files {
         println!("{f}");
+    }
+    if !interp_only_failures.is_empty() {
+        println!("== failures in interpreter-only files ==");
+        for f in &interp_only_failures {
+            println!("{f}");
+        }
     }
     println!(
         "== {} files, {clean_files} fully supported; {passed} runs passed, {failed} failed ==",

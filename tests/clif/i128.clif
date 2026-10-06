@@ -1,0 +1,90 @@
+test run
+
+function %add_mul(i128, i128) -> i128, i128 {
+block0(v0: i128, v1: i128):
+    v2 = iadd v0, v1
+    v3 = imul v0, v1
+    return v2, v3
+}
+; run: %add_mul(0xffffffffffffffff, 1) == [0x10000000000000000, 0xffffffffffffffff]
+; run: %add_mul(-1, -1) == [-2, 1]
+; run: %add_mul(0x123456789abcdef0123456789abcdef, 0x10000000000000000) == [0x123456789abcdf00123456789abcdef, 0x0123456789abcdef0000000000000000]
+
+function %shifts(i128, i32) -> i128, i128, i128, i128 {
+block0(v0: i128, v1: i32):
+    v2 = ishl v0, v1
+    v3 = ushr v0, v1
+    v4 = sshr v0, v1
+    v5 = rotl v0, v1
+    return v2, v3, v4, v5
+}
+; run: %shifts(0x8000000000000000_0000000000000001, 0) == [0x8000000000000000_0000000000000001, 0x8000000000000000_0000000000000001, 0x8000000000000000_0000000000000001, 0x8000000000000000_0000000000000001]
+; run: %shifts(0x8000000000000000_0000000000000001, 64) == [0x0000000000000001_0000000000000000, 0x8000000000000000, -0x8000000000000000, 0x0000000000000001_8000000000000000]
+; run: %shifts(0x8000000000000000_0000000000000001, 129) == [0x0000000000000000_0000000000000002, 0x4000000000000000_0000000000000000, 0xc000000000000000_0000000000000000, 0x0000000000000000_0000000000000003]
+
+function %divrem(i128, i128) -> i128, i128, i128, i128 {
+block0(v0: i128, v1: i128):
+    v2 = udiv v0, v1
+    v3 = urem v0, v1
+    v4 = sdiv v0, v1
+    v5 = srem v0, v1
+    return v2, v3, v4, v5
+}
+; run: %divrem(1000000000000000000000000000000, 7) == [142857142857142857142857142857, 1, 142857142857142857142857142857, 1]
+; run: %divrem(-100, 7) == [48611766702991209066196372490252601622, 2, -14, -2]
+
+function %cmp(i128, i128) -> i8, i8, i8 {
+block0(v0: i128, v1: i128):
+    v2 = icmp slt v0, v1
+    v3 = icmp ult v0, v1
+    v4 = icmp eq v0, v1
+    return v2, v3, v4
+}
+; run: %cmp(-1, 1) == [1, 0, 0]
+; run: %cmp(0x10000000000000000, 0xffffffffffffffff) == [0, 0, 0]
+
+function %convert(i128) -> f64, f32 {
+block0(v0: i128):
+    v1 = fcvt_from_sint.f64 v0
+    v2 = fcvt_from_uint.f32 v0
+    return v1, v2
+}
+; run: %convert(-1) == [-0x1.0, +Inf]
+; run: %convert(0x200000000000000000000000000001) == [0x1.0p117, 0x1.0p117]
+
+; i128 values passed to another function and carried around a loop.
+function %square(i128) -> i128 {
+block0(v0: i128):
+    v1 = imul v0, v0
+    return v1
+}
+
+function %pow2k(i128, i32) -> i128 {
+    fn0 = %square(i128) -> i128
+block0(v0: i128, v1: i32):
+    jump block1(v0, v1)
+block1(v2: i128, v3: i32):
+    brif v3, block2, block3
+block2:
+    v4 = call fn0(v2)
+    v5 = iconst.i32 1
+    v6 = isub v3, v5
+    jump block1(v4, v6)
+block3:
+    return v2
+}
+; run: %pow2k(3, 3) == 6561
+; run: %pow2k(3, 6) == 3433683820292512484657849089281
+
+function %mem(i128) -> i128 {
+    ss0 = explicit_slot 16, align = 16
+block0(v0: i128):
+    v1 = stack_addr.i32 ss0
+    store v0, v1
+    v2 = load.i64 v1+8
+    v3 = load.i128 v1
+    v4 = uextend.i128 v2
+    v5 = iadd v3, v4
+    return v5
+}
+; run: %mem(0x0000000000000005_0000000000000001) == 0x0000000000000005_0000000000000006

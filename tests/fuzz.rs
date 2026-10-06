@@ -2,9 +2,10 @@
 //! interpreter and, compiled by this backend, in wasmtime. Results (or the fact
 //! that both trap) must agree.
 //!
-//! Each seed gives two functions: scalar only, and with vector code.
-//! `FUZZ_ITERS` sets the number of seeds (default 150), `FUZZ_SEED` the
-//! first seed, and `FUZZ_ONLY=scalar|simd` restricts the kind.
+//! Each seed gives three functions: scalar only, with vector code, and with
+//! `i128` code. `FUZZ_ITERS` sets the number of seeds (default 150),
+//! `FUZZ_SEED` the first seed, and `FUZZ_ONLY=scalar|simd|i128` restricts
+//! the kind.
 
 mod harness;
 
@@ -14,12 +15,13 @@ use cranelift_interpreter::environment::FunctionStore;
 use cranelift_interpreter::interpreter::{Interpreter, InterpreterState};
 use cranelift_interpreter::step::ControlFlow;
 use cranelift_wasm_backend::Config;
-use harness::clifgen::{Rng, arg, generate, generate_simd};
+use harness::clifgen::{Rng, arg, generate, generate_i128, generate_simd};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     Scalar,
     Simd,
+    I128,
 }
 
 #[test]
@@ -39,15 +41,17 @@ fn differential() {
     let only = match std::env::var("FUZZ_ONLY").as_deref() {
         Ok("scalar") => Some(Kind::Scalar),
         Ok("simd") => Some(Kind::Simd),
+        Ok("i128") => Some(Kind::I128),
         _ => None,
     };
     let runs = (seed0..seed0 + iters)
-        .flat_map(|seed| [(seed, Kind::Scalar), (seed, Kind::Simd)])
+        .flat_map(|seed| [(seed, Kind::Scalar), (seed, Kind::Simd), (seed, Kind::I128)])
         .filter(|&(_, kind)| only.is_none_or(|o| o == kind));
     for (seed, kind) in runs {
         let (func, params) = match kind {
             Kind::Scalar => generate(seed),
             Kind::Simd => generate_simd(seed),
+            Kind::I128 => generate_i128(seed),
         };
         cranelift_codegen::verify_function(
             &func,

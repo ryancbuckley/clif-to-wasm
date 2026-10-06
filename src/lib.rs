@@ -5,6 +5,8 @@
 //! are built around register allocation, which a stack machine with unlimited
 //! locals does not need. Instead the pipeline is:
 //!
+//! 0. **Legalization** ([`legalize_i128`]): `i128` values become pairs of
+//!    `i64`s, so the later passes only see types wasm has.
 //! 1. **Analysis** ([`analysis`]): reachability, reverse postorder, CFG edges,
 //!    dominators, loop headers and merge nodes, value-level dead code
 //!    elimination and use counts.
@@ -29,6 +31,7 @@ use wasm_encoder::ValType;
 mod analysis;
 mod emit;
 mod encode;
+mod legalize_i128;
 mod liveness;
 mod locals;
 mod lower;
@@ -234,18 +237,21 @@ pub fn wasm_type(ty: ir::Type) -> Result<ValType> {
 }
 
 /// The wasm signature of a Cranelift signature.
+///
+/// An `i128` parameter or return value becomes two `i64`s, low half first.
 pub fn wasm_signature(sig: &Signature) -> Result<(Vec<ValType>, Vec<ValType>)> {
-    let params = sig
-        .params
-        .iter()
-        .map(|p| wasm_type(p.value_type))
-        .collect::<Result<_>>()?;
-    let results = sig
-        .returns
-        .iter()
-        .map(|p| wasm_type(p.value_type))
-        .collect::<Result<_>>()?;
-    Ok((params, results))
+    let lower = |ps: &[ir::AbiParam]| -> Result<Vec<ValType>> {
+        let mut out = Vec::with_capacity(ps.len());
+        for p in ps {
+            if p.value_type == ir::types::I128 {
+                out.extend([ValType::I64, ValType::I64]);
+            } else {
+                out.push(wasm_type(p.value_type)?);
+            }
+        }
+        Ok(out)
+    };
+    Ok((lower(&sig.params)?, lower(&sig.returns)?))
 }
 
 /// Compile one function.
@@ -254,14 +260,18 @@ pub fn compile_function(
     config: &Config,
     env: &mut dyn Env,
 ) -> Result<CompiledFunction> {
-    // The passes assume alias-free IR. Resolving needs a mutable copy, so
-    // only make one when an alias is actually used.
-    let resolved;
-    let func = if uses_aliases(func) {
+    // The passes assume alias-free IR without `i128`. Both fixes need a
+    // mutable copy, so only make one when needed.
+    let rewritten;
+    let (aliases, wide) = scan(func);
+    let func = if aliases || wide {
         let mut f = func.clone();
         f.dfg.resolve_all_aliases();
-        resolved = f;
-        &resolved
+        if wide {
+            legalize_i128::legalize(&mut f)?;
+        }
+        rewritten = f;
+        &rewritten
     } else {
         func
     };
@@ -272,10 +282,24 @@ pub fn compile_function(
     structure::emit_function(func, config, env, &info, &stack, locals)
 }
 
-fn uses_aliases(func: &ir::Function) -> bool {
+/// One pass over the function: does it use value aliases, and does it
+/// involve `i128` anywhere (signatures, block parameters or results)?
+fn scan(func: &ir::Function) -> (bool, bool) {
     let dfg = &func.dfg;
-    func.layout
-        .blocks()
-        .flat_map(|b| func.layout.block_insts(b))
-        .any(|inst| dfg.inst_values(inst).any(|v| dfg.value_is_alias(v)))
+    let mut aliases = false;
+    let mut wide = legalize_i128::signatures_need(func);
+    for b in func.layout.blocks() {
+        wide |= dfg
+            .block_params(b)
+            .iter()
+            .any(|&p| dfg.value_type(p) == ir::types::I128);
+        for inst in func.layout.block_insts(b) {
+            aliases |= dfg.inst_values(inst).any(|v| dfg.value_is_alias(v));
+            wide |= dfg
+                .inst_results(inst)
+                .iter()
+                .any(|&r| dfg.value_type(r) == ir::types::I128);
+        }
+    }
+    (aliases, wide)
 }
