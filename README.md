@@ -16,13 +16,14 @@ not need. The backend works directly on the IR instead.
 
 | Pass | File | What it does | Switch |
 |------|------|--------------|--------|
+| Legalize | `src/legalize_i128.rs` | Rewrites `i128` values into `(lo, hi)` pairs of `i64` (signatures, block params, calls) before anything else runs; only when a function uses `i128` | |
 | Analysis | `src/analysis.rs` | RPO, deduplicated CFG edges, dominators, loop headers, merge nodes, reducibility, value-level DCE, use counts | |
 | Stackify | `src/stackify.rs` | Greedy backwards tree building: a single-use def in the same block is folded into its user unless that would reorder side effects. The check is O(1) using Cranelift-style side-effect colors. Constants are rematerialized at every use. `operands()` here defines evaluation order for every later pass | `stackify` |
 | Liveness | `src/liveness.rs` | Positions, and per-block live-range segments for the values that need a local; collects block-argument moves | |
 | Locals | `src/locals.rs` | Greedy coloring per wasm type. A value first tries its move partner's local (argument ↔ parameter), so most block-argument moves disappear | `coalesce` |
 | Structure | `src/structure.rs` | Ramsey's "Beyond Relooper" (ICFP 2022) over the dominator tree, run with an explicit task stack. Irreducible CFGs fall back to a `loop` + `br_table` dispatcher | |
 | Emit | `src/emit.rs` | Emitter state, value emission, and the operand cursor that lowering takes operands from | |
-| Lower | `src/lower.rs` | One case per opcode | |
+| Lower | `src/lower.rs`, `src/lower_simd.rs` | One case per opcode; vector operations in their own module | |
 | Encode | `src/encode.rs` | Byte encoding with a `local.set x; local.get x` → `local.tee x` peephole; scratch and other extra locals | `use_tee` |
 
 Cross-module contracts are each stated in one place:
@@ -88,11 +89,35 @@ loads/stores (all widths, negative offsets), stack slots, `call`,
 `call_indirect`, `return_call(_indirect)`, `func_addr`, `symbol_value`,
 `br_table`, traps, `get_stack_pointer`/`get_frame_pointer`.
 
+`i128` is supported by legalizing it into pairs of `i64`
+(`src/legalize_i128.rs`). At the wasm level an `i128` parameter or result is
+two `i64`s, low half first. Arithmetic, bitwise ops, shifts and rotates,
+comparisons, `select`, extensions and truncations, `clz`/`ctz`/`popcnt`/
+`cls`, `bswap`/`bitrev`, loads and stores, calls, block parameters, and
+bitcasts to and from 128-bit vectors expand into `i64` code. Division and
+remainder become a 128-iteration shift-subtract loop, and conversions from
+`i128` to floats are correctly rounded (round to odd, then convert).
+
+128-bit vectors (`i8x16`, `i16x8`, `i32x4`, `i64x2`, `f32x4`, `f64x2`) map to
+`v128` (`src/lower_simd.rs`). Most operations map to a single wasm SIMD
+instruction. These have no direct wasm counterpart and are emulated:
+
+- `imul.i8x16`, `umulhi`/`smulhi`: widening multiplies plus a shuffle.
+- `iadd_pairwise`: two shuffles and an add.
+- `i64x2` unsigned comparisons and min/max: flip the sign bits.
+- `uunarrow`: unsigned clamp, then narrow.
+- `popcnt` of 16/32/64-bit lanes: byte popcounts summed pairwise.
+- `i64x2` ↔ `f64x2` conversions: lane by lane through scalars.
+
 Not yet supported (functions using these return `Error::Unsupported`):
-SIMD types, `i128`, `f16`/`f128`, big-endian memory access,
-`bswap`/`bitrev`, multi-result overflow ops (`*_overflow`), 64-bit
-`umulhi`/`smulhi`, narrow `fcvt_*_sat`, bitwise ops on floats, atomics,
-`fma`, exceptions (`try_call`), and dynamic stack slots.
+
+- **Vectors:** vectors narrower than 128 bits (`i32x2`, `i8x8`, …), `fma`,
+  64-bit-lane `umulhi`/`smulhi`, saturating/averaging ops on 32/64-bit
+  lanes, `snarrow`/`unarrow` from `i64x2`, and dynamic vectors.
+- **Scalars:** `f16`/`f128`, big-endian memory access, multi-result
+  overflow ops (`*_overflow`), `umulhi`/`smulhi` on `i128`, narrow
+  `fcvt_*_sat`, bitwise ops on floats.
+- **Other:** atomics, exceptions (`try_call`), dynamic stack slots.
 
 ## Testing
 
@@ -112,19 +137,41 @@ cargo run --example runclif  -- tests/clif/control.clif
 ```
 
 - `tests/clif/*.clif` are Cranelift filetests with `; run:` lines. Each one is
-  compiled, validated with `wasmparser` and executed in wasmtime under three
-  configs (default, no-tee, memory64).
+  compiled, validated with `wasmparser` and executed in wasmtime under four
+  configs (default, no-tee, no-coalesce, memory64). As in Cranelift's own
+  runner, a run command calls the function it is attached to.
 - `tests/fuzz.rs` builds random functions with `cranelift-frontend`
   (arithmetic, conversions, loads/stores, diamonds, loops, `br_table`,
-  traps). It runs them in `cranelift-interpreter` and as wasm, and compares
-  results or traps.
-- Upstream runtests: 8603 run commands pass and 0 fail. The rest are skipped
-  as unsupported, mostly SIMD and `i128`.
+  traps) and runs them in `cranelift-interpreter` and as wasm, comparing
+  results or traps. Each seed gives three functions: scalar only, with
+  vector code, and with `i128` code.
+- `tests/simd_ops.rs` checks every vector operation on every vector type it
+  accepts, with random inputs, against the interpreter.
+- Upstream runtests: 11,531 run commands pass and 0 fail; 306 of 395 files
+  are fully supported. The rest are skipped as unsupported, mostly
+  sub-128-bit vectors, two-result overflow ops, atomics, `f16`/`f128` and
+  big-endian memory. Files that only run under Cranelift's interpreter
+  (`test interpret` without `test run`) are reported separately:
+  `i128-conversion.clif` expects the interpreter's saturating
+  float-to-`i128` conversion where Cranelift's semantics (and this backend)
+  give the exact value or trap.
 
 ### Notes
 
 - The interpreter traps on `INT_MIN srem -1`, which Cranelift defines as 0.
   The fuzzer avoids that case.
+- NaN bit patterns are nondeterministic in wasm, and the interpreter keeps
+  signaling NaNs that hardware quiets. Results compare all NaNs as equal,
+  per lane for float vectors. Wherever the fuzzer reinterprets float bits
+  as integers (stores, bitcasts, shuffles, bitwise ops), it canonicalizes
+  NaNs first.
+- The interpreter panics on `avg_round`, so only the upstream runtests
+  cover it. It also saturates float-to-`i128` conversions instead of
+  trapping, so the fuzzer does not generate those.
+- `iconst.i128` is not valid IR in this Cranelift version (the verifier
+  rejects it); generated `i128` constants are built with `iconcat`. The
+  backend still accepts `iconst.i128`, zero-extending the immediate like
+  Cranelift's x64 backend.
 - Tests originally ran on wasmi 2.0.0, which miscomputed one fuzz case that
   V8 and the interpreter agree on. That is why execution now uses wasmtime.
 
@@ -204,8 +251,8 @@ Findings:
 
 ## Possible next steps
 
-- `i128` (as i64 pairs), SIMD (`v128`), atomics, and the remaining scalar
-  ops.
+- Atomics, two-result overflow ops, sub-128-bit vectors and the other
+  unsupported operations listed above.
 - Operand commutation and pre-passes that increase the number of
   single-use values (as LLVM does).
 - Compile speed: the allocator, analysis and emission each take roughly a
