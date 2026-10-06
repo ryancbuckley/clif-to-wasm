@@ -1,0 +1,80 @@
+test run
+
+function %farith(f64, f64) -> f64, f64, f64, f64 {
+block0(v0: f64, v1: f64):
+    v2 = fadd v0, v1
+    v3 = fsub v0, v1
+    v4 = fmul v0, v1
+    v5 = fdiv v0, v1
+    return v2, v3, v4, v5
+}
+; run: %farith(0x3.0, 0x2.0) == [0x5.0, 0x1.0, 0x6.0, 0x1.8]
+
+function %funary(f32) -> f32, f32, f32, f32, f32, f32 {
+block0(v0: f32):
+    v1 = fneg v0
+    v2 = fabs v0
+    v3 = floor v0
+    v4 = ceil v0
+    v5 = trunc v0
+    v6 = nearest v0
+    return v1, v2, v3, v4, v5, v6
+}
+; run: %funary(-0x1.8) == [0x1.8, 0x1.8, -0x2.0, -0x1.0, -0x1.0, -0x2.0]
+
+function %fcmp(f32, f32) -> i8, i8, i8, i8, i8, i8, i8 {
+block0(v0: f32, v1: f32):
+    v2 = fcmp uno v0, v1
+    v3 = fcmp ord v0, v1
+    v4 = fcmp one v0, v1
+    v5 = fcmp ueq v0, v1
+    v6 = fcmp ult v0, v1
+    v7 = fcmp ne v0, v1
+    v8 = fcmp lt v0, v1
+    return v2, v3, v4, v5, v6, v7, v8
+}
+; run: %fcmp(0x1.0, 0x2.0) == [0, 1, 1, 0, 1, 1, 1]
+; run: %fcmp(0x1.0, 0x1.0) == [0, 1, 0, 1, 0, 0, 0]
+; run: %fcmp(+NaN, 0x1.0) == [1, 0, 0, 1, 1, 1, 0]
+
+function %conv(f64) -> i32, i64, f32 {
+block0(v0: f64):
+    v1 = fcvt_to_sint.i32 v0
+    v2 = fcvt_to_uint.i64 v0
+    v3 = fdemote.f32 v0
+    return v1, v2, v3
+}
+; run: %conv(0x1.8p4) == [24, 24, 0x1.8p4]
+
+function %sat(f32) -> i32, i32 {
+block0(v0: f32):
+    v1 = fcvt_to_sint_sat.i32 v0
+    v2 = fcvt_to_uint_sat.i32 v0
+    return v1, v2
+}
+; run: %sat(-0x1.0p40) == [0x80000000, 0]
+; run: %sat(+NaN) == [0, 0]
+
+function %from_int(i8, i64) -> f64, f32 {
+block0(v0: i8, v1: i64):
+    v2 = fcvt_from_sint.f64 v0
+    v3 = fcvt_from_uint.f32 v1
+    return v2, v3
+}
+; run: %from_int(-3, 16) == [-0x3.0, 0x10.0]
+
+function %bitcast(f32) -> i32 {
+block0(v0: f32):
+    v1 = bitcast.i32 v0
+    return v1
+}
+; run: %bitcast(0x1.0) == 0x3f800000
+
+function %minmaxf(f64, f64) -> f64, f64, f64 {
+block0(v0: f64, v1: f64):
+    v2 = fmin v0, v1
+    v3 = fmax v0, v1
+    v4 = fcopysign v0, v1
+    return v2, v3, v4
+}
+; run: %minmaxf(0x1.0, -0x2.0) == [-0x2.0, 0x1.0, -0x1.0]

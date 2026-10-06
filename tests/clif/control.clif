@@ -1,0 +1,216 @@
+test run
+
+function %if_else(i32) -> i32 {
+block0(v0: i32):
+    brif v0, block1, block2
+block1:
+    v1 = iconst.i32 10
+    jump block3(v1)
+block2:
+    v2 = iconst.i32 20
+    jump block3(v2)
+block3(v3: i32):
+    v4 = iadd v3, v0
+    return v4
+}
+; run: %if_else(1) == 11
+; run: %if_else(0) == 20
+
+function %sum_to(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 0
+    jump block1(v0, v1)
+block1(v2: i32, v3: i32):
+    brif v2, block2, block3
+block2:
+    v4 = iadd v3, v2
+    v5 = iconst.i32 1
+    v6 = isub v2, v5
+    jump block1(v6, v4)
+block3:
+    return v3
+}
+; run: %sum_to(10) == 55
+; run: %sum_to(0) == 0
+
+; Fibonacci with a parallel swap of block parameters.
+function %fib(i32) -> i64 {
+block0(v0: i32):
+    v1 = iconst.i64 0
+    v2 = iconst.i64 1
+    jump block1(v0, v1, v2)
+block1(v3: i32, v4: i64, v5: i64):
+    brif v3, block2, block3
+block2:
+    v6 = iadd v4, v5
+    v7 = iconst.i32 1
+    v8 = isub v3, v7
+    jump block1(v8, v5, v6)
+block3:
+    return v4
+}
+; run: %fib(10) == 55
+; run: %fib(90) == 2880067194370816120
+
+function %swap_loop(i32, i32, i32) -> i32 {
+block0(v0: i32, v1: i32, v2: i32):
+    jump block1(v0, v1, v2)
+block1(v3: i32, v4: i32, v5: i32):
+    brif v5, block2, block3
+block2:
+    v6 = iconst.i32 1
+    v7 = isub v5, v6
+    jump block1(v4, v3, v7)
+block3:
+    v8 = iconst.i32 10
+    v9 = imul v3, v8
+    v10 = iadd v9, v4
+    return v10
+}
+; run: %swap_loop(1, 2, 0) == 12
+; run: %swap_loop(1, 2, 1) == 21
+; run: %swap_loop(1, 2, 5) == 21
+
+function %nested_loops(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 0
+    jump block1(v1, v1)
+block1(v2: i32, v3: i32):
+    v4 = icmp slt v2, v0
+    brif v4, block2(v1, v3), block5
+block2(v5: i32, v6: i32):
+    v7 = icmp slt v5, v2
+    brif v7, block3, block4
+block3:
+    v8 = iadd v6, v5
+    v9 = iconst.i32 1
+    v10 = iadd v5, v9
+    jump block2(v10, v8)
+block4:
+    v11 = iconst.i32 1
+    v12 = iadd v2, v11
+    jump block1(v12, v6)
+block5:
+    return v3
+}
+; run: %nested_loops(5) == 10
+; run: %nested_loops(10) == 120
+
+function %br_table(i32) -> i32 {
+block0(v0: i32):
+    br_table v0, block4, [block1, block2, block3, block1]
+block1:
+    v1 = iconst.i32 100
+    return v1
+block2:
+    v2 = iconst.i32 200
+    return v2
+block3:
+    v3 = iconst.i32 300
+    return v3
+block4:
+    v4 = iconst.i32 -1
+    return v4
+}
+; run: %br_table(0) == 100
+; run: %br_table(1) == 200
+; run: %br_table(2) == 300
+; run: %br_table(3) == 100
+; run: %br_table(4) == -1
+; run: %br_table(-1) == -1
+
+function %br_table_args(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 1
+    v2 = iconst.i64 2
+    br_table v0, block1(v0), [block1(v1), block1(v2), block2]
+block1(v3: i64):
+    v4 = iconst.i64 10
+    v5 = imul v3, v4
+    return v5
+block2:
+    v6 = iconst.i64 7
+    return v6
+}
+; run: %br_table_args(0) == 10
+; run: %br_table_args(1) == 20
+; run: %br_table_args(2) == 7
+; run: %br_table_args(3) == 30
+; run: %br_table_args(0x100000000) == 0xa00000000
+
+function %brif_same(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    brif v0, block1(v1), block1(v1)
+block1(v2: i32):
+    return v2
+}
+; run: %brif_same(0, 5) == 5
+; run: %brif_same(1, 5) == 5
+
+function %brif_i64(i64) -> i32 {
+block0(v0: i64):
+    brif v0, block1, block2
+block1:
+    v1 = iconst.i32 1
+    return v1
+block2:
+    v2 = iconst.i32 2
+    return v2
+}
+; run: %brif_i64(0x100000000) == 1
+; run: %brif_i64(0) == 2
+
+; Two entries into the loop {block1, block2}: irreducible.
+function %irreducible(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = iconst.i32 0
+    brif v0, block1(v2), block2(v2)
+block1(v3: i32):
+    v4 = iconst.i32 1
+    v5 = iadd v3, v4
+    v6 = icmp sge v5, v1
+    brif v6, block3(v5), block2(v5)
+block2(v7: i32):
+    v8 = iconst.i32 10
+    v9 = iadd v7, v8
+    v10 = icmp sge v9, v1
+    brif v10, block3(v9), block1(v9)
+block3(v11: i32):
+    return v11
+}
+; run: %irreducible(1, 25) == 33
+; run: %irreducible(0, 25) == 32
+
+function %trapnz(i32) -> i32 {
+block0(v0: i32):
+    trapnz v0, user1
+    v1 = iconst.i32 42
+    return v1
+}
+; run: %trapnz(0) == 42
+
+function %diamond_chain(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 1
+    brif v0, block1, block2
+block1:
+    v2 = iadd v0, v1
+    jump block3(v2)
+block2:
+    v3 = isub v0, v1
+    jump block3(v3)
+block3(v4: i32):
+    v20 = iconst.i32 5
+    v5 = icmp sgt v4, v20
+    brif v5, block4, block5
+block4:
+    v6 = imul v4, v4
+    jump block6(v6)
+block5:
+    jump block6(v4)
+block6(v7: i32):
+    return v7
+}
+; run: %diamond_chain(0) == -1
+; run: %diamond_chain(3) == 4
+; run: %diamond_chain(9) == 100

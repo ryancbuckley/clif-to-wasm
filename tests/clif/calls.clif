@@ -1,0 +1,97 @@
+test run
+
+function %double(i32) -> i32 {
+block0(v0: i32):
+    v1 = iadd v0, v0
+    return v1
+}
+
+function %call_it(i32) -> i32 {
+    fn0 = %double(i32) -> i32
+block0(v0: i32):
+    v1 = call fn0(v0)
+    v2 = iconst.i32 1
+    v3 = iadd v1, v2
+    return v3
+}
+; run: %call_it(20) == 41
+
+function %pair(i64) -> i64, i64 {
+block0(v0: i64):
+    v1 = iconst.i64 1
+    v2 = iadd v0, v1
+    return v0, v2
+}
+
+function %call_multi(i64) -> i64 {
+    fn0 = %pair(i64) -> i64, i64
+block0(v0: i64):
+    v1, v2 = call fn0(v0)
+    v3 = imul v1, v2
+    return v3
+}
+; run: %call_multi(6) == 42
+
+function %call_ind(i32) -> i32 {
+    sig0 = (i32) -> i32
+    fn0 = %double(i32) -> i32
+block0(v0: i32):
+    v1 = func_addr.i32 fn0
+    v2 = call_indirect sig0, v1(v0)
+    return v2
+}
+; run: %call_ind(7) == 14
+
+function %fact(i64) -> i64 {
+    fn0 = %fact(i64) -> i64
+block0(v0: i64):
+    brif v0, block1, block2
+block1:
+    v1 = iconst.i64 1
+    v2 = isub v0, v1
+    v3 = call fn0(v2)
+    v4 = imul v0, v3
+    return v4
+block2:
+    v5 = iconst.i64 1
+    return v5
+}
+; run: %fact(10) == 3628800
+
+function %tail_count(i32, i32) -> i32 {
+    fn0 = %tail_count(i32, i32) -> i32
+block0(v0: i32, v1: i32):
+    brif v0, block1, block2
+block1:
+    v2 = iconst.i32 1
+    v3 = isub v0, v2
+    v4 = iadd v1, v2
+    return_call fn0(v3, v4)
+block2:
+    return v1
+}
+; run: %tail_count(100000, 0) == 100000
+
+; The callee must not see the caller's stack slot clobbered.
+function %use_slot(i32) -> i32 {
+    ss0 = explicit_slot 4
+block0(v0: i32):
+    v2 = stack_addr.i32 ss0
+    store v0, v2
+    v1 = load.i32 v2
+    return v1
+}
+
+function %slot_across_call(i32) -> i32 {
+    ss0 = explicit_slot 4
+    fn0 = %use_slot(i32) -> i32
+block0(v0: i32):
+    v5 = stack_addr.i32 ss0
+    store v0, v5
+    v1 = iconst.i32 99
+    v2 = call fn0(v1)
+    v3 = load.i32 v5
+    v4 = iadd v2, v3
+    return v4
+}
+; run: %slot_across_call(1) == 100

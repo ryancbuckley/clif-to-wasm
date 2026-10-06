@@ -1,0 +1,99 @@
+test run
+
+function %store_load(i32, i64) -> i64 {
+block0(v0: i32, v1: i64):
+    store v1, v0+8
+    v2 = load.i64 v0+8
+    return v2
+}
+; run: %store_load(16, 0x1122334455667788) == 0x1122334455667788
+
+; The second load must not be folded past the store.
+function %load_store_order(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 5
+    store v1, v0
+    v2 = load.i32 v0
+    v3 = iconst.i32 7
+    store v3, v0
+    v4 = iadd v2, v3
+    return v4
+}
+; run: %load_store_order(100) == 12
+
+; Two loads used in swapped order: one must go through a local.
+function %load_order(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 3
+    store v1, v0
+    v2 = iconst.i32 4
+    store v2, v0+4
+    v3 = load.i32 v0
+    v4 = load.i32 v0+4
+    v5 = isub v4, v3
+    return v5
+}
+; run: %load_order(200) == 1
+
+function %narrow_mem(i32) -> i32, i32, i64, i8 {
+block0(v0: i32):
+    v1 = iconst.i32 0xfffffe80
+    store v1, v0
+    v2 = uload8.i32 v0
+    v3 = sload16.i32 v0
+    v4 = sload8.i64 v0
+    v5 = load.i8 v0
+    return v2, v3, v4, v5
+}
+; run: %narrow_mem(64) == [0x80, -384, -128, 0x80]
+
+function %istore(i32, i64) -> i64 {
+block0(v0: i32, v1: i64):
+    v2 = iconst.i64 0
+    store v2, v0
+    istore16 v1, v0
+    v3 = load.i64 v0
+    return v3
+}
+; run: %istore(32, 0x123456789) == 0x6789
+
+function %neg_offset(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 99
+    store v1, v0-4
+    v2 = load.i32 v0-4
+    return v2
+}
+; run: %neg_offset(100) == 99
+
+function %float_mem(i32, f64) -> f64 {
+block0(v0: i32, v1: f64):
+    store v1, v0
+    v2 = load.f64 v0
+    return v2
+}
+; run: %float_mem(8, 0x1.5) == 0x1.5
+
+function %stack_slots(i32, i32) -> i32 {
+    ss0 = explicit_slot 4
+    ss1 = explicit_slot 8, align = 8
+block0(v0: i32, v1: i32):
+    v10 = stack_addr.i32 ss0
+    store v0, v10
+    v2 = stack_addr.i32 ss1
+    store v1, v2+4
+    v3 = load.i32 v10
+    v4 = load.i32 v2+4
+    v5 = isub v3, v4
+    return v5
+}
+; run: %stack_slots(10, 3) == 7
+
+function %trap_load(i32) -> i32 {
+block0(v0: i32):
+    v1 = load.i32 v0
+    v2 = iconst.i32 1
+    v3 = iadd v1, v2
+    return v3
+}
+; run: %trap_load(0) == 1

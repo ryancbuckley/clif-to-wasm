@@ -1,0 +1,162 @@
+test run
+
+function %add(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = iadd v0, v1
+    return v2
+}
+; run: %add(1, 2) == 3
+; run: %add(-1, 1) == 0
+; run: %add(0x7fffffff, 1) == 0x80000000
+
+function %expr(i64, i64, i64) -> i64 {
+block0(v0: i64, v1: i64, v2: i64):
+    v3 = imul v0, v1
+    v4 = iconst.i64 7
+    v5 = isub v3, v4
+    v6 = band v5, v2
+    v7 = bor v6, v0
+    v8 = bxor v7, v1
+    return v8
+}
+; run: %expr(3, 5, -1) == 14
+; run: %expr(100, 200, 0xff00) == 20140
+
+function %multi_use(i32) -> i32 {
+block0(v0: i32):
+    v1 = imul v0, v0
+    v2 = iadd v1, v1
+    v3 = isub v2, v0
+    return v3
+}
+; run: %multi_use(3) == 15
+; run: %multi_use(-4) == 36
+
+function %div(i32, i32) -> i32, i32, i32, i32 {
+block0(v0: i32, v1: i32):
+    v2 = sdiv v0, v1
+    v3 = udiv v0, v1
+    v4 = srem v0, v1
+    v5 = urem v0, v1
+    return v2, v3, v4, v5
+}
+; run: %div(-7, 2) == [-3, 2147483644, -1, 1]
+; run: %div(7, 3) == [2, 2, 1, 1]
+
+function %shifts(i32, i32) -> i32, i32, i32, i32, i32 {
+block0(v0: i32, v1: i32):
+    v2 = ishl v0, v1
+    v3 = ushr v0, v1
+    v4 = sshr v0, v1
+    v5 = rotl v0, v1
+    v6 = rotr v0, v1
+    return v2, v3, v4, v5, v6
+}
+; run: %shifts(0x80000001, 33) == [2, 0x40000000, 0xc0000000, 3, 0xc0000000]
+
+function %shift64_by32(i64, i32) -> i64 {
+block0(v0: i64, v1: i32):
+    v2 = ishl v0, v1
+    return v2
+}
+; run: %shift64_by32(1, 40) == 0x10000000000
+
+function %bits(i32) -> i32, i32, i32, i32 {
+block0(v0: i32):
+    v1 = clz v0
+    v2 = ctz v0
+    v3 = popcnt v0
+    v4 = cls v0
+    return v1, v2, v3, v4
+}
+; run: %bits(0x00f0) == [24, 4, 4, 23]
+; run: %bits(-1) == [0, 0, 32, 31]
+
+function %bits64(i64) -> i64, i64, i64 {
+block0(v0: i64):
+    v1 = clz v0
+    v2 = ctz v0
+    v3 = cls v0
+    return v1, v2, v3
+}
+; run: %bits64(0x100) == [55, 8, 54]
+
+function %minmax(i32, i32) -> i32, i32, i32, i32 {
+block0(v0: i32, v1: i32):
+    v2 = smin v0, v1
+    v3 = smax v0, v1
+    v4 = umin v0, v1
+    v5 = umax v0, v1
+    return v2, v3, v4, v5
+}
+; run: %minmax(-1, 1) == [-1, 1, 1, -1]
+
+function %misc(i32) -> i32, i32, i32, i32 {
+block0(v0: i32):
+    v1 = ineg v0
+    v2 = bnot v0
+    v3 = iabs v0
+    v4 = bmask.i32 v0
+    return v1, v2, v3, v4
+}
+; run: %misc(5) == [-5, -6, 5, -1]
+; run: %misc(-5) == [5, 4, 5, -1]
+; run: %misc(0) == [0, -1, 0, 0]
+
+function %mulhi(i32, i32) -> i32, i32 {
+block0(v0: i32, v1: i32):
+    v2 = umulhi v0, v1
+    v3 = smulhi v0, v1
+    return v2, v3
+}
+; run: %mulhi(-1, -1) == [-2, 0]
+; run: %mulhi(0x10000, 0x10000) == [1, 1]
+
+function %icmp(i64, i64) -> i8, i8, i8, i8 {
+block0(v0: i64, v1: i64):
+    v2 = icmp slt v0, v1
+    v3 = icmp ult v0, v1
+    v4 = icmp eq v0, v1
+    v5 = icmp sge v0, v1
+    return v2, v3, v4, v5
+}
+; run: %icmp(-1, 1) == [1, 0, 0, 0]
+; run: %icmp(3, 3) == [0, 0, 1, 1]
+
+function %select(i32, i64, i64) -> i64 {
+block0(v0: i32, v1: i64, v2: i64):
+    v3 = select v0, v1, v2
+    return v3
+}
+; run: %select(1, 10, 20) == 10
+; run: %select(0, 10, 20) == 20
+
+function %select_i64_cond(i64, f32, f32) -> f32 {
+block0(v0: i64, v1: f32, v2: f32):
+    v3 = select v0, v1, v2
+    return v3
+}
+; run: %select_i64_cond(0x100000000, 0x1.0, 0x2.0) == 0x1.0
+; run: %select_i64_cond(0, 0x1.0, 0x2.0) == 0x2.0
+
+function %bitselect(i32, i32, i32) -> i32 {
+block0(v0: i32, v1: i32, v2: i32):
+    v3 = bitselect v0, v1, v2
+    return v3
+}
+; run: %bitselect(0xff00ff00, 0x12345678, 0xabcdef01) == 0x12cd5601
+
+function %ext(i32) -> i64, i64 {
+block0(v0: i32):
+    v1 = uextend.i64 v0
+    v2 = sextend.i64 v0
+    return v1, v2
+}
+; run: %ext(-1) == [0xffffffff, -1]
+
+function %uadd_trap(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = uadd_overflow_trap v0, v1, user1
+    return v2
+}
+; run: %uadd_trap(1, 2) == 3
