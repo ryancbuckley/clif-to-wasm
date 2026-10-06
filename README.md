@@ -18,7 +18,7 @@ not need. The backend works directly on the IR instead.
 |------|------|--------------|
 | Analysis | `src/analysis.rs` | RPO, deduplicated CFG edges, dominators, loop headers, merge nodes, reducibility, value-level DCE, use counts |
 | Stackify | `src/stackify.rs` | Greedy backwards tree building: a single-use def in the same block is folded into its user unless that would reorder side effects. The check is O(1) using Cranelift-style side-effect colors. Constants are rematerialized at every use |
-| Locals | `src/locals.rs` | Values not passed on the stack get locals. Live intervals are hulls computed from SSA liveness; linear-scan coloring per wasm type |
+| Locals | `src/locals.rs` | Values not passed on the stack get locals. Live ranges are per-block segments from SSA liveness; greedy coloring per wasm type that first tries the local of a branch argument's partner (parameter ↔ argument), so most block-argument moves disappear |
 | Structure | `src/structure.rs` | Ramsey's "Beyond Relooper" (ICFP 2022) over the dominator tree, run with an explicit task stack. Irreducible CFGs fall back to a `loop` + `br_table` dispatcher |
 | Lower | `src/lower.rs` | Per-opcode emission, plus a `local.set x; local.get x` → `local.tee x` peephole |
 
@@ -115,11 +115,81 @@ cargo run --example runclif  -- tests/clif/control.clif
 - Tests originally ran on wasmi 2.0.0, which miscomputed one fuzz case that
   V8 and the interpreter agree on. That is why execution now uses wasmtime.
 
+## Benchmarks
+
+```sh
+cargo bench --bench codegen          # BENCH_QUICK=1 for a faster run
+UPSTREAM_RUNTESTS=wasmtime/cranelift/filetests/filetests/runtests cargo bench --bench codegen
+cargo run --release --example compile_loop   # compile the random corpus in a loop, for profiling
+cargo run --example wasm2wat -- target/bench/kernels-default.wasm
+```
+
+`benches/codegen.rs` compares a `naive` configuration (`stackify: false`,
+`use_tee: false`) with the default one on three corpora:
+
+- nine kernels in `tests/harness/kernels.rs` (fib, sieve, matmul, crc32,
+  insertion sort, mandelbrot, collatz, a `br_table` state machine, recursive
+  fib). They are built with `cranelift-frontend` the way a JIT would build
+  them. `tests/kernels.rs` checks them against the interpreter.
+- 1000 random functions from the fuzzer's generator.
+- Cranelift's upstream runtests, if `UPSTREAM_RUNTESTS` is set.
+
+It reports:
+
+- output size: bytes, locals and `local.*` ops;
+- the backend's own compile time;
+- kernel runtime in wasmtime, V8 Liftoff (`--liftoff-only`) and V8
+  TurboFan (`--no-liftoff`), the last two when `node` is on the `PATH`;
+- V8's compile time for the module.
+
+### Results (node 26, wasmtime 49)
+
+Effect of precise live ranges plus move hints (default configuration,
+before → after):
+
+| | random corpus | kernels |
+|---|---|---|
+| code bytes | 1,240,324 → 1,080,592 (−13%) | 1678 → 1636 |
+| locals | 26,968 → 12,282 (−54%) | 63 → 49 |
+| `local.get` | 128,546 → 92,772 (−28%) | 210 → 201 |
+| `local.set` | 70,171 → 34,397 (−51%) | 116 → 107 |
+| compile time | 57 → 64 µs/function (+12%) | |
+
+Kernel runtime, median ms:
+
+| kernel | Liftoff naive | Liftoff default (before) | Liftoff default (now) | TurboFan default | wasmtime default |
+|---|---:|---:|---:|---:|---:|
+| fib_iter | 47.6 | 19.6 | 19.8 | 7.5 | 13.6 |
+| sieve | 4.9 | 3.7 | 3.8 | 1.9 | 2.6 |
+| matmul | 4.7 | 4.5 | 4.8 | 1.0 | 1.3 |
+| crc32 | 24.2 | 24.1 | 24.8 | 15.6 | 15.9 |
+| sort | 4.1 | 3.0 | 3.1 | 1.3 | 2.1 |
+| mandel | 14.6 | 14.2 | 14.3 | 5.4 | 6.7 |
+| collatz | 79.4 | 71.7 | 52.2 | 32.7 | 48.0 |
+| dispatch | 67.8 | 51.9 | 47.9 | 34.4 | 38.7 |
+| fib_rec | 5.2 | 5.3 | 5.3 | 2.8 | 2.8 |
+
+Findings:
+
+- Optimizing tiers (TurboFan, wasmtime/Cranelift) run naive and default
+  output at the same speed (within noise): they rebuild SSA from locals
+  anyway.
+- The baseline tier is where output quality matters. Expression trees make
+  Liftoff up to 2.4× faster than naive output (fib_iter), and coalescing
+  block-argument moves gives another 27% on collatz and 8% on dispatch.
+- The backend compiles about 4M CLIF instructions per second (≈250 ns per
+  instruction). Running binaryen.js `-O2` on the same small modules took
+  roughly 500–1000× longer than generating them.
+- Tried and dropped: sinking pure single-use values into later blocks so
+  they can join an expression tree. On these corpora it changed nothing
+  measurable.
+
 ## Possible next steps
 
-- Better coalescing of block-parameter moves (intervals with holes, or
-  move hints).
 - `i128` (as i64 pairs), SIMD (`v128`), atomics, and the remaining scalar
   ops.
 - Operand commutation and pre-passes that increase the number of
   single-use values (as LLVM does).
+- Compile speed: the allocator, analysis and emission each take roughly a
+  third of the time. The main lever left is avoiding repeated
+  `operands()`/`value_def` work across passes.
