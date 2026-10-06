@@ -80,6 +80,10 @@ pub struct Config {
     /// Use `local.tee` to feed the first use of a multi-use value directly
     /// from the stack.
     pub use_tee: bool,
+    /// Build expression trees. When off, every value goes through a local
+    /// (constants are still rematerialized); this is mainly useful as a
+    /// baseline for comparisons.
+    pub stackify: bool,
 }
 
 impl Default for Config {
@@ -91,6 +95,7 @@ impl Default for Config {
             stack_pointer_global: None,
             tail_calls: true,
             use_tee: true,
+            stackify: true,
         }
     }
 }
@@ -242,7 +247,7 @@ pub fn compile_function(
         func
     };
     let info = analysis::FuncInfo::compute(func)?;
-    let stack = stackify::stackify(func, &info);
+    let stack = stackify::stackify(func, &info, config.stackify);
     let locals = locals::allocate(func, &info, &stack, config)?;
     structure::emit_function(func, config, env, &info, &stack, locals)
 }

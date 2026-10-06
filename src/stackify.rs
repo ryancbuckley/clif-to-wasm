@@ -99,7 +99,7 @@ pub(crate) fn operands(func: &Function, info: &FuncInfo, inst: Inst, out: &mut V
     }
 }
 
-pub(crate) fn stackify(func: &Function, info: &FuncInfo) -> Stackified {
+pub(crate) fn stackify(func: &Function, info: &FuncInfo, enabled: bool) -> Stackified {
     let mut s = Stackified {
         inlined: SecondaryMap::new(),
         root_of: SecondaryMap::new(),
@@ -124,7 +124,7 @@ pub(crate) fn stackify(func: &Function, info: &FuncInfo) -> Stackified {
         }
 
         for root in func.layout.block_insts(block).rev() {
-            if !s.is_root(info, func, root) {
+            if !enabled || !s.is_root(info, func, root) {
                 continue;
             }
             let mut moved = 0;
