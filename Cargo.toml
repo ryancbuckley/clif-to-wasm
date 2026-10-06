@@ -1,0 +1,18 @@
+[package]
+name = "cranelift-wasm-backend"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cranelift-codegen = { version = "=0.136.2", default-features = false, features = ["std", "unwind"] }
+wasm-encoder = "0.245"
+
+[dev-dependencies]
+cranelift-frontend = "=0.136.2"
+cranelift-interpreter = "=0.136.2"
+cranelift-reader = "=0.136.2"
+target-lexicon = "0.13.5"
+wasmparser = "0.245"
+wasmprinter = "0.245"
+wasmtime = { version = "=49.0.2", default-features = false, features = ["cranelift", "runtime", "std"] }
+wat = "1.261.0"

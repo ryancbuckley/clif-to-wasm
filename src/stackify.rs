@@ -1,0 +1,164 @@
+//! Expression tree building ("stackification").
+//!
+//! Each block is walked backwards. Every live instruction that has not been
+//! folded into a later one is a *root*. For each root, its operands are
+//! visited in reverse emission order (the operand stack is LIFO), depth-first,
+//! and an operand's defining instruction is folded into the tree when:
+//!
+//! - it is in the same block, has exactly one result and that result has
+//!   exactly one use;
+//! - it is not a rematerialized constant (those are emitted at every use
+//!   anyway); and
+//! - if it has a side effect (including trapping and reading memory), the
+//!   move does not reorder it with another side effect.
+//!
+//! The last check is O(1). `color[i]` is the number of effectful instructions
+//! before `i` in its block. Folding effectful `d` into the tree rooted at `r`
+//! moves `d` to just before the part of the tree built so far. It is safe iff
+//! every effectful instruction between `d` and `r` has already been moved
+//! into this tree (and therefore sits after `d`'s new position, in the same
+//! relative order). Because trees are grown backwards, those are exactly the
+//! effectful instructions counted so far, so the condition is
+//! `color[r] - color[d] - 1 == moved`.
+//!
+//! Operands that are only evaluated on some paths (block arguments of a
+//! conditional branch) only accept trees without side effects, since folding
+//! would make an unconditional effect conditional.
+
+use crate::analysis::{FuncInfo, has_lowering_side_effect, is_remat};
+use cranelift_codegen::entity::SecondaryMap;
+use cranelift_codegen::ir::{Function, Inst, Opcode, Value, ValueDef};
+
+/// Emission recurses over trees, so bound their depth.
+const MAX_TREE_DEPTH: u32 = 100;
+
+pub(crate) struct Stackified {
+    /// The result of this instruction is consumed directly from the stack by
+    /// its only user, so the instruction is emitted as part of that user's
+    /// tree.
+    pub inlined: SecondaryMap<Inst, bool>,
+    /// For inlined instructions: the root of the tree containing it.
+    pub root_of: SecondaryMap<Inst, Option<Inst>>,
+}
+
+impl Stackified {
+    pub fn is_root(&self, info: &FuncInfo, func: &Function, inst: Inst) -> bool {
+        info.live_inst[inst] && !self.inlined[inst] && !is_remat(func, inst)
+    }
+
+    pub fn root(&self, inst: Inst) -> Inst {
+        self.root_of[inst].unwrap_or(inst)
+    }
+}
+
+/// An operand in emission order. `conditional` operands are only evaluated on
+/// some of the paths out of the instruction.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Operand {
+    pub value: Value,
+    pub conditional: bool,
+}
+
+/// The operands of `inst` in the order the emitter pushes them. The emitter
+/// and the stackifier must agree on this order.
+pub(crate) fn operands(func: &Function, info: &FuncInfo, inst: Inst, out: &mut Vec<Operand>) {
+    out.clear();
+    let dfg = &func.dfg;
+    let args = dfg.inst_args(inst);
+    let plain = |out: &mut Vec<Operand>, vs: &[Value]| {
+        out.extend(vs.iter().map(|&value| Operand {
+            value,
+            conditional: false,
+        }))
+    };
+    let op = dfg.insts[inst].opcode();
+    match op {
+        Opcode::Select | Opcode::SelectSpectreGuard => {
+            plain(out, &[args[1], args[2], args[0]]);
+        }
+        Opcode::Store | Opcode::Istore8 | Opcode::Istore16 | Opcode::Istore32 => {
+            plain(out, &[args[1], args[0]]);
+        }
+        Opcode::CallIndirect | Opcode::ReturnCallIndirect => {
+            plain(out, &args[1..]);
+            plain(out, &args[..1]);
+        }
+        Opcode::Jump | Opcode::Brif | Opcode::BrTable => {
+            plain(out, args);
+            let block = func.layout.inst_block(inst).unwrap();
+            let dests = &info.dests[block];
+            let conditional = dests.len() > 1;
+            for &call in dests {
+                out.extend(
+                    info.live_args(func, call)
+                        .map(|value| Operand { value, conditional }),
+                );
+            }
+        }
+        _ => plain(out, args),
+    }
+}
+
+pub(crate) fn stackify(func: &Function, info: &FuncInfo) -> Stackified {
+    let mut s = Stackified {
+        inlined: SecondaryMap::new(),
+        root_of: SecondaryMap::new(),
+    };
+    let mut color: SecondaryMap<Inst, u32> = SecondaryMap::new();
+    let mut effectful: SecondaryMap<Inst, bool> = SecondaryMap::new();
+    let mut ops = Vec::new();
+    // (value, allow side effects, depth)
+    let mut worklist: Vec<(Value, bool, u32)> = Vec::new();
+
+    for &block in &info.rpo {
+        let mut c = 0;
+        for inst in func.layout.block_insts(block) {
+            if !info.live_inst[inst] || is_remat(func, inst) {
+                continue;
+            }
+            color[inst] = c;
+            if has_lowering_side_effect(func, inst) {
+                effectful[inst] = true;
+                c += 1;
+            }
+        }
+
+        for root in func.layout.block_insts(block).rev() {
+            if !s.is_root(info, func, root) {
+                continue;
+            }
+            let mut moved = 0;
+            operands(func, info, root, &mut ops);
+            worklist.extend(ops.iter().map(|o| (o.value, !o.conditional, 1)));
+
+            while let Some((v, allow_effects, depth)) = worklist.pop() {
+                let ValueDef::Result(d, 0) = func.dfg.value_def(v) else {
+                    continue;
+                };
+                if info.use_count[v] != 1
+                    || func.dfg.inst_results(d).len() != 1
+                    || func.layout.inst_block(d) != Some(block)
+                    || is_remat(func, d)
+                    || depth > MAX_TREE_DEPTH
+                {
+                    continue;
+                }
+                debug_assert!(!s.inlined[d]);
+                if effectful[d] {
+                    if !allow_effects || color[root] - color[d] - 1 != moved {
+                        continue;
+                    }
+                    moved += 1;
+                }
+                s.inlined[d] = true;
+                s.root_of[d] = Some(root);
+                operands(func, info, d, &mut ops);
+                worklist.extend(
+                    ops.iter()
+                        .map(|o| (o.value, allow_effects && !o.conditional, depth + 1)),
+                );
+            }
+        }
+    }
+    s
+}
