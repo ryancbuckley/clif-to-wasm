@@ -11,6 +11,9 @@ use wasm_encoder::{Instruction as I, MemArg, ValType};
 
 impl Emitter<'_> {
     pub(crate) fn lower(&mut self, inst: Inst) -> Result<()> {
+        if crate::lower_simd::is_simd(self.func, inst) {
+            return self.lower_simd(inst);
+        }
         let func = self.func;
         let dfg = &func.dfg;
         let data = dfg.insts[inst];

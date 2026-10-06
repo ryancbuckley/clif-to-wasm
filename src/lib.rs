@@ -32,6 +32,7 @@ mod encode;
 mod liveness;
 mod locals;
 mod lower;
+mod lower_simd;
 pub mod module;
 mod stackify;
 mod structure;
@@ -210,7 +211,8 @@ impl CompiledFunction {
 
 /// Map a Cranelift scalar type to the wasm value type that represents it.
 ///
-/// `i8` and `i16` values live in `i32`s and are kept zero-extended.
+/// `i8` and `i16` values live in `i32`s and are kept zero-extended. 128-bit
+/// vectors are `v128`s.
 pub fn wasm_type(ty: ir::Type) -> Result<ValType> {
     use cranelift_codegen::ir::types;
     Ok(match ty {
@@ -218,6 +220,15 @@ pub fn wasm_type(ty: ir::Type) -> Result<ValType> {
         types::I64 => ValType::I64,
         types::F32 => ValType::F32,
         types::F64 => ValType::F64,
+        ty if ty.is_vector()
+            && ty.bits() == 128
+            && matches!(
+                ty.lane_type(),
+                types::I8 | types::I16 | types::I32 | types::I64 | types::F32 | types::F64
+            ) =>
+        {
+            ValType::V128
+        }
         _ => return unsupported(format!("type {ty}")),
     })
 }

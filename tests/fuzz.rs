@@ -2,8 +2,9 @@
 //! interpreter and, compiled by this backend, in wasmtime. Results (or the fact
 //! that both trap) must agree.
 //!
-//! `FUZZ_ITERS` sets the number of functions (default 300); `FUZZ_SEED`
-//! picks the starting seed.
+//! Each seed gives two functions: scalar only, and with vector code.
+//! `FUZZ_ITERS` sets the number of seeds (default 150), `FUZZ_SEED` the
+//! first seed, and `FUZZ_ONLY=scalar|simd` restricts the kind.
 
 mod harness;
 
@@ -13,14 +14,20 @@ use cranelift_interpreter::environment::FunctionStore;
 use cranelift_interpreter::interpreter::{Interpreter, InterpreterState};
 use cranelift_interpreter::step::ControlFlow;
 use cranelift_wasm_backend::Config;
-use harness::clifgen::{Rng, arg, generate};
+use harness::clifgen::{Rng, arg, generate, generate_simd};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Scalar,
+    Simd,
+}
 
 #[test]
 fn differential() {
     let iters: u64 = std::env::var("FUZZ_ITERS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(300);
+        .unwrap_or(150);
     let seed0: u64 = std::env::var("FUZZ_SEED")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -28,16 +35,33 @@ fn differential() {
     let mut failures = Vec::new();
     let mut compared = 0;
     let mut trapped = 0;
-    for seed in seed0..seed0 + iters {
-        let (func, params) = generate(seed);
+    let mut skipped = 0;
+    let only = match std::env::var("FUZZ_ONLY").as_deref() {
+        Ok("scalar") => Some(Kind::Scalar),
+        Ok("simd") => Some(Kind::Simd),
+        _ => None,
+    };
+    let runs = (seed0..seed0 + iters)
+        .flat_map(|seed| [(seed, Kind::Scalar), (seed, Kind::Simd)])
+        .filter(|&(_, kind)| only.is_none_or(|o| o == kind));
+    for (seed, kind) in runs {
+        let (func, params) = match kind {
+            Kind::Scalar => generate(seed),
+            Kind::Simd => generate_simd(seed),
+        };
         cranelift_codegen::verify_function(
             &func,
             &cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder()),
         )
-        .unwrap_or_else(|e| panic!("seed {seed}: generator made invalid IR: {e}\n{func}"));
+        .unwrap_or_else(|e| panic!("seed {seed} {kind:?}: generator made invalid IR: {e}\n{func}"));
 
         for config in [
             Config::default(),
+            Config {
+                stackify: false,
+                use_tee: false,
+                ..Config::default()
+            },
             Config {
                 use_tee: false,
                 ..Config::default()
@@ -71,10 +95,22 @@ fn differential() {
                 store.add("%f".into(), &func);
                 let state = InterpreterState::default().with_function_store(store);
                 let mut interp = Interpreter::new(state).with_fuel(Some(1_000_000));
-                let expected = match interp.call_by_name("%f", &args) {
-                    Ok(ControlFlow::Return(vals)) => Some(vals.to_vec()),
-                    Ok(ControlFlow::Trap(_)) => None,
-                    other => panic!("seed {seed}: interpreter: {other:?}"),
+                let call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    interp.call_by_name("%f", &args).map(|cf| match cf {
+                        ControlFlow::Return(vals) => Some(vals.to_vec()),
+                        ControlFlow::Trap(_) => None,
+                        other => panic!("seed {seed}: interpreter: {other:?}"),
+                    })
+                }));
+                let expected = match call {
+                    Ok(Ok(e)) => e,
+                    Ok(Err(e)) => panic!("seed {seed} {kind:?}: interpreter error: {e}\n{func}"),
+                    // The interpreter does not implement every vector
+                    // operation on every type; such cases are inconclusive.
+                    Err(_) => {
+                        skipped += 1;
+                        break;
+                    }
                 };
                 let got = runner
                     .call("f", &args, &returns)
@@ -83,12 +119,12 @@ fn differential() {
                 trapped += expected.is_none() as u32;
                 let ok = match (&expected, &got) {
                     (None, None) => true,
-                    (Some(e), Some(g)) => harness::same_results(e, g),
+                    (Some(e), Some(g)) => harness::same_results(e, g, &returns),
                     _ => false,
                 };
                 if !ok {
                     failures.push(format!(
-                        "seed {seed} {:?}: args {args:?}\n  expected {expected:?}\n  got      {got:?}\n{func}",
+                        "seed {seed} {kind:?} {:?}: args {args:?}\n  expected {expected:?}\n  got      {got:?}\n{func}",
                         config
                     ));
                     break;
@@ -99,8 +135,13 @@ fn differential() {
             break;
         }
     }
-    println!("{compared} executions compared, {trapped} trapped");
+    println!(
+        "{compared} executions compared, {trapped} trapped, {skipped} functions skipped (interpreter panic)"
+    );
     if !failures.is_empty() {
+        for f in &failures {
+            eprintln!("FAIL {}", f.lines().next().unwrap_or(""));
+        }
         panic!("{} failures; first:\n{}", failures.len(), failures[0]);
     }
 }

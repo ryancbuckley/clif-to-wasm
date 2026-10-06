@@ -83,6 +83,10 @@ pub(crate) fn operands(func: &Function, info: &FuncInfo, inst: Inst, out: &mut V
         Opcode::Select | Opcode::SelectSpectreGuard => {
             plain(out, &[args[1], args[2], args[0]]);
         }
+        // `v128.bitselect` takes the mask last.
+        Opcode::Bitselect if dfg.value_type(args[0]).is_vector() => {
+            plain(out, &[args[1], args[2], args[0]]);
+        }
         Opcode::Store | Opcode::Istore8 | Opcode::Istore16 | Opcode::Istore32 => {
             plain(out, &[args[1], args[0]]);
         }

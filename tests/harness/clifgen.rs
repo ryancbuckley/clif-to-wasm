@@ -5,8 +5,8 @@ use cranelift_codegen::data_value::DataValue;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::{Ieee32, Ieee64};
 use cranelift_codegen::ir::{
-    AbiParam, Function, InstBuilder, MemFlagsData, Signature, StackSlotData, StackSlotKind, Type,
-    UserFuncName, Value, types,
+    AbiParam, ConstantData, Endianness, Function, InstBuilder, MemFlagsData, Signature,
+    StackSlotData, StackSlotKind, Type, UserFuncName, Value, types,
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -56,7 +56,19 @@ const TYPES: [Type; 6] = [
     types::F32,
     types::F64,
 ];
+const VTYPES: [Type; 6] = [
+    types::I8X16,
+    types::I16X8,
+    types::I32X4,
+    types::I64X2,
+    types::F32X4,
+    types::F64X2,
+];
 const SLOT_SIZE: u32 = 64;
+
+fn little() -> MemFlagsData {
+    MemFlagsData::new().with_endianness(Endianness::Little)
+}
 
 struct Gen<'a, 'b> {
     rng: &'a mut Rng,
@@ -64,6 +76,18 @@ struct Gen<'a, 'b> {
     vars: Vec<(Variable, Type)>,
     slot: cranelift_codegen::ir::StackSlot,
     budget: u32,
+    /// Also generate vector code.
+    simd: bool,
+    /// Also generate `i128` code.
+    wide: bool,
+}
+
+/// What kinds of values a generated function may use beyond the basic
+/// scalar types.
+#[derive(Clone, Copy)]
+struct Features {
+    simd: bool,
+    i128: bool,
 }
 
 impl Gen<'_, '_> {
@@ -82,6 +106,17 @@ impl Gen<'_, '_> {
     }
 
     fn constant(&mut self, ty: Type) -> Value {
+        if ty.is_vector() {
+            let bytes: Vec<u8> = (0..16)
+                .map(|_| match self.rng.below(4) {
+                    0 => 0,
+                    1 => 0xff,
+                    _ => self.rng.next() as u8,
+                })
+                .collect();
+            let c = self.b.func.dfg.constants.insert(ConstantData::from(bytes));
+            return self.b.ins().vconst(ty, c);
+        }
         match ty {
             types::F32 => {
                 let f = self
@@ -95,10 +130,27 @@ impl Gen<'_, '_> {
                     .pick(&[0.0f64, -0.0, 2.5, -7.75, 1e300, f64::NEG_INFINITY]);
                 self.b.ins().f64const(Ieee64::with_float(f))
             }
+            types::I128 => {
+                let (lo, hi) = (self.rng.int(), self.rng.int());
+                let lo = self.b.ins().iconst(types::I64, lo);
+                let hi = self.b.ins().iconst(types::I64, hi);
+                self.b.ins().iconcat(lo, hi)
+            }
             _ => {
                 let i = self.rng.int();
                 self.b.ins().iconst(ty, i)
             }
+        }
+    }
+
+    /// An integer constant of any width (`iconst` cannot make an `i128`).
+    fn int_const(&mut self, ty: Type, v: i64) -> Value {
+        if ty == types::I128 {
+            let lo = self.b.ins().iconst(types::I64, v);
+            let hi = self.b.ins().iconst(types::I64, if v < 0 { -1 } else { 0 });
+            self.b.ins().iconcat(lo, hi)
+        } else {
+            self.b.ins().iconst(ty, v)
         }
     }
 
@@ -112,8 +164,10 @@ impl Gen<'_, '_> {
     }
 
     fn addr(&mut self, size: u32) -> (Value, i32) {
-        let slots = SLOT_SIZE / 8;
-        let off = (self.rng.below(slots as u64) as u32 * 8).min(SLOT_SIZE - size) as i32;
+        // Accesses are aligned (they use trusted flags).
+        let align = size.clamp(8, 16);
+        let slots = SLOT_SIZE / align;
+        let off = (self.rng.below(slots as u64) as u32 * align).min(SLOT_SIZE - size) as i32;
         // Split the offset between the address and the immediate.
         let split = if self.rng.chance(50) { off } else { 0 };
         let a = self.b.ins().stack_addr(types::I64, self.slot, split);
@@ -125,6 +179,12 @@ impl Gen<'_, '_> {
             return self.leaf(ty);
         }
         let d = depth - 1;
+        if ty.is_vector() {
+            return self.vexpr(ty, d);
+        }
+        if self.simd && ty.is_int() && self.rng.chance(12) {
+            return self.vector_to_scalar(ty, d);
+        }
         if ty.is_float() {
             return match self.rng.below(9) {
                 0 => {
@@ -148,7 +208,12 @@ impl Gen<'_, '_> {
                     self.b.ins().fneg(a)
                 }
                 5 => {
-                    let src = self.rng.pick(&[types::I8, types::I32, types::I64]);
+                    let src = if self.wide {
+                        self.rng
+                            .pick(&[types::I8, types::I32, types::I64, types::I128])
+                    } else {
+                        self.rng.pick(&[types::I8, types::I32, types::I64])
+                    };
                     let a = self.expr(src, d);
                     if self.rng.chance(50) {
                         self.b.ins().fcvt_from_sint(ty, a)
@@ -193,7 +258,12 @@ impl Gen<'_, '_> {
             }
             7 => {
                 let a = self.expr(ty, d);
-                let amt_ty = self.rng.pick(&[types::I8, types::I32, types::I64]);
+                let amt_ty = if self.wide {
+                    self.rng
+                        .pick(&[types::I8, types::I32, types::I64, types::I128])
+                } else {
+                    self.rng.pick(&[types::I8, types::I32, types::I64])
+                };
                 let b = self.expr(amt_ty, d);
                 let ins = self.b.ins();
                 match self.rng.below(5) {
@@ -218,7 +288,7 @@ impl Gen<'_, '_> {
                 // Division may trap; both sides must agree.
                 let (a, b) = (self.expr(ty, d), self.expr(ty, d));
                 let b = if self.rng.chance(80) {
-                    let one = self.b.ins().iconst(ty, 1);
+                    let one = self.int_const(ty, 1);
                     self.b.ins().bor(b, one)
                 } else {
                     b
@@ -230,11 +300,19 @@ impl Gen<'_, '_> {
                     _ => {
                         // The interpreter traps on `MIN srem -1`, which
                         // Cranelift defines as 0; keep the divisor positive.
-                        let one = self.b.ins().iconst(ty, 1);
+                        let one = self.int_const(ty, 1);
                         let b = self.b.ins().ushr(b, one);
                         let b = self.b.ins().bor(b, one);
                         self.b.ins().srem(a, b)
                     }
+                }
+            }
+            10 if self.wide && ty.bits() >= 16 && self.rng.chance(25) => {
+                let a = self.expr(ty, d);
+                if self.rng.chance(50) {
+                    self.b.ins().bswap(a)
+                } else {
+                    self.b.ins().bitrev(a)
                 }
             }
             10 => {
@@ -265,9 +343,13 @@ impl Gen<'_, '_> {
             }
             13 | 14 => {
                 // Conversions from another integer type.
-                let src = self
-                    .rng
-                    .pick(&[types::I8, types::I16, types::I32, types::I64]);
+                let src = if self.wide {
+                    self.rng
+                        .pick(&[types::I8, types::I16, types::I32, types::I64, types::I128])
+                } else {
+                    self.rng
+                        .pick(&[types::I8, types::I16, types::I32, types::I64])
+                };
                 let a = self.expr(src, d);
                 if src == ty {
                     a
@@ -279,6 +361,9 @@ impl Gen<'_, '_> {
                     self.b.ins().sextend(ty, a)
                 }
             }
+            // The interpreter saturates float-to-i128 conversions instead of
+            // trapping, so those are left out.
+            15 if ty == types::I128 => self.leaf(ty),
             15 => {
                 let f = self.rng.pick(&[types::F32, types::F64]);
                 let a = self.expr(f, d);
@@ -316,6 +401,320 @@ impl Gen<'_, '_> {
         }
     }
 
+    /// Replace NaNs with the canonical NaN. Applied wherever float bits are
+    /// reinterpreted (stores, bitcasts, shuffles, bitwise ops on floats):
+    /// NaN payloads and signs are nondeterministic in wasm, and differ between
+    /// the interpreter and real hardware.
+    fn canon(&mut self, v: Value) -> Value {
+        let ty = self.b.func.dfg.value_type(v);
+        if !ty.lane_type().is_float() {
+            return v;
+        }
+        let nan = if ty.lane_type() == types::F32 {
+            self.b.ins().f32const(Ieee32::with_bits(0x7fc0_0000))
+        } else {
+            self.b
+                .ins()
+                .f64const(Ieee64::with_bits(0x7ff8_0000_0000_0000))
+        };
+        let is_nan = self.b.ins().fcmp(FloatCC::Unordered, v, v);
+        if ty.is_vector() {
+            let nan = self.b.ins().splat(ty, nan);
+            let mask = self.b.ins().bitcast(ty, little(), is_nan);
+            self.b.ins().bitselect(mask, nan, v)
+        } else {
+            self.b.ins().select(is_nan, nan, v)
+        }
+    }
+
+    /// A 16-byte-aligned address in the slot, for vector accesses.
+    fn vaddr(&mut self) -> (Value, i32) {
+        let off = (self.rng.below((SLOT_SIZE / 16) as u64) * 16) as i32;
+        let a = self.b.ins().stack_addr(types::I64, self.slot, 0);
+        (a, off)
+    }
+
+    /// A vector type with the same lane count as `ty` but `bits`-wide lanes.
+    fn with_lane_bits(ty: Type, bits: u32, float: bool) -> Type {
+        let lane = match (bits, float) {
+            (32, true) => types::F32,
+            (64, true) => types::F64,
+            (8, _) => types::I8,
+            (16, _) => types::I16,
+            (32, _) => types::I32,
+            _ => types::I64,
+        };
+        lane.by(128 / bits).unwrap_or(ty)
+    }
+
+    /// An expression producing a scalar integer from vectors.
+    fn vector_to_scalar(&mut self, ty: Type, d: u32) -> Value {
+        match self.rng.below(3) {
+            0 => {
+                // extractlane from a vector with lanes of this type.
+                let vty = ty.by(128 / ty.bits()).unwrap();
+                let v = self.expr(vty, d);
+                let idx = self.rng.below((128 / ty.bits()) as u64) as u8;
+                self.b.ins().extractlane(v, idx)
+            }
+            1 if ty == types::I8 => {
+                let vty = self.rng.pick(&VTYPES);
+                let v = self.expr(vty, d);
+                if vty.is_float() || self.rng.chance(50) {
+                    self.b.ins().vany_true(v)
+                } else {
+                    self.b.ins().vall_true(v)
+                }
+            }
+            _ => {
+                let vty = self.rng.pick(&VTYPES);
+                let v = self.expr(vty, d);
+                let v = self.canon(v);
+                self.b.ins().vhigh_bits(ty, v)
+            }
+        }
+    }
+
+    fn vexpr(&mut self, ty: Type, d: u32) -> Value {
+        let lane = ty.lane_type();
+        let bits = lane.bits();
+        let int = lane.is_int();
+        match self.rng.below(20) {
+            0 => self.leaf(ty),
+            1 => {
+                let (a, off) = self.vaddr();
+                self.b.ins().load(ty, MemFlagsData::trusted(), a, off)
+            }
+            2 => {
+                let x = self.expr(lane, d);
+                self.b.ins().splat(ty, x)
+            }
+            3 => {
+                let v = self.expr(ty, d);
+                let x = self.expr(lane, d);
+                let idx = self.rng.below(ty.lane_count() as u64) as u8;
+                self.b.ins().insertlane(v, x, idx)
+            }
+            4 => {
+                // Shuffle or swizzle as bytes.
+                let (x, y) = (self.expr(ty, d), self.expr(ty, d));
+                let (x, y) = (self.canon(x), self.canon(y));
+                let (x, y) = (
+                    self.b.ins().bitcast(types::I8X16, little(), x),
+                    self.b.ins().bitcast(types::I8X16, little(), y),
+                );
+                let r = if self.rng.chance(70) {
+                    let mask: Vec<u8> = (0..16).map(|_| self.rng.below(32) as u8).collect();
+                    let imm = self.b.func.dfg.immediates.push(ConstantData::from(mask));
+                    self.b.ins().shuffle(x, y, imm)
+                } else {
+                    self.b.ins().swizzle(x, y)
+                };
+                self.b.ins().bitcast(ty, little(), r)
+            }
+            5 => {
+                // Reinterpret another vector type.
+                let other = self.rng.pick(&VTYPES);
+                let v = self.expr(other, d);
+                let v = self.canon(v);
+                if other == ty {
+                    v
+                } else {
+                    self.b.ins().bitcast(ty, little(), v)
+                }
+            }
+            6 => {
+                let c = self.expr(ty, d);
+                let (x, y) = (self.expr(ty, d), self.expr(ty, d));
+                let (c, x, y) = (self.canon(c), self.canon(x), self.canon(y));
+                self.b.ins().bitselect(c, x, y)
+            }
+            7 => {
+                let c = self.cond(1);
+                let (x, y) = (self.expr(ty, d), self.expr(ty, d));
+                self.b.ins().select(c, x, y)
+            }
+            8 => {
+                let (x, y) = (self.expr(ty, d), self.expr(ty, d));
+                let (x, y) = (self.canon(x), self.canon(y));
+                let ins = self.b.ins();
+                match self.rng.below(3) {
+                    0 => ins.band(x, y),
+                    1 => ins.bor(x, y),
+                    _ => ins.bxor(x, y),
+                }
+            }
+            9 => {
+                let x = self.expr(ty, d);
+                let x = self.canon(x);
+                self.b.ins().bnot(x)
+            }
+            _ if !int => self.vfloat(ty, d),
+            10 | 11 => {
+                let (x, y) = (self.expr(ty, d), self.expr(ty, d));
+                let ins = self.b.ins();
+                match self.rng.below(7) {
+                    0 => ins.iadd(x, y),
+                    1 => ins.isub(x, y),
+                    2 => ins.imul(x, y),
+                    3 => ins.smin(x, y),
+                    4 => ins.umax(x, y),
+                    5 => ins.umin(x, y),
+                    _ => ins.smax(x, y),
+                }
+            }
+            12 => {
+                let (x, y) = (self.expr(ty, d), self.expr(ty, d));
+                match (self.rng.below(4), bits) {
+                    (0, 8 | 16) => self.b.ins().uadd_sat(x, y),
+                    (1, 8 | 16) => self.b.ins().ssub_sat(x, y),
+                    (2, 8 | 16) => self.b.ins().usub_sat(x, y),
+                    (3, 16) => self.b.ins().sqmul_round_sat(x, y),
+                    (_, 64) => self.b.ins().imul(x, y),
+                    (3, _) => self.b.ins().iadd_pairwise(x, y),
+                    (_, _) if self.rng.chance(50) => self.b.ins().umulhi(x, y),
+                    _ => self.b.ins().smulhi(x, y),
+                }
+            }
+            13 => {
+                let x = self.expr(ty, d);
+                let ins = self.b.ins();
+                match self.rng.below(3) {
+                    0 => ins.ineg(x),
+                    1 => ins.iabs(x),
+                    _ => ins.popcnt(x),
+                }
+            }
+            14 => {
+                let x = self.expr(ty, d);
+                let amt_ty = self.rng.pick(&[types::I32, types::I64]);
+                let a = self.expr(amt_ty, d);
+                let ins = self.b.ins();
+                match self.rng.below(3) {
+                    0 => ins.ishl(x, a),
+                    1 => ins.ushr(x, a),
+                    _ => ins.sshr(x, a),
+                }
+            }
+            15 => {
+                let cc = self.rng.pick(&[
+                    IntCC::Equal,
+                    IntCC::NotEqual,
+                    IntCC::SignedLessThan,
+                    IntCC::SignedGreaterThanOrEqual,
+                    IntCC::UnsignedLessThan,
+                    IntCC::UnsignedGreaterThan,
+                    IntCC::UnsignedLessThanOrEqual,
+                ]);
+                if bits >= 32 && self.rng.chance(40) {
+                    let fty = Self::with_lane_bits(ty, bits, true);
+                    let (x, y) = (self.expr(fty, d), self.expr(fty, d));
+                    let cc = self.rng.pick(&[
+                        FloatCC::Equal,
+                        FloatCC::NotEqual,
+                        FloatCC::LessThan,
+                        FloatCC::GreaterThanOrEqual,
+                        FloatCC::Ordered,
+                        FloatCC::Unordered,
+                        FloatCC::OrderedNotEqual,
+                        FloatCC::UnorderedOrEqual,
+                        FloatCC::UnorderedOrLessThan,
+                    ]);
+                    self.b.ins().fcmp(cc, x, y)
+                } else {
+                    let (x, y) = (self.expr(ty, d), self.expr(ty, d));
+                    self.b.ins().icmp(cc, x, y)
+                }
+            }
+            16 if bits > 8 => {
+                // Widen from narrower lanes.
+                let src = Self::with_lane_bits(ty, bits / 2, false);
+                let x = self.expr(src, d);
+                let ins = self.b.ins();
+                match self.rng.below(4) {
+                    0 => ins.swiden_low(x),
+                    1 => ins.swiden_high(x),
+                    2 => ins.uwiden_low(x),
+                    _ => ins.uwiden_high(x),
+                }
+            }
+            17 if bits <= 16 => {
+                // Narrow from wider lanes.
+                let src = Self::with_lane_bits(ty, bits * 2, false);
+                let (x, y) = (self.expr(src, d), self.expr(src, d));
+                let ins = self.b.ins();
+                match self.rng.below(3) {
+                    0 => ins.snarrow(x, y),
+                    1 => ins.unarrow(x, y),
+                    _ => ins.uunarrow(x, y),
+                }
+            }
+            18 if bits >= 32 => {
+                let fty = Self::with_lane_bits(ty, bits, true);
+                let x = self.expr(fty, d);
+                if self.rng.chance(50) {
+                    self.b.ins().fcvt_to_sint_sat(ty, x)
+                } else {
+                    self.b.ins().fcvt_to_uint_sat(ty, x)
+                }
+            }
+            _ => self.leaf(ty),
+        }
+    }
+
+    fn vfloat(&mut self, ty: Type, d: u32) -> Value {
+        let bits = ty.lane_bits();
+        match self.rng.below(6) {
+            0 | 1 => {
+                let (x, y) = (self.expr(ty, d), self.expr(ty, d));
+                let ins = self.b.ins();
+                match self.rng.below(7) {
+                    0 => ins.fadd(x, y),
+                    1 => ins.fsub(x, y),
+                    2 => ins.fmul(x, y),
+                    3 => ins.fdiv(x, y),
+                    4 => ins.fmin(x, y),
+                    5 => ins.fmax(x, y),
+                    _ => {
+                        let y = self.canon(y);
+                        self.b.ins().fcopysign(x, y)
+                    }
+                }
+            }
+            2 => {
+                let x = self.expr(ty, d);
+                let ins = self.b.ins();
+                match self.rng.below(7) {
+                    0 => ins.fneg(x),
+                    1 => ins.fabs(x),
+                    2 => ins.sqrt(x),
+                    3 => ins.ceil(x),
+                    4 => ins.floor(x),
+                    5 => ins.trunc(x),
+                    _ => ins.nearest(x),
+                }
+            }
+            3 => {
+                let ity = Self::with_lane_bits(ty, bits, false);
+                let x = self.expr(ity, d);
+                if self.rng.chance(50) {
+                    self.b.ins().fcvt_from_sint(ty, x)
+                } else {
+                    self.b.ins().fcvt_from_uint(ty, x)
+                }
+            }
+            4 if bits == 32 => {
+                let x = self.expr(types::F64X2, d);
+                self.b.ins().fvdemote(x)
+            }
+            4 => {
+                let x = self.expr(types::F32X4, d);
+                self.b.ins().fvpromote_low(x)
+            }
+            _ => self.leaf(ty),
+        }
+    }
+
     fn load(&mut self, ty: Type) -> Value {
         let (a, off) = self.addr(ty.bytes());
         let ins = self.b.ins();
@@ -338,8 +737,21 @@ impl Gen<'_, '_> {
     }
 
     fn store(&mut self) {
-        let ty = self.rng.pick(&TYPES);
+        if self.simd && self.rng.chance(30) {
+            let ty = self.rng.pick(&VTYPES);
+            let v = self.expr(ty, 2);
+            let v = self.canon(v);
+            let (a, off) = self.vaddr();
+            self.b.ins().store(MemFlagsData::trusted(), v, a, off);
+            return;
+        }
+        let ty = if self.wide && self.rng.chance(25) {
+            types::I128
+        } else {
+            self.rng.pick(&TYPES)
+        };
         let v = self.expr(ty, 2);
+        let v = if self.simd { self.canon(v) } else { v };
         let (a, off) = self.addr(ty.bytes());
         if ty == types::I64 && self.rng.chance(30) {
             self.b.ins().istore16(MemFlagsData::trusted(), v, a, off);
@@ -349,7 +761,11 @@ impl Gen<'_, '_> {
     }
 
     fn cond(&mut self, depth: u32) -> Value {
-        let ty = self.rng.pick(&TYPES);
+        let ty = if self.wide && self.rng.chance(30) {
+            types::I128
+        } else {
+            self.rng.pick(&TYPES)
+        };
         let (a, b) = (self.expr(ty, depth), self.expr(ty, depth));
         if ty.is_float() {
             let cc = self.rng.pick(&[
@@ -496,14 +912,54 @@ impl Gen<'_, '_> {
     }
 }
 
-/// Generate a random function `%f` from a seed. Returns it with its
+/// Generate a random scalar function `%f` from a seed. Returns it with its
 /// parameter types.
 pub fn generate(seed: u64) -> (Function, Vec<Type>) {
+    generate_with(
+        seed,
+        Features {
+            simd: false,
+            i128: false,
+        },
+    )
+}
+
+/// Like [`generate`], with vector types and operations too.
+pub fn generate_simd(seed: u64) -> (Function, Vec<Type>) {
+    generate_with(
+        seed,
+        Features {
+            simd: true,
+            i128: false,
+        },
+    )
+}
+
+/// Like [`generate`], with `i128` values too.
+pub fn generate_i128(seed: u64) -> (Function, Vec<Type>) {
+    generate_with(
+        seed,
+        Features {
+            simd: false,
+            i128: true,
+        },
+    )
+}
+
+fn generate_with(seed: u64, features: Features) -> (Function, Vec<Type>) {
+    let simd = features.simd;
     let mut rng = Rng(seed.wrapping_mul(0x9E3779B97F4A7C15) | 1);
+    let mut all: Vec<Type> = TYPES.to_vec();
+    if simd {
+        all.extend(VTYPES);
+    }
+    if features.i128 {
+        all.extend([types::I128, types::I128]);
+    }
     let nparams = 1 + rng.below(4) as usize;
-    let params: Vec<Type> = (0..nparams).map(|_| rng.pick(&TYPES)).collect();
+    let params: Vec<Type> = (0..nparams).map(|_| rng.pick(&all)).collect();
     let nvars = 2 + rng.below(5) as usize;
-    let var_tys: Vec<Type> = (0..nvars).map(|_| rng.pick(&TYPES)).collect();
+    let var_tys: Vec<Type> = (0..nvars).map(|_| rng.pick(&all)).collect();
 
     let mut sig = Signature::new(CallConv::SystemV);
     sig.params.extend(params.iter().map(|&t| AbiParam::new(t)));
@@ -532,6 +988,8 @@ pub fn generate(seed: u64) -> (Function, Vec<Type>) {
         vars: vec![],
         slot,
         budget,
+        simd,
+        wide: features.i128,
     };
     // Zero the slot so loads are deterministic.
     for off in (0..SLOT_SIZE).step_by(8) {
@@ -578,7 +1036,15 @@ pub fn arg(rng: &mut Rng, ty: Type) -> DataValue {
         types::I16 => DataValue::I16(i as i16),
         types::I32 => DataValue::I32(i as i32),
         types::I64 => DataValue::I64(i),
+        types::I128 => DataValue::I128(((rng.int() as i128) << 64) ^ i as i128),
         types::F32 => DataValue::F32(Ieee32::with_float((i % 1000) as f32 / 8.0)),
-        _ => DataValue::F64(Ieee64::with_float((i % 100000) as f64 / 16.0)),
+        types::F64 => DataValue::F64(Ieee64::with_float((i % 100000) as f64 / 16.0)),
+        _ => {
+            let mut b = [0u8; 16];
+            for chunk in b.chunks_mut(8) {
+                chunk.copy_from_slice(&rng.int().to_le_bytes());
+            }
+            DataValue::V128(b)
+        }
     }
 }

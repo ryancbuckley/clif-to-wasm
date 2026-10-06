@@ -186,24 +186,41 @@ impl Runner {
         let f = instance
             .get_func(&mut store, name)
             .ok_or_else(|| format!("no export {name}"))?;
-        let args = args
-            .iter()
-            .map(to_val)
-            .collect::<Option<Vec<_>>>()
-            .ok_or("argument type")?;
-        let mut results: Vec<Val> = returns.iter().map(|_| Val::I32(0)).collect();
+        // An i128 travels as two i64s, low half first.
+        let mut wargs = Vec::new();
+        for a in args {
+            match *a {
+                DataValue::I128(x) => {
+                    wargs.extend([Val::I64(x as i64), Val::I64((x >> 64) as i64)])
+                }
+                _ => wargs.push(to_val(a).ok_or("argument type")?),
+            }
+        }
+        let width = |t: &Type| if *t == types::I128 { 2 } else { 1 };
+        let mut results: Vec<Val> = vec![Val::I32(0); returns.iter().map(width).sum::<usize>()];
         let start = std::time::Instant::now();
-        let trapped = f.call(&mut store, &args, &mut results).is_err();
+        let trapped = f.call(&mut store, &wargs, &mut results).is_err();
         *elapsed = start.elapsed().as_secs_f64();
         if trapped {
             return Ok(None);
         }
-        results
-            .iter()
-            .zip(returns)
-            .map(|(v, &ty)| from_val(v, ty))
-            .collect::<Result<_, _>>()
-            .map(Some)
+        let mut out = Vec::new();
+        let mut i = 0;
+        for &ty in returns {
+            if ty == types::I128 {
+                let (Val::I64(lo), Val::I64(hi)) = (&results[i], &results[i + 1]) else {
+                    return Err("bad i128 result".into());
+                };
+                out.push(DataValue::I128(
+                    (*lo as u64 as i128) | ((*hi as i128) << 64),
+                ));
+                i += 2;
+            } else {
+                out.push(from_val(&results[i], ty)?);
+                i += 1;
+            }
+        }
+        Ok(Some(out))
     }
 }
 
@@ -215,6 +232,7 @@ fn to_val(v: &DataValue) -> Option<Val> {
         DataValue::I64(x) => Val::I64(x),
         DataValue::F32(x) => Val::F32(x.bits()),
         DataValue::F64(x) => Val::F64(x.bits()),
+        DataValue::V128(b) => Val::V128(u128::from_le_bytes(b).into()),
         _ => return None,
     })
 }
@@ -230,20 +248,45 @@ fn from_val(v: &Val, ty: Type) -> Result<DataValue, String> {
         (Val::I64(x), _) => DataValue::I64(*x),
         (Val::F32(x), _) => DataValue::F32(Ieee32::with_bits(*x)),
         (Val::F64(x), _) => DataValue::F64(Ieee64::with_bits(*x)),
+        (Val::V128(x), _) => DataValue::V128(x.as_u128().to_le_bytes()),
         _ => return Err(format!("unexpected result {v:?}")),
     })
 }
 
 /// Compare results bitwise, but treat all NaNs as equal like Cranelift's
-/// runtests do.
-pub fn same_results(a: &[DataValue], b: &[DataValue]) -> bool {
+/// runtests do. `types` gives the result types, so that float vectors can be
+/// compared lane by lane.
+pub fn same_results(a: &[DataValue], b: &[DataValue], types: &[Type]) -> bool {
+    fn float_eq(x: u64, y: u64, bits: u32) -> bool {
+        let exp = if bits == 32 {
+            0x7f80_0000
+        } else {
+            0x7ff0_0000_0000_0000
+        };
+        let man = if bits == 32 {
+            0x007f_ffff
+        } else {
+            0x000f_ffff_ffff_ffff
+        };
+        let nan = |v: u64| v & exp == exp && v & man != 0;
+        x == y || (nan(x) && nan(y))
+    }
     a.len() == b.len()
-        && a.iter().zip(b).all(|(a, b)| match (a, b) {
+        && a.iter().zip(b).enumerate().all(|(i, (a, b))| match (a, b) {
             (DataValue::F32(x), DataValue::F32(y)) => {
-                x.bits() == y.bits() || (x.is_nan() && y.is_nan())
+                float_eq(x.bits().into(), y.bits().into(), 32)
             }
-            (DataValue::F64(x), DataValue::F64(y)) => {
-                x.bits() == y.bits() || (x.is_nan() && y.is_nan())
+            (DataValue::F64(x), DataValue::F64(y)) => float_eq(x.bits(), y.bits(), 64),
+            (DataValue::V128(x), DataValue::V128(y))
+                if types
+                    .get(i)
+                    .is_some_and(|t| t.is_vector() && t.lane_type().is_float()) =>
+            {
+                let lb = types[i].lane_bits() as usize / 8;
+                x.chunks(lb).zip(y.chunks(lb)).all(|(p, q)| {
+                    let v = |c: &[u8]| c.iter().rev().fold(0u64, |acc, &b| acc << 8 | b as u64);
+                    float_eq(v(p), v(q), lb as u32 * 8)
+                })
             }
             _ => a == b,
         })
@@ -281,10 +324,10 @@ pub fn run_clif(text: &str, config: &Config) -> Result<Outcome, String> {
                 }
                 RunCommand::Print(inv) => (inv, true, vec![]),
             };
-            let target = &inv.func;
-            let Some(callee) = funcs.iter().find(|f| func_name(f) == *target) else {
-                return Err(format!("no function {target}"));
-            };
+            // Like Cranelift's runner, call the function the command is
+            // attached to; the name in the command is informational.
+            let target = &name;
+            let callee = func;
             let returns: Vec<Type> = callee
                 .signature
                 .returns
@@ -303,7 +346,7 @@ pub fn run_clif(text: &str, config: &Config) -> Result<Outcome, String> {
                     .push(format!("{target}: may call an unsupported function")),
                 Ok(None) => out.failures.push(format!("{text}: trapped")),
                 Ok(Some(got)) => {
-                    if same_results(&got, &expected) == want_equal {
+                    if same_results(&got, &expected, &returns) == want_equal {
                         out.passed += 1;
                     } else {
                         out.failures.push(format!("{text}: got {got:?}"));

@@ -215,19 +215,27 @@ pub(crate) fn same_call(func: &Function, a: &BlockCall, b: &BlockCall) -> bool {
 /// Is this instruction a constant that is rematerialized at each use instead
 /// of being stored in a local?
 pub(crate) fn is_remat(func: &Function, inst: Inst) -> bool {
-    matches!(
-        func.dfg.insts[inst],
+    match func.dfg.insts[inst] {
         InstructionData::UnaryImm {
             opcode: Opcode::Iconst,
             ..
-        } | InstructionData::UnaryIeee32 {
+        }
+        | InstructionData::UnaryIeee32 {
             opcode: Opcode::F32const,
             ..
-        } | InstructionData::UnaryIeee64 {
+        }
+        | InstructionData::UnaryIeee64 {
             opcode: Opcode::F64const,
             ..
-        }
-    )
+        } => true,
+        // Only 128-bit vector constants fit a `v128.const`; others stay
+        // ordinary (and unsupported) instructions.
+        InstructionData::UnaryConst {
+            opcode: Opcode::Vconst,
+            ..
+        } => func.dfg.value_type(func.dfg.first_result(inst)).bits() == 128,
+        _ => false,
+    }
 }
 
 /// Mirrors `cranelift_codegen::inst_predicates` (which is private).

@@ -193,6 +193,13 @@ impl<'a> Emitter<'a> {
             D::UnaryIeee64 { imm, .. } => {
                 self.ins(I::F64Const(wasm_encoder::Ieee64::new(imm.bits())))
             }
+            D::UnaryConst {
+                constant_handle, ..
+            } => {
+                let bytes = self.func.dfg.constants.get(constant_handle).as_slice();
+                let bytes: [u8; 16] = bytes.try_into().expect("128-bit vector constant");
+                self.ins(I::V128Const(i128::from_le_bytes(bytes)))
+            }
             _ => unreachable!(),
         }
         Ok(())
