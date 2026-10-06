@@ -27,6 +27,8 @@ use cranelift_codegen::ir::{self, ExternalName, LibCall, Signature, UserExternal
 use wasm_encoder::ValType;
 
 mod analysis;
+mod emit;
+mod encode;
 mod liveness;
 mod locals;
 mod lower;

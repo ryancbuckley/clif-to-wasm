@@ -23,8 +23,8 @@
 //! loop around a `br_table` that dispatches on a label local.
 
 use crate::analysis::FuncInfo;
+use crate::emit::{Emitter, Label, Task};
 use crate::locals::Locals;
-use crate::lower::{Emitter, Label, Task};
 use crate::stackify::Stackified;
 use crate::{CompiledFunction, Config, Env, Result, unsupported, wasm_signature};
 use cranelift_codegen::ir::{Block, BlockCall, Function, Opcode, types};
@@ -208,6 +208,9 @@ impl Emitter<'_> {
     }
 
     /// Emit the start of a terminator and push the tasks for its successors.
+    ///
+    /// Branch operands are pushed here directly rather than through
+    /// `Emitter::inst`; see `stackify::operands` for why the order is safe.
     fn terminator(&mut self, b: Block) -> Result<()> {
         let func = self.func;
         let info = self.info;

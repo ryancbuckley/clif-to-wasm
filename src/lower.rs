@@ -1,367 +1,16 @@
-//! Per-instruction lowering.
+//! Lowering of individual Cranelift instructions to wasm instructions.
 //!
-//! `i8` and `i16` values are represented as zero-extended `i32`s. Operations
-//! that can set bits above the type's width mask their result; operations
-//! that depend on the sign bit sign-extend their inputs first.
+//! Each case takes its operands with [`Emitter::operand`], which pushes them
+//! in the order given by [`crate::stackify::operands`].
 
-use crate::analysis::{FuncInfo, is_remat};
-use crate::locals::{Locals, NO_LOCAL};
-use crate::stackify::Stackified;
-use crate::{Config, Env, Name, Result, SymbolValue, unsupported, wasm_type};
-use cranelift_codegen::entity::SecondaryMap;
+use crate::emit::{Emitter, is64, narrow_bits, w};
+use crate::{Name, Result, SymbolValue, unsupported, wasm_type};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::{
-    Endianness, Function, Inst, InstructionData as D, Opcode, StackSlot, Type, Value, ValueDef,
-    types,
-};
-use wasm_encoder::{BlockType, Encode, Instruction as I, MemArg, ValType};
+use cranelift_codegen::ir::{Inst, InstructionData as D, Opcode, Type, types};
+use wasm_encoder::{Instruction as I, MemArg, ValType};
 
-/// An entry on the wasm label stack, used to compute branch depths.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Label {
-    If,
-    Loop(cranelift_codegen::ir::Block),
-    BlockFollowedBy(cranelift_codegen::ir::Block),
-    Dispatch,
-    Other,
-}
-
-/// Pending structured-emission work; see `structure.rs`.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum Task {
-    /// Emit a dominator subtree.
-    Tree(cranelift_codegen::ir::Block),
-    /// Move block arguments and transfer control along an edge.
-    Branch {
-        src: cranelift_codegen::ir::Block,
-        call: cranelift_codegen::ir::BlockCall,
-    },
-    Else,
-    /// Close the innermost label.
-    End,
-}
-
-pub(crate) struct Emitter<'a> {
-    pub func: &'a Function,
-    pub config: &'a Config,
-    pub env: &'a mut dyn Env,
-    pub info: &'a FuncInfo,
-    pub stack: &'a Stackified,
-    pub locals: Locals,
-    pub labels: Vec<Label>,
-    pub tasks: Vec<Task>,
-    /// Locals allocated during emission (scratch, frame pointer, label).
-    pub extra: Vec<ValType>,
-    /// Shadow-stack frame: (frame pointer local, frame size).
-    pub frame: Option<(u32, u32)>,
-    pub slot_offset: SecondaryMap<StackSlot, u32>,
-    /// The label local, when emitting a dispatch loop.
-    pub dispatch_label: Option<u32>,
-    sink: Vec<u8>,
-    pending_set: Option<u32>,
-    scratch_free: Vec<(ValType, u32)>,
-    #[cfg(debug_assertions)]
-    expect: Vec<(Vec<Value>, usize)>,
-}
-
-fn is64(ty: Type) -> bool {
-    ty == types::I64 || ty == types::F64
-}
-
-fn narrow_bits(ty: Type) -> Option<u32> {
-    match ty {
-        types::I8 => Some(8),
-        types::I16 => Some(16),
-        _ => None,
-    }
-}
-
-macro_rules! w {
-    ($ty:expr, $a:ident, $b:ident) => {
-        if is64($ty) { I::$b } else { I::$a }
-    };
-}
-
-impl<'a> Emitter<'a> {
-    pub fn new(
-        func: &'a Function,
-        config: &'a Config,
-        env: &'a mut dyn Env,
-        info: &'a FuncInfo,
-        stack: &'a Stackified,
-        locals: Locals,
-    ) -> Self {
-        Emitter {
-            func,
-            config,
-            env,
-            info,
-            stack,
-            locals,
-            labels: Vec::new(),
-            tasks: Vec::new(),
-            extra: Vec::new(),
-            frame: None,
-            slot_offset: SecondaryMap::new(),
-            dispatch_label: None,
-            sink: Vec::new(),
-            pending_set: None,
-            scratch_free: Vec::new(),
-            #[cfg(debug_assertions)]
-            expect: Vec::new(),
-        }
-    }
-
-    // ---- Encoding -------------------------------------------------------
-
-    /// Emit one instruction. `local.set x; local.get x` is fused into
-    /// `local.tee x`.
-    pub fn ins(&mut self, i: I<'_>) {
-        if let Some(l) = self.pending_set.take() {
-            if self.config.use_tee && matches!(i, I::LocalGet(g) if g == l) {
-                I::LocalTee(l).encode(&mut self.sink);
-                return;
-            }
-            I::LocalSet(l).encode(&mut self.sink);
-        }
-        if let I::LocalSet(l) = i {
-            self.pending_set = Some(l);
-            return;
-        }
-        i.encode(&mut self.sink);
-    }
-
-    pub fn finish(mut self) -> (Vec<u8>, Locals, Vec<ValType>) {
-        if let Some(l) = self.pending_set.take() {
-            I::LocalSet(l).encode(&mut self.sink);
-        }
-        (self.sink, self.locals, self.extra)
-    }
-
-    pub fn new_local(&mut self, ty: ValType) -> u32 {
-        self.extra.push(ty);
-        self.locals.next_index() + self.extra.len() as u32 - 1
-    }
-
-    fn scratch(&mut self, ty: ValType) -> u32 {
-        if let Some(i) = self.scratch_free.iter().position(|&(t, _)| t == ty) {
-            return self.scratch_free.swap_remove(i).1;
-        }
-        self.new_local(ty)
-    }
-
-    fn release(&mut self, ty: ValType, l: u32) {
-        self.scratch_free.push((ty, l));
-    }
-
-    pub fn br_depth(&self, label: Label) -> u32 {
-        let i = self
-            .labels
-            .iter()
-            .rposition(|&l| l == label)
-            .expect("branch target in scope");
-        (self.labels.len() - 1 - i) as u32
-    }
-
-    // ---- Values ---------------------------------------------------------
-
-    fn ty(&self, v: Value) -> Type {
-        self.func.dfg.value_type(v)
-    }
-
-    pub fn local(&self, v: Value) -> u32 {
-        let l = self.locals.local_of[v];
-        debug_assert_ne!(l, NO_LOCAL, "{v} has no local");
-        l
-    }
-
-    /// Push the value `v`.
-    pub fn value(&mut self, v: Value) -> Result<()> {
-        #[cfg(debug_assertions)]
-        if let Some((exp, i)) = self.expect.last_mut() {
-            assert_eq!(exp.get(*i), Some(&v), "operand order mismatch");
-            *i += 1;
-        }
-        match self.func.dfg.value_def(v) {
-            ValueDef::Result(d, _) if is_remat(self.func, d) => self.constant(d),
-            ValueDef::Result(d, _) if self.stack.inlined[d] => self.inst(d),
-            _ => {
-                self.ins(I::LocalGet(self.local(v)));
-                Ok(())
-            }
-        }
-    }
-
-    fn constant(&mut self, inst: Inst) -> Result<()> {
-        let ty = self.ty(self.func.dfg.first_result(inst));
-        match self.func.dfg.insts[inst] {
-            D::UnaryImm { imm, .. } => self.iconst(ty, imm.bits()),
-            D::UnaryIeee32 { imm, .. } => {
-                self.ins(I::F32Const(wasm_encoder::Ieee32::new(imm.bits())))
-            }
-            D::UnaryIeee64 { imm, .. } => {
-                self.ins(I::F64Const(wasm_encoder::Ieee64::new(imm.bits())))
-            }
-            _ => unreachable!(),
-        }
-        Ok(())
-    }
-
-    fn iconst(&mut self, ty: Type, v: i64) {
-        match ty {
-            types::I64 => self.ins(I::I64Const(v)),
-            types::I8 => self.ins(I::I32Const((v as u8) as i32)),
-            types::I16 => self.ins(I::I32Const((v as u16) as i32)),
-            _ => self.ins(I::I32Const(v as i32)),
-        }
-    }
-
-    fn ptr_const(&mut self, v: i64) {
-        if self.config.memory64 {
-            self.ins(I::I64Const(v))
-        } else {
-            self.ins(I::I32Const(v as i32))
-        }
-    }
-
-    fn ptr_add(&mut self) {
-        self.ins(if self.config.memory64 {
-            I::I64Add
-        } else {
-            I::I32Add
-        })
-    }
-
-    /// Clear the bits above a narrow type's width.
-    fn mask(&mut self, ty: Type) {
-        if let Some(bits) = narrow_bits(ty) {
-            self.ins(I::I32Const(((1u32 << bits) - 1) as i32));
-            self.ins(I::I32And);
-        }
-    }
-
-    /// Sign-extend a narrow value to its full `i32`.
-    fn sext(&mut self, ty: Type) {
-        match ty {
-            types::I8 => self.ins(I::I32Extend8S),
-            types::I16 => self.ins(I::I32Extend16S),
-            _ => {}
-        }
-    }
-
-    /// Convert an integer on the stack to an `i32` truth value.
-    fn int_to_cond(&mut self, ty: Type) {
-        if ty == types::I64 {
-            self.ins(I::I64Const(0));
-            self.ins(I::I64Ne);
-        }
-    }
-
-    /// Push a value and convert it to the wasm address type.
-    fn address(&mut self, v: Value) -> Result<()> {
-        self.value(v)?;
-        match (self.ty(v), self.config.memory64) {
-            (types::I64, false) => self.ins(I::I32WrapI64),
-            (types::I64, true) => {}
-            (types::I32, true) => self.ins(I::I64ExtendI32U),
-            (types::I32, false) => {}
-            (ty, _) => return unsupported(format!("address of type {ty}")),
-        }
-        Ok(())
-    }
-
-    /// Push a shift amount, converted to the shifted type's width and
-    /// masked for narrow types.
-    fn shift_amount(&mut self, amt: Value, ty: Type) -> Result<()> {
-        self.value(amt)?;
-        match (is64(self.ty(amt)), is64(ty)) {
-            (true, false) => self.ins(I::I32WrapI64),
-            (false, true) => self.ins(I::I64ExtendI32U),
-            _ => {}
-        }
-        if let Some(bits) = narrow_bits(ty) {
-            self.ins(I::I32Const(bits as i32 - 1));
-            self.ins(I::I32And);
-        }
-        Ok(())
-    }
-
-    fn memarg(&mut self, offset: u64, flags: cranelift_codegen::ir::MemFlags, size: u32) -> MemArg {
-        let data = self.func.dfg.mem_flags[flags];
-        MemArg {
-            offset,
-            align: if data.aligned() {
-                size.trailing_zeros()
-            } else {
-                0
-            },
-            memory_index: self.config.memory_index,
-        }
-    }
-
-    /// Push an address and return the static offset to use in the memarg.
-    fn mem_address(
-        &mut self,
-        addr: Value,
-        offset: i32,
-        flags: cranelift_codegen::ir::MemFlags,
-    ) -> Result<u64> {
-        if self.func.dfg.mem_flags[flags].explicit_endianness() == Some(Endianness::Big) {
-            return unsupported("big-endian memory access");
-        }
-        self.address(addr)?;
-        if offset >= 0 {
-            Ok(offset as u64)
-        } else {
-            self.ptr_const(offset as i64);
-            self.ptr_add();
-            Ok(0)
-        }
-    }
-
-    pub fn epilogue(&mut self) {
-        if let Some((fp, size)) = self.frame {
-            self.ins(I::LocalGet(fp));
-            self.ptr_const(size as i64);
-            self.ptr_add();
-            self.ins(I::GlobalSet(self.config.stack_pointer_global.unwrap()));
-        }
-    }
-
-    // ---- Instructions -----------------------------------------------------
-
-    /// Emit a root instruction and store or drop its results.
-    pub fn root(&mut self, inst: Inst) -> Result<()> {
-        self.inst(inst)?;
-        for &r in self.func.dfg.inst_results(inst).iter().rev() {
-            let l = self.locals.local_of[r];
-            if l == NO_LOCAL {
-                self.ins(I::Drop);
-            } else {
-                self.ins(I::LocalSet(l));
-            }
-        }
-        Ok(())
-    }
-
-    /// Emit an instruction, leaving its results on the stack.
-    pub fn inst(&mut self, inst: Inst) -> Result<()> {
-        #[cfg(debug_assertions)]
-        {
-            let mut ops = Vec::new();
-            crate::stackify::operands(self.func, self.info, inst, &mut ops);
-            self.expect.push((ops.iter().map(|o| o.value).collect(), 0));
-        }
-        self.lower(inst)?;
-        #[cfg(debug_assertions)]
-        {
-            let (exp, i) = self.expect.pop().unwrap();
-            assert_eq!(exp.len(), i, "not all operands of {inst} were emitted");
-        }
-        Ok(())
-    }
-
-    fn lower(&mut self, inst: Inst) -> Result<()> {
+impl Emitter<'_> {
+    pub(crate) fn lower(&mut self, inst: Inst) -> Result<()> {
         let func = self.func;
         let dfg = &func.dfg;
         let data = dfg.insts[inst];
@@ -381,8 +30,8 @@ impl<'a> Emitter<'a> {
 
             // Integer arithmetic.
             (Opcode::Iadd | Opcode::Isub | Opcode::Imul, _) => {
-                self.value(args[0])?;
-                self.value(args[1])?;
+                self.operand()?;
+                self.operand()?;
                 self.ins(match op {
                     Opcode::Iadd => w!(ty, I32Add, I64Add),
                     Opcode::Isub => w!(ty, I32Sub, I64Sub),
@@ -391,8 +40,8 @@ impl<'a> Emitter<'a> {
                 self.mask(ty);
             }
             (Opcode::Band | Opcode::Bor | Opcode::Bxor, _) if ty.is_int() => {
-                self.value(args[0])?;
-                self.value(args[1])?;
+                self.operand()?;
+                self.operand()?;
                 self.ins(match op {
                     Opcode::Band => w!(ty, I32And, I64And),
                     Opcode::Bor => w!(ty, I32Or, I64Or),
@@ -400,7 +49,7 @@ impl<'a> Emitter<'a> {
                 });
             }
             (Opcode::Bnot | Opcode::Ineg, _) if ty.is_int() => {
-                self.value(args[0])?;
+                self.operand()?;
                 if is64(ty) {
                     self.ins(I::I64Const(-1));
                 } else {
@@ -415,11 +64,11 @@ impl<'a> Emitter<'a> {
                 self.mask(ty);
             }
             (Opcode::Ishl | Opcode::Ushr | Opcode::Sshr, _) => {
-                self.value(args[0])?;
+                self.operand()?;
                 if op == Opcode::Sshr {
                     self.sext(ty);
                 }
-                self.shift_amount(args[1], ty)?;
+                self.shift_amount(ty)?;
                 self.ins(match op {
                     Opcode::Ishl => w!(ty, I32Shl, I64Shl),
                     Opcode::Ushr => w!(ty, I32ShrU, I64ShrU),
@@ -430,12 +79,12 @@ impl<'a> Emitter<'a> {
                 }
             }
             (Opcode::Rotl | Opcode::Rotr, _) => {
-                self.value(args[0])?;
+                self.operand()?;
                 if let Some(bits) = narrow_bits(ty) {
                     let x = self.scratch(ValType::I32);
                     let n = self.scratch(ValType::I32);
                     self.ins(I::LocalTee(x));
-                    self.shift_amount(args[1], ty)?;
+                    self.shift_amount(ty)?;
                     self.ins(I::LocalTee(n));
                     let (first, second) = if op == Opcode::Rotl {
                         (I::I32Shl, I::I32ShrU)
@@ -453,7 +102,7 @@ impl<'a> Emitter<'a> {
                     self.release(ValType::I32, x);
                     self.release(ValType::I32, n);
                 } else {
-                    self.shift_amount(args[1], ty)?;
+                    self.shift_amount(ty)?;
                     self.ins(if op == Opcode::Rotl {
                         w!(ty, I32Rotl, I64Rotl)
                     } else {
@@ -462,8 +111,8 @@ impl<'a> Emitter<'a> {
                 }
             }
             (Opcode::Udiv | Opcode::Urem, _) => {
-                self.value(args[0])?;
-                self.value(args[1])?;
+                self.operand()?;
+                self.operand()?;
                 self.ins(if op == Opcode::Udiv {
                     w!(ty, I32DivU, I64DivU)
                 } else {
@@ -471,9 +120,9 @@ impl<'a> Emitter<'a> {
                 });
             }
             (Opcode::Sdiv | Opcode::Srem, _) => {
-                self.value(args[0])?;
+                self.operand()?;
                 self.sext(ty);
-                self.value(args[1])?;
+                self.operand()?;
                 self.sext(ty);
                 if op == Opcode::Sdiv {
                     self.ins(w!(ty, I32DivS, I64DivS));
@@ -497,11 +146,11 @@ impl<'a> Emitter<'a> {
                 match ty {
                     types::I8 | types::I16 => {
                         let bits = narrow_bits(ty).unwrap();
-                        self.value(args[0])?;
+                        self.operand()?;
                         if signed {
                             self.sext(ty);
                         }
-                        self.value(args[1])?;
+                        self.operand()?;
                         if signed {
                             self.sext(ty);
                         }
@@ -516,9 +165,9 @@ impl<'a> Emitter<'a> {
                         } else {
                             I::I64ExtendI32U
                         };
-                        self.value(args[0])?;
+                        self.operand()?;
                         self.ins(ext.clone());
-                        self.value(args[1])?;
+                        self.operand()?;
                         self.ins(ext);
                         self.ins(I::I64Mul);
                         self.ins(I::I64Const(32));
@@ -529,7 +178,7 @@ impl<'a> Emitter<'a> {
                 }
             }
             (Opcode::Iabs, _) => {
-                self.value(args[0])?;
+                self.operand()?;
                 self.sext(ty);
                 let vt = wasm_type(ty)?;
                 let s = self.scratch(vt);
@@ -556,12 +205,12 @@ impl<'a> Emitter<'a> {
                 let vt = wasm_type(ty)?;
                 let a = self.scratch(vt);
                 let b = self.scratch(vt);
-                self.value(args[0])?;
+                self.operand()?;
                 if signed {
                     self.sext(ty);
                 }
                 self.ins(I::LocalTee(a));
-                self.value(args[1])?;
+                self.operand()?;
                 if signed {
                     self.sext(ty);
                 }
@@ -582,7 +231,7 @@ impl<'a> Emitter<'a> {
                 self.release(vt, b);
             }
             (Opcode::Clz | Opcode::Ctz | Opcode::Popcnt, _) => {
-                self.value(args[0])?;
+                self.operand()?;
                 let bits = narrow_bits(ty);
                 if let (Opcode::Ctz, Some(bits)) = (op, bits) {
                     self.ins(I::I32Const(1 << bits));
@@ -599,7 +248,7 @@ impl<'a> Emitter<'a> {
                 }
             }
             (Opcode::Cls, _) => {
-                self.value(args[0])?;
+                self.operand()?;
                 self.sext(ty);
                 let vt = wasm_type(ty)?;
                 let s = self.scratch(vt);
@@ -633,11 +282,11 @@ impl<'a> Emitter<'a> {
                         | IntCC::SignedGreaterThan
                         | IntCC::SignedGreaterThanOrEqual
                 );
-                self.value(args[0])?;
+                self.operand()?;
                 if signed {
                     self.sext(aty);
                 }
-                self.value(args[1])?;
+                self.operand()?;
                 if signed {
                     self.sext(aty);
                 }
@@ -655,7 +304,7 @@ impl<'a> Emitter<'a> {
                 });
             }
             (Opcode::Bmask, _) => {
-                self.value(args[0])?;
+                self.operand()?;
                 self.ins(w!(aty, I32Eqz, I64Eqz));
                 self.ins(I::I32Eqz);
                 if is64(ty) {
@@ -669,20 +318,20 @@ impl<'a> Emitter<'a> {
                 }
             }
             (Opcode::Select | Opcode::SelectSpectreGuard, _) if !ty.is_vector() => {
-                self.value(args[1])?;
-                self.value(args[2])?;
-                self.value(args[0])?;
+                self.operand()?;
+                self.operand()?;
+                self.operand()?;
                 self.int_to_cond(aty);
                 self.ins(I::Select);
             }
             (Opcode::Bitselect, _) if ty.is_int() => {
                 let vt = wasm_type(ty)?;
                 let c = self.scratch(vt);
-                self.value(args[0])?;
+                self.operand()?;
                 self.ins(I::LocalTee(c));
-                self.value(args[1])?;
+                self.operand()?;
                 self.ins(w!(ty, I32And, I64And));
-                self.value(args[2])?;
+                self.operand()?;
                 self.ins(I::LocalGet(c));
                 if is64(ty) {
                     self.ins(I::I64Const(-1));
@@ -699,9 +348,9 @@ impl<'a> Emitter<'a> {
                 let vt = wasm_type(ty)?;
                 let a = self.scratch(vt);
                 let r = self.scratch(vt);
-                self.value(args[0])?;
+                self.operand()?;
                 self.ins(I::LocalTee(a));
-                self.value(args[1])?;
+                self.operand()?;
                 self.ins(w!(ty, I32Add, I64Add));
                 self.ins(I::LocalTee(r));
                 if let Some(bits) = narrow_bits(ty) {
@@ -719,13 +368,13 @@ impl<'a> Emitter<'a> {
 
             // Conversions.
             (Opcode::Uextend, _) => {
-                self.value(args[0])?;
+                self.operand()?;
                 if is64(ty) && !is64(aty) {
                     self.ins(I::I64ExtendI32U);
                 }
             }
             (Opcode::Sextend, _) => {
-                self.value(args[0])?;
+                self.operand()?;
                 self.sext(aty);
                 if is64(ty) && !is64(aty) {
                     self.ins(I::I64ExtendI32S);
@@ -733,14 +382,14 @@ impl<'a> Emitter<'a> {
                 self.mask(ty);
             }
             (Opcode::Ireduce, _) => {
-                self.value(args[0])?;
+                self.operand()?;
                 if is64(aty) {
                     self.ins(I::I32WrapI64);
                 }
                 self.mask(ty);
             }
             (Opcode::Bitcast, _) if !ty.is_vector() => {
-                self.value(args[0])?;
+                self.operand()?;
                 match (aty, ty) {
                     (a, b) if a == b => {}
                     (types::I32, types::F32) => self.ins(I::F32ReinterpretI32),
@@ -751,16 +400,16 @@ impl<'a> Emitter<'a> {
                 }
             }
             (Opcode::Fpromote, _) if ty == types::F64 && aty == types::F32 => {
-                self.value(args[0])?;
+                self.operand()?;
                 self.ins(I::F64PromoteF32);
             }
             (Opcode::Fdemote, _) if ty == types::F32 && aty == types::F64 => {
-                self.value(args[0])?;
+                self.operand()?;
                 self.ins(I::F32DemoteF64);
             }
             (Opcode::FcvtFromSint | Opcode::FcvtFromUint, _) if !ty.is_vector() => {
                 let signed = op == Opcode::FcvtFromSint;
-                self.value(args[0])?;
+                self.operand()?;
                 if signed {
                     self.sext(aty);
                 }
@@ -783,7 +432,7 @@ impl<'a> Emitter<'a> {
                     types::F64 => true,
                     _ => return unsupported(format!("{op} {aty}")),
                 };
-                self.value(args[0])?;
+                self.operand()?;
                 self.ins(match (is64(ty), f64, signed) {
                     (false, false, true) => I::I32TruncF32S,
                     (false, false, false) => I::I32TruncF32U,
@@ -816,7 +465,7 @@ impl<'a> Emitter<'a> {
                 if matches!(ty, types::I32 | types::I64) =>
             {
                 let signed = op == Opcode::FcvtToSintSat;
-                self.value(args[0])?;
+                self.operand()?;
                 self.ins(match (is64(ty), aty == types::F64, signed) {
                     (false, false, true) => I::I32TruncSatF32S,
                     (false, false, false) => I::I32TruncSatF32U,
@@ -840,8 +489,8 @@ impl<'a> Emitter<'a> {
                 | Opcode::Fcopysign,
                 _,
             ) if matches!(ty, types::F32 | types::F64) => {
-                self.value(args[0])?;
-                self.value(args[1])?;
+                self.operand()?;
+                self.operand()?;
                 self.ins(match op {
                     Opcode::Fadd => w!(ty, F32Add, F64Add),
                     Opcode::Fsub => w!(ty, F32Sub, F64Sub),
@@ -862,7 +511,7 @@ impl<'a> Emitter<'a> {
                 | Opcode::Nearest,
                 _,
             ) if matches!(ty, types::F32 | types::F64) => {
-                self.value(args[0])?;
+                self.operand()?;
                 self.ins(match op {
                     Opcode::Fneg => w!(ty, F32Neg, F64Neg),
                     Opcode::Fabs => w!(ty, F32Abs, F64Abs),
@@ -874,7 +523,7 @@ impl<'a> Emitter<'a> {
                 });
             }
             (Opcode::Fcmp, D::FloatCompare { cond, .. }) if !aty.is_vector() => {
-                self.fcmp(cond, aty, args[0], args[1])?;
+                self.fcmp(cond, aty)?;
             }
 
             // Memory.
@@ -886,11 +535,9 @@ impl<'a> Emitter<'a> {
                 | Opcode::Sload16
                 | Opcode::Uload32
                 | Opcode::Sload32,
-                D::Load {
-                    arg, flags, offset, ..
-                },
+                D::Load { flags, offset, .. },
             ) => {
-                let off = self.mem_address(arg, offset.into(), flags)?;
+                let off = self.mem_address(offset.into(), flags)?;
                 let (size, i) = match (op, ty) {
                     (Opcode::Load, types::I8) => (1, I::I32Load8U as fn(MemArg) -> I<'static>),
                     (Opcode::Load, types::I16) => (2, I::I32Load16U as _),
@@ -917,14 +564,14 @@ impl<'a> Emitter<'a> {
             (
                 Opcode::Store | Opcode::Istore8 | Opcode::Istore16 | Opcode::Istore32,
                 D::Store {
-                    args: [x, p],
+                    args: [x, _],
                     flags,
                     offset,
                     ..
                 },
             ) => {
-                let off = self.mem_address(p, offset.into(), flags)?;
-                self.value(x)?;
+                let off = self.mem_address(offset.into(), flags)?;
+                self.operand()?;
                 let vty = dfg.value_type(x);
                 let (size, i) = match (op, vty) {
                     (Opcode::Store, types::I8) => (1, I::I32Store8 as fn(MemArg) -> I<'static>),
@@ -990,8 +637,8 @@ impl<'a> Emitter<'a> {
 
             // Calls.
             (Opcode::Call | Opcode::ReturnCall, D::Call { func_ref, .. }) => {
-                for &a in args {
-                    self.value(a)?;
+                for _ in args {
+                    self.operand()?;
                 }
                 let name = &dfg.ext_funcs[func_ref].name;
                 let idx = self.env.func_index(Name::resolve(func, name))?;
@@ -1011,10 +658,10 @@ impl<'a> Emitter<'a> {
                 Opcode::CallIndirect | Opcode::ReturnCallIndirect,
                 D::CallIndirect { sig_ref, .. },
             ) => {
-                for &a in &args[1..] {
-                    self.value(a)?;
+                for _ in &args[1..] {
+                    self.operand()?;
                 }
-                self.value(args[0])?;
+                self.operand()?;
                 if is64(aty) {
                     self.ins(I::I32WrapI64);
                 }
@@ -1042,8 +689,8 @@ impl<'a> Emitter<'a> {
                 }
             }
             (Opcode::Return, _) => {
-                for &a in args {
-                    self.value(a)?;
+                for _ in args {
+                    self.operand()?;
                 }
                 self.epilogue();
                 self.ins(I::Return);
@@ -1052,7 +699,7 @@ impl<'a> Emitter<'a> {
             // Traps.
             (Opcode::Trap, _) => self.ins(I::Unreachable),
             (Opcode::Trapz | Opcode::Trapnz, _) => {
-                self.value(args[0])?;
+                self.operand()?;
                 self.int_to_cond(aty);
                 if op == Opcode::Trapz {
                     self.ins(I::I32Eqz);
@@ -1065,25 +712,8 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
-    /// Convert a pointer-typed value on the stack to `ty`.
-    fn ptr_to(&mut self, ty: Type) -> Result<()> {
-        match (self.config.memory64, ty) {
-            (false, types::I32) | (true, types::I64) => {}
-            (false, types::I64) => self.ins(I::I64ExtendI32U),
-            (true, types::I32) => self.ins(I::I32WrapI64),
-            _ => return unsupported(format!("pointer of type {ty}")),
-        }
-        Ok(())
-    }
-
-    /// Trap if the `i32` on the stack is nonzero.
-    fn trap_if(&mut self) {
-        self.ins(I::If(BlockType::Empty));
-        self.ins(I::Unreachable);
-        self.ins(I::End);
-    }
-
-    fn fcmp(&mut self, cond: FloatCC, ty: Type, a: Value, b: Value) -> Result<()> {
+    /// Push both operands and compare them.
+    fn fcmp(&mut self, cond: FloatCC, ty: Type) -> Result<()> {
         let vt = wasm_type(ty)?;
         let simple = |cc| -> Option<(I<'static>, bool)> {
             Some(match cc {
@@ -1102,8 +732,8 @@ impl<'a> Emitter<'a> {
             })
         };
         if let Some((i, negate)) = simple(cond) {
-            self.value(a)?;
-            self.value(b)?;
+            self.operand()?;
+            self.operand()?;
             self.ins(i);
             if negate {
                 self.ins(I::I32Eqz);
@@ -1120,20 +750,20 @@ impl<'a> Emitter<'a> {
                 } else {
                     (w!(ty, F32Ne, F64Ne), I::I32Or)
                 };
-                self.value(a)?;
+                self.operand()?;
                 self.ins(I::LocalTee(sa));
                 self.ins(I::LocalGet(sa));
                 self.ins(cmp.clone());
-                self.value(b)?;
+                self.operand()?;
                 self.ins(I::LocalTee(sb));
                 self.ins(I::LocalGet(sb));
                 self.ins(cmp);
                 self.ins(comb);
             }
             FloatCC::OrderedNotEqual | FloatCC::UnorderedOrEqual => {
-                self.value(a)?;
+                self.operand()?;
                 self.ins(I::LocalTee(sa));
-                self.value(b)?;
+                self.operand()?;
                 self.ins(I::LocalTee(sb));
                 self.ins(w!(ty, F32Lt, F64Lt));
                 self.ins(I::LocalGet(sa));

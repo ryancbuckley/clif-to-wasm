@@ -59,8 +59,15 @@ pub(crate) struct Operand {
     pub conditional: bool,
 }
 
-/// The operands of `inst` in the order the emitter pushes them. The emitter
-/// and the stackifier must agree on this order.
+/// The operands of `inst` in the order they are pushed. This is the single
+/// source of truth for evaluation order: lowering takes its operands from
+/// this list one by one ([`crate::emit::Emitter::operand`]).
+///
+/// The exception is branches (`jump`, `brif`, `br_table`), which
+/// `structure.rs` emits itself: the condition or index first, then each
+/// edge's arguments inside that edge's arm. Only the first operand there can
+/// hold side effects, because arguments of a multi-way branch only accept
+/// pure trees, so the order among the arguments does not matter.
 pub(crate) fn operands(func: &Function, info: &FuncInfo, inst: Inst, out: &mut Vec<Operand>) {
     out.clear();
     let dfg = &func.dfg;
