@@ -174,6 +174,50 @@ impl Emitter<'_> {
                         self.ins(I::I64ShrU);
                         self.ins(I::I32WrapI64);
                     }
+                    types::I64 => self.mulhi64(signed)?,
+                    _ => return unsupported(format!("{op}.{ty}")),
+                }
+            }
+            (Opcode::Bswap | Opcode::Bitrev, _) => {
+                self.operand()?;
+                let bits = narrow_bits(ty);
+                if op == Opcode::Bitrev {
+                    let wide = is64(ty);
+                    self.swap_bits(wide, 1, 0x5555_5555_5555_5555);
+                    self.swap_bits(wide, 2, 0x3333_3333_3333_3333);
+                    self.swap_bits(wide, 4, 0x0f0f_0f0f_0f0f_0f0f);
+                }
+                match ty {
+                    // Byte-reverse as 32 bits, then shift down: a narrow
+                    // value's high bits are zero, so the result is
+                    // zero-extended too.
+                    types::I8 | types::I16 | types::I32 => {
+                        let s = self.scratch(ValType::I32);
+                        if !(op == Opcode::Bswap && ty == types::I8) {
+                            self.ins(I::LocalTee(s));
+                            self.ins(I::I32Const(0x00ff_00ff));
+                            self.ins(I::I32And);
+                            self.ins(I::I32Const(8));
+                            self.ins(I::I32Rotr);
+                            self.ins(I::LocalGet(s));
+                            self.ins(I::I32Const(0xff00_ff00u32 as i32));
+                            self.ins(I::I32And);
+                            self.ins(I::I32Const(8));
+                            self.ins(I::I32Rotl);
+                            self.ins(I::I32Or);
+                            if let Some(bits) = bits {
+                                self.ins(I::I32Const(32 - bits as i32));
+                                self.ins(I::I32ShrU);
+                            }
+                        }
+                        self.release(ValType::I32, s);
+                    }
+                    types::I64 => {
+                        self.swap_bits(true, 8, 0x00ff_00ff_00ff_00ff);
+                        self.swap_bits(true, 16, 0x0000_ffff_0000_ffff);
+                        self.ins(I::I64Const(32));
+                        self.ins(I::I64Rotl);
+                    }
                     _ => return unsupported(format!("{op}.{ty}")),
                 }
             }
@@ -708,6 +752,103 @@ impl Emitter<'_> {
             }
 
             _ => return unsupported(format!("instruction `{}`", dfg.display_inst(inst))),
+        }
+        Ok(())
+    }
+
+    /// Swap adjacent `shift`-bit groups of the value on the stack:
+    /// `((x >> shift) & mask) | ((x & mask) << shift)`.
+    fn swap_bits(&mut self, wide: bool, shift: i64, mask: u64) {
+        let vt = if wide { ValType::I64 } else { ValType::I32 };
+        let s = self.scratch(vt);
+        let (konst, and, or, shl, shr): (fn(i64) -> I<'static>, _, _, _, _) = if wide {
+            (I::I64Const, I::I64And, I::I64Or, I::I64Shl, I::I64ShrU)
+        } else {
+            (
+                |v| I::I32Const(v as i32),
+                I::I32And,
+                I::I32Or,
+                I::I32Shl,
+                I::I32ShrU,
+            )
+        };
+        self.ins(I::LocalTee(s));
+        self.ins(konst(shift));
+        self.ins(shr);
+        self.ins(konst(mask as i64));
+        self.ins(and.clone());
+        self.ins(I::LocalGet(s));
+        self.ins(konst(mask as i64));
+        self.ins(and);
+        self.ins(konst(shift));
+        self.ins(shl);
+        self.ins(or);
+        self.release(vt, s);
+    }
+
+    /// The high 64 bits of a 64x64-bit product, from 32-bit pieces:
+    /// with `p1 = a.lo * b.hi` and `p2 = a.hi * b.lo`,
+    /// `hi = a.hi*b.hi + p1.hi + p2.hi + (p0.hi + p1.lo + p2.lo).hi`.
+    /// The signed version subtracts `b` if `a < 0` and `a` if `b < 0`.
+    fn mulhi64(&mut self, signed: bool) -> Result<()> {
+        let [a, b, p1, p2] = [(); 4].map(|_| self.scratch(ValType::I64));
+        let lo32 = |e: &mut Self, l: u32| {
+            e.ins(I::LocalGet(l));
+            e.ins(I::I64Const(0xffff_ffff));
+            e.ins(I::I64And);
+        };
+        let hi32 = |e: &mut Self, l: u32| {
+            e.ins(I::LocalGet(l));
+            e.ins(I::I64Const(32));
+            e.ins(I::I64ShrU);
+        };
+        self.operand()?;
+        self.ins(I::LocalSet(a));
+        self.operand()?;
+        self.ins(I::LocalSet(b));
+        lo32(self, a);
+        hi32(self, b);
+        self.ins(I::I64Mul);
+        self.ins(I::LocalSet(p1));
+        hi32(self, a);
+        lo32(self, b);
+        self.ins(I::I64Mul);
+        self.ins(I::LocalSet(p2));
+        // a.hi*b.hi + p1.hi + p2.hi
+        hi32(self, a);
+        hi32(self, b);
+        self.ins(I::I64Mul);
+        hi32(self, p1);
+        self.ins(I::I64Add);
+        hi32(self, p2);
+        self.ins(I::I64Add);
+        // + (p0.hi + p1.lo + p2.lo).hi
+        lo32(self, a);
+        lo32(self, b);
+        self.ins(I::I64Mul);
+        self.ins(I::I64Const(32));
+        self.ins(I::I64ShrU);
+        lo32(self, p1);
+        self.ins(I::I64Add);
+        lo32(self, p2);
+        self.ins(I::I64Add);
+        self.ins(I::I64Const(32));
+        self.ins(I::I64ShrU);
+        self.ins(I::I64Add);
+        if signed {
+            for (x, y) in [(a, b), (b, a)] {
+                // - (x < 0 ? y : 0)
+                self.ins(I::LocalGet(y));
+                self.ins(I::I64Const(0));
+                self.ins(I::LocalGet(x));
+                self.ins(I::I64Const(0));
+                self.ins(I::I64LtS);
+                self.ins(I::Select);
+                self.ins(I::I64Sub);
+            }
+        }
+        for l in [a, b, p1, p2] {
+            self.release(ValType::I64, l);
         }
         Ok(())
     }
