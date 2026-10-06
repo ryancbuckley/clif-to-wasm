@@ -16,3 +16,7 @@ wasmparser = "0.245"
 wasmprinter = "0.245"
 wasmtime = { version = "=49.0.2", default-features = false, features = ["cranelift", "runtime", "std"] }
 wat = "1.261.0"
+
+[[bench]]
+name = "codegen"
+harness = false

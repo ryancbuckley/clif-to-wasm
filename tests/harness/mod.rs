@@ -2,6 +2,9 @@
 //! Runs CLIF filetests (`; run:` directives) through the wasm backend and
 //! executes the result with wasmtime.
 
+pub mod clifgen;
+pub mod kernels;
+
 use cranelift_codegen::data_value::DataValue;
 use cranelift_codegen::ir::{Function, Type, UserFuncName, immediates::*, types};
 use cranelift_reader::{Comparison, ParseOptions, RunCommand, parse_run_command, parse_test};
@@ -154,6 +157,29 @@ impl Runner {
         args: &[DataValue],
         returns: &[Type],
     ) -> Result<Option<Vec<DataValue>>, String> {
+        self.call_timed(name, args, returns).0
+    }
+
+    /// Like `call`, also returning the time (in seconds) spent in the call
+    /// itself, excluding instantiation.
+    pub fn call_timed(
+        &self,
+        name: &str,
+        args: &[DataValue],
+        returns: &[Type],
+    ) -> (Result<Option<Vec<DataValue>>, String>, f64) {
+        let mut elapsed = 0.0;
+        let r = self.call_inner(name, args, returns, &mut elapsed);
+        (r, elapsed)
+    }
+
+    fn call_inner(
+        &self,
+        name: &str,
+        args: &[DataValue],
+        returns: &[Type],
+        elapsed: &mut f64,
+    ) -> Result<Option<Vec<DataValue>>, String> {
         let mut store = wasmtime::Store::new(&self.engine, ());
         let instance =
             wasmtime::Instance::new(&mut store, &self.module, &[]).map_err(|e| e.to_string())?;
@@ -166,7 +192,10 @@ impl Runner {
             .collect::<Option<Vec<_>>>()
             .ok_or("argument type")?;
         let mut results: Vec<Val> = returns.iter().map(|_| Val::I32(0)).collect();
-        if f.call(&mut store, &args, &mut results).is_err() {
+        let start = std::time::Instant::now();
+        let trapped = f.call(&mut store, &args, &mut results).is_err();
+        *elapsed = start.elapsed().as_secs_f64();
+        if trapped {
             return Ok(None);
         }
         results
