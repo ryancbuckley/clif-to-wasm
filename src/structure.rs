@@ -23,7 +23,7 @@
 //! loop around a `br_table` that dispatches on a label local.
 
 use crate::analysis::FuncInfo;
-use crate::locals::{Locals, NO_LOCAL};
+use crate::locals::Locals;
 use crate::lower::{Emitter, Label, Task};
 use crate::stackify::Stackified;
 use crate::{CompiledFunction, Config, Env, Result, unsupported, wasm_signature};
@@ -312,10 +312,7 @@ impl Emitter<'_> {
         let info = self.info;
         let moves: Vec<_> = info
             .live_arg_pairs(func, call)
-            .filter(|&(a, p)| {
-                let la = self.locals.local_of[a];
-                la == NO_LOCAL || la != self.locals.local_of[p]
-            })
+            .filter(|&(a, p)| self.locals.move_needed(a, p))
             .collect();
         for &(a, _) in &moves {
             self.value(a)?;

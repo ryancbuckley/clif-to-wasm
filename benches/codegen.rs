@@ -1,6 +1,7 @@
 //! Code generation benchmarks.
 //!
-//! Reports, for the naive (no expression trees) and default configurations:
+//! Reports, for the naive (no expression trees), no-coalesce and default
+//! configurations:
 //!
 //! - static output metrics: code bytes, declared locals, `local.*` ops;
 //! - compile speed of this backend;
@@ -30,6 +31,13 @@ fn variants() -> Vec<(&'static str, Config)> {
             Config {
                 stackify: false,
                 use_tee: false,
+                ..Config::default()
+            },
+        ),
+        (
+            "no-coalesce",
+            Config {
+                coalesce: false,
                 ..Config::default()
             },
         ),

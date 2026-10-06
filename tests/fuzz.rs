@@ -42,6 +42,10 @@ fn differential() {
                 use_tee: false,
                 ..Config::default()
             },
+            Config {
+                coalesce: false,
+                ..Config::default()
+            },
         ] {
             let (wasm, unsupported) = harness::compile_module(std::slice::from_ref(&func), &config);
             if !unsupported.is_empty() {
@@ -84,8 +88,8 @@ fn differential() {
                 };
                 if !ok {
                     failures.push(format!(
-                        "seed {seed} use_tee={}: args {args:?}\n  expected {expected:?}\n  got      {got:?}\n{func}",
-                        config.use_tee
+                        "seed {seed} {:?}: args {args:?}\n  expected {expected:?}\n  got      {got:?}\n{func}",
+                        config
                     ));
                     break;
                 }

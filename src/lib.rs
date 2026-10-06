@@ -12,9 +12,10 @@
 //!    tree building. A single-use def is folded into its user when doing so
 //!    does not reorder side effects; this is checked in O(1) with Cranelift-style
 //!    side-effect *colors*. Constants are rematerialized at every use.
-//! 3. **Local allocation** ([`locals`]): values that are not consumed directly
-//!    off the operand stack get a wasm local; locals are shared between values
-//!    whose (conservative, hull-shaped) live intervals do not overlap.
+//! 3. **Local allocation** ([`liveness`], [`locals`]): values that are not
+//!    consumed directly off the operand stack get a wasm local; locals are
+//!    shared between values whose live ranges do not overlap, preferring to
+//!    give block arguments and parameters the same local.
 //! 4. **Structuring and emission** ([`structure`], [`lower`]): control flow is
 //!    rebuilt from the dominator tree following Ramsey's "Beyond Relooper"
 //!    (ICFP 2022). Irreducible control flow falls back to a dispatch loop.
@@ -26,6 +27,7 @@ use cranelift_codegen::ir::{self, ExternalName, LibCall, Signature, UserExternal
 use wasm_encoder::ValType;
 
 mod analysis;
+mod liveness;
 mod locals;
 mod lower;
 pub mod module;
@@ -84,6 +86,9 @@ pub struct Config {
     /// (constants are still rematerialized); this is mainly useful as a
     /// baseline for comparisons.
     pub stackify: bool,
+    /// Try to give a block argument and the parameter it is passed to the
+    /// same local, so that the move disappears.
+    pub coalesce: bool,
 }
 
 impl Default for Config {
@@ -96,6 +101,7 @@ impl Default for Config {
             tail_calls: true,
             use_tee: true,
             stackify: true,
+            coalesce: true,
         }
     }
 }
@@ -248,7 +254,8 @@ pub fn compile_function(
     };
     let info = analysis::FuncInfo::compute(func)?;
     let stack = stackify::stackify(func, &info, config.stackify);
-    let locals = locals::allocate(func, &info, &stack, config)?;
+    let ranges = liveness::compute(func, &info, &stack);
+    let locals = locals::allocate(func, &info, &ranges, config.coalesce)?;
     structure::emit_function(func, config, env, &info, &stack, locals)
 }
 

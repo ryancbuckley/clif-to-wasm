@@ -1,31 +1,18 @@
 //! Assignment of wasm locals to the values that are not consumed directly
-//! from the operand stack.
+//! from the operand stack, given their [live ranges](crate::liveness).
 //!
-//! Every root instruction gets a position, in reverse postorder, with extra
-//! positions for each block's start and end. A value's live range is a list
-//! of segments, at most two per block, found by walking predecessors from
-//! each use up to the def. A block parameter is defined by the terminator of
-//! each predecessor, so there it is live from that terminator to the block
-//! end; this lets a value whose last use is a branch argument share a local
-//! with the parameter it is passed to.
-//!
-//! Segments are half-open with respect to a single instruction: a value
-//! whose last use is at position `p` may share a local with a value defined
-//! at `p`, because an instruction reads all its operands before writing its
-//! results. Block-argument moves push every argument before setting any
-//! parameter, so the same holds for them.
-//!
-//! Values are colored greedily in order of their first position. A value
-//! first tries the locals of its *move partners* (branch arguments and the
-//! parameters they are passed to), so that the move disappears, then a local
-//! that is free from its start on, then (in small functions) any local whose
-//! segments do not overlap its own.
+//! Values are colored greedily in order of their first position, separately
+//! for each wasm type. A value first tries the locals of its *move partners*
+//! (the arguments and parameters of block-argument moves it takes part in),
+//! so that the move disappears, then a local that is free from its start
+//! on, then a bounded number of other locals whose segments do not overlap
+//! its own.
 
-use crate::analysis::{FuncInfo, is_remat};
-use crate::stackify::{Operand, Stackified, operands};
-use crate::{Config, Result, wasm_type};
+use crate::analysis::FuncInfo;
+use crate::liveness::{Buckets, LiveRanges, Segment};
+use crate::{Result, wasm_type};
 use cranelift_codegen::entity::{EntityRef, SecondaryMap};
-use cranelift_codegen::ir::{Block, Function, Inst, Value, ValueDef};
+use cranelift_codegen::ir::{Function, Value};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use wasm_encoder::ValType;
@@ -48,22 +35,19 @@ impl Locals {
     pub fn next_index(&self) -> u32 {
         self.num_params + self.decls.len() as u32
     }
-}
 
-/// Does `v` need a local (as opposed to being dead, rematerialized, or
-/// passed on the stack)?
-pub(crate) fn needs_local(func: &Function, info: &FuncInfo, stack: &Stackified, v: Value) -> bool {
-    if !info.live_val[v] || info.use_count[v] == 0 {
-        return false;
-    }
-    match func.dfg.value_def(v) {
-        ValueDef::Result(d, _) => !stack.inlined[d] && !is_remat(func, d),
-        ValueDef::Param(..) => true,
-        ValueDef::Union(..) => unreachable!(),
+    /// Must the block-argument move `param := arg` be emitted?
+    ///
+    /// Not when both are in the same local. That is safe because a branch
+    /// pushes all its (needed) arguments before setting any parameter, and
+    /// because two values in one local never overlap: no other argument of
+    /// the same branch can be in that local, and no other parameter of the
+    /// target either (they are all defined at the same terminator).
+    pub fn move_needed(&self, arg: Value, param: Value) -> bool {
+        let la = self.local_of[arg];
+        la == NO_LOCAL || la != self.local_of[param]
     }
 }
-
-type Segment = (u32, u32);
 
 /// Does `v` overlap any segment of `slot`? Both are sorted and
 /// non-overlapping; `v` is short, so binary-search `slot` for each segment.
@@ -84,42 +68,6 @@ fn merge_into(a: &mut Vec<Segment>, b: &[Segment]) {
             let i = a.partition_point(|s| s.0 <= seg.0);
             a.insert(i, seg);
         }
-    }
-}
-
-/// Items grouped by value index (compressed sparse rows).
-struct Buckets<T> {
-    first: Vec<u32>,
-    items: Vec<T>,
-}
-
-impl<T: Copy> Buckets<T> {
-    fn new(n: usize, entries: impl Iterator<Item = (Value, T)> + Clone) -> Self {
-        let mut first = vec![0u32; n + 1];
-        for (v, _) in entries.clone() {
-            first[v.index() + 1] += 1;
-        }
-        for i in 0..n {
-            first[i + 1] += first[i];
-        }
-        let mut fill = first.clone();
-        // Every slot is overwritten below; any entry serves as filler.
-        let Some((_, filler)) = entries.clone().next() else {
-            return Buckets {
-                first,
-                items: Vec::new(),
-            };
-        };
-        let mut items = vec![filler; first[n] as usize];
-        for (v, t) in entries {
-            items[fill[v.index()] as usize] = t;
-            fill[v.index()] += 1;
-        }
-        Buckets { first, items }
-    }
-
-    fn get(&self, i: usize) -> &[T] {
-        &self.items[self.first[i] as usize..self.first[i + 1] as usize]
     }
 }
 
@@ -189,177 +137,20 @@ fn new_slot(slots: &mut Vec<Slot>, classes: &mut Vec<Class>, ty: ValType) -> u32
     l
 }
 
-/// Per-block scratch state for building one value's segments.
-struct Scratch {
-    stamp: SecondaryMap<Block, u32>,
-    live_in: SecondaryMap<Block, u32>,
-    lo: SecondaryMap<Block, u32>,
-    hi: SecondaryMap<Block, u32>,
-    term_def: SecondaryMap<Block, bool>,
-    touched: Vec<Block>,
-}
-
-impl Scratch {
-    fn touch(&mut self, b: Block, cur: u32) {
-        if self.stamp[b] != cur {
-            self.stamp[b] = cur;
-            self.lo[b] = u32::MAX;
-            self.hi[b] = 0;
-            self.term_def[b] = false;
-            self.touched.push(b);
-        }
-    }
-
-    fn add(&mut self, b: Block, cur: u32, p: u32) {
-        self.touch(b, cur);
-        self.lo[b] = self.lo[b].min(p);
-        self.hi[b] = self.hi[b].max(p);
-    }
-}
-
 pub(crate) fn allocate(
     func: &Function,
     info: &FuncInfo,
-    stack: &Stackified,
-    _config: &Config,
+    ranges: &LiveRanges,
+    coalesce: bool,
 ) -> Result<Locals> {
-    let entry = info.rpo[0];
-    let entry_params = func.dfg.block_params(entry);
+    let entry_params = func.dfg.block_params(info.rpo[0]);
     let num_params = entry_params.len() as u32;
     let mut local_of = SecondaryMap::with_default(NO_LOCAL);
-
-    // Positions.
-    let mut pos: SecondaryMap<Inst, u32> = SecondaryMap::new();
-    let mut start: SecondaryMap<Block, u32> = SecondaryMap::new();
-    let mut end: SecondaryMap<Block, u32> = SecondaryMap::new();
-    let mut p = 0;
-    for &b in &info.rpo {
-        start[b] = p;
-        p += 1;
-        for inst in func.layout.block_insts(b) {
-            if stack.is_root(info, func, inst) {
-                pos[inst] = p;
-                p += 1;
-            }
-        }
-        end[b] = p;
-        p += 1;
-    }
-    let term_pos = |b: Block| pos[func.layout.last_inst(b).unwrap()];
-
-    // Uses of each value that needs a local, and move partners, bucketed by
-    // value with a counting sort.
-    let is_local = |v: Value| needs_local(func, info, stack, v);
-    let mut use_list: Vec<(Value, Block, u32)> = Vec::new();
-    let mut pair_list: Vec<(Value, Value)> = Vec::new();
-    let mut ops: Vec<Operand> = Vec::new();
-    for &b in &info.rpo {
-        for inst in func.layout.block_insts(b) {
-            if !info.live_inst[inst] {
-                continue;
-            }
-            let root = stack.root(inst);
-            let at_block = func.layout.inst_block(root).unwrap();
-            operands(func, info, inst, &mut ops);
-            for o in &ops {
-                if is_local(o.value) {
-                    use_list.push((o.value, at_block, pos[root]));
-                }
-            }
-        }
-        for &call in &info.dests[b] {
-            for (a, param) in info.live_arg_pairs(func, call) {
-                if is_local(a) {
-                    pair_list.push((a, param));
-                    pair_list.push((param, a));
-                }
-            }
-        }
-    }
-    let num_values = func.dfg.num_values();
-    let uses = Buckets::new(num_values, use_list.iter().map(|&(v, b, p)| (v, (b, p))));
-    let partners = Buckets::new(num_values, pair_list.iter().copied());
-
-    // Segments.
-    let mut scratch = Scratch {
-        stamp: SecondaryMap::new(),
-        live_in: SecondaryMap::new(),
-        lo: SecondaryMap::new(),
-        hi: SecondaryMap::new(),
-        term_def: SecondaryMap::new(),
-        touched: Vec::new(),
-    };
-    let mut walk: Vec<Block> = Vec::new();
-    let mut seg_buf: Vec<Segment> = Vec::new();
-    // (value, first segment index, number of segments)
-    let mut values: Vec<(Value, u32, u32)> = Vec::new();
-    for vi in 0..num_values {
-        let v_uses = uses.get(vi);
-        if v_uses.is_empty() {
-            continue;
-        }
-        let v = Value::new(vi);
-        let cur = vi as u32 + 1;
-        scratch.touched.clear();
-        let def_block = match func.dfg.value_def(v) {
-            ValueDef::Result(d, _) => {
-                let b = func.layout.inst_block(d).unwrap();
-                scratch.add(b, cur, pos[d]);
-                b
-            }
-            ValueDef::Param(b, _) => {
-                scratch.add(b, cur, start[b]);
-                if b != entry {
-                    for &pred in &info.preds[b] {
-                        scratch.touch(pred, cur);
-                        scratch.term_def[pred] = true;
-                    }
-                }
-                b
-            }
-            ValueDef::Union(..) => unreachable!(),
-        };
-        for &(ub, upos) in v_uses {
-            scratch.add(ub, cur, upos);
-            if ub == def_block || scratch.live_in[ub] == cur {
-                continue;
-            }
-            scratch.live_in[ub] = cur;
-            scratch.add(ub, cur, start[ub]);
-            walk.push(ub);
-            while let Some(x) = walk.pop() {
-                for &pred in &info.preds[x] {
-                    scratch.add(pred, cur, end[pred]);
-                    if pred != def_block && scratch.live_in[pred] != cur {
-                        scratch.live_in[pred] = cur;
-                        scratch.add(pred, cur, start[pred]);
-                        walk.push(pred);
-                    }
-                }
-            }
-        }
-        let first = seg_buf.len();
-        for &b in &scratch.touched {
-            let (lo, hi) = (scratch.lo[b], scratch.hi[b]);
-            let has_points = lo <= hi;
-            if scratch.term_def[b] {
-                let t = term_pos(b);
-                if has_points && hi >= t {
-                    seg_buf.push((lo, hi.max(end[b])));
-                } else {
-                    if has_points {
-                        seg_buf.push((lo, hi));
-                    }
-                    seg_buf.push((t, end[b]));
-                }
-            } else if has_points {
-                seg_buf.push((lo, hi));
-            }
-        }
-        seg_buf[first..].sort_unstable();
-        values.push((v, first as u32, (seg_buf.len() - first) as u32));
-    }
-    values.sort_unstable_by_key(|&(v, first, _)| (seg_buf[first as usize].0, v.index()));
+    let moves = if coalesce { &ranges.moves[..] } else { &[] };
+    let partners = Buckets::new(
+        func.dfg.num_values(),
+        moves.iter().flat_map(|&(a, p)| [(a, p), (p, a)]),
+    );
 
     // Coloring.
     let mut slots: Vec<Slot> = Vec::new();
@@ -369,8 +160,7 @@ pub(crate) fn allocate(
         new_slot(&mut slots, &mut classes, ty);
     }
 
-    for &(v, first, len) in &values {
-        let segs = &seg_buf[first as usize..(first + len) as usize];
+    for (v, segs) in ranges.iter() {
         let ty = wasm_type(func.dfg.value_type(v))?;
         let (lo, hi) = (segs[0].0, segs.last().unwrap().1);
         let fits = |slots: &[Slot], l: u32| {

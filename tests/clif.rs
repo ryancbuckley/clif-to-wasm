@@ -14,6 +14,13 @@ fn configs() -> Vec<(&'static str, Config)> {
             },
         ),
         (
+            "no-coalesce",
+            Config {
+                coalesce: false,
+                ..Config::default()
+            },
+        ),
+        (
             "memory64",
             Config {
                 memory64: true,
