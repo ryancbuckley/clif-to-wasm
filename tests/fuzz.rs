@@ -14,7 +14,7 @@ use cranelift_codegen::ir::Type;
 use cranelift_interpreter::environment::FunctionStore;
 use cranelift_interpreter::interpreter::{Interpreter, InterpreterState};
 use cranelift_interpreter::step::ControlFlow;
-use cranelift_wasm_backend::Config;
+use cranelift_wasm_backend::{Config, Optimizations};
 use harness::clifgen::{Rng, arg, generate, generate_i128, generate_simd};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,19 +61,9 @@ fn differential() {
 
         for config in [
             Config::default(),
-            Config {
-                stack_values: false,
-                use_tee: false,
-                ..Config::default()
-            },
-            Config {
-                use_tee: false,
-                ..Config::default()
-            },
-            Config {
-                coalesce: false,
-                ..Config::default()
-            },
+            harness::config(|c| c.opts = Optimizations::none()),
+            harness::config(|c| c.opts.use_tee = false),
+            harness::config(|c| c.opts.coalesce = false),
         ] {
             let (wasm, unsupported) = harness::compile_module(std::slice::from_ref(&func), &config);
             if !unsupported.is_empty() {

@@ -674,7 +674,7 @@ impl Emitter<'_> {
             }
 
             (Opcode::GetStackPointer | Opcode::GetFramePointer, _) => {
-                match (self.frame, self.config.stack_pointer_global) {
+                match (self.frame, self.config.module.stack_pointer_global) {
                     (Some((fp, _)), _) => self.ins(I::LocalGet(fp)),
                     (None, Some(sp)) => self.ins(I::GlobalGet(sp)),
                     (None, None) => return unsupported(format!("{op} without a stack pointer")),
@@ -691,7 +691,7 @@ impl Emitter<'_> {
                 let idx = self.env.func_index(Name::resolve(func, name))?;
                 if op == Opcode::ReturnCall {
                     self.epilogue();
-                    if self.config.tail_calls {
+                    if self.config.engine.tail_calls {
                         self.ins(I::ReturnCall(idx));
                     } else {
                         self.ins(I::Call(idx));
@@ -713,10 +713,10 @@ impl Emitter<'_> {
                     self.ins(I::I32WrapI64);
                 }
                 let type_index = self.env.type_index(&dfg.signatures[sig_ref])?;
-                let table_index = self.config.table_index;
+                let table_index = self.config.module.table_index;
                 if op == Opcode::ReturnCallIndirect {
                     self.epilogue();
-                    if self.config.tail_calls {
+                    if self.config.engine.tail_calls {
                         self.ins(I::ReturnCallIndirect {
                             type_index,
                             table_index,

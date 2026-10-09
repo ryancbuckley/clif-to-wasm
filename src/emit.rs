@@ -110,7 +110,7 @@ impl<'a> Emitter<'a> {
             frame: None,
             slot_offset: SecondaryMap::new(),
             dispatch_label: None,
-            body: Body::new(config.use_tee),
+            body: Body::new(config.opts.use_tee),
             extra: ExtraLocals::new(base),
             operand_stack: Vec::new(),
             cursors: Vec::new(),
@@ -215,7 +215,7 @@ impl<'a> Emitter<'a> {
     }
 
     pub(crate) fn ptr_const(&mut self, v: i64) {
-        if self.config.memory64 {
+        if self.config.module.memory64 {
             self.ins(I::I64Const(v))
         } else {
             self.ins(I::I32Const(v as i32))
@@ -223,7 +223,7 @@ impl<'a> Emitter<'a> {
     }
 
     pub(crate) fn ptr_add(&mut self) {
-        self.ins(if self.config.memory64 {
+        self.ins(if self.config.module.memory64 {
             I::I64Add
         } else {
             I::I32Add
@@ -259,7 +259,7 @@ impl<'a> Emitter<'a> {
     /// type.
     pub(crate) fn address(&mut self) -> Result<()> {
         let v = self.operand()?;
-        match (self.ty(v), self.config.memory64) {
+        match (self.ty(v), self.config.module.memory64) {
             (types::I64, false) => self.ins(I::I32WrapI64),
             (types::I64, true) => {}
             (types::I32, true) => self.ins(I::I64ExtendI32U),
@@ -299,7 +299,7 @@ impl<'a> Emitter<'a> {
             } else {
                 0
             },
-            memory_index: self.config.memory_index,
+            memory_index: self.config.module.memory_index,
         }
     }
 
@@ -328,7 +328,9 @@ impl<'a> Emitter<'a> {
             self.ins(I::LocalGet(fp));
             self.ptr_const(size as i64);
             self.ptr_add();
-            self.ins(I::GlobalSet(self.config.stack_pointer_global.unwrap()));
+            self.ins(I::GlobalSet(
+                self.config.module.stack_pointer_global.unwrap(),
+            ));
         }
     }
 
@@ -368,7 +370,7 @@ impl<'a> Emitter<'a> {
 
     /// Convert a pointer-typed value on the stack to `ty`.
     pub(crate) fn ptr_to(&mut self, ty: Type) -> Result<()> {
-        match (self.config.memory64, ty) {
+        match (self.config.module.memory64, ty) {
             (false, types::I32) | (true, types::I64) => {}
             (false, types::I64) => self.ins(I::I64ExtendI32U),
             (true, types::I32) => self.ins(I::I32WrapI64),

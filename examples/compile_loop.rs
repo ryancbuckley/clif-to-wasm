@@ -13,10 +13,7 @@ fn main() {
     let funcs: Vec<_> = (1..=1000)
         .map(|s| harness::clifgen::generate(s).0)
         .collect();
-    let config = cranelift_wasm_backend::Config {
-        stack_pointer_global: Some(0),
-        ..Default::default()
-    };
+    let config = harness::config(|c| c.module.stack_pointer_global = Some(0));
     // Resolve aliases up front, as Cranelift's own pipeline does, so that the
     // timing covers only this backend.
     let funcs: Vec<_> = funcs

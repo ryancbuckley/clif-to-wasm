@@ -49,6 +49,14 @@ impl TestEnv<'_> {
     }
 }
 
+/// The default configuration, changed by `f`, e.g.
+/// `config(|c| c.opts.use_tee = false)`.
+pub fn config(f: impl FnOnce(&mut Config)) -> Config {
+    let mut c = Config::default();
+    f(&mut c);
+    c
+}
+
 pub fn func_name(f: &Function) -> String {
     match &f.name {
         UserFuncName::Testcase(t) => String::from_utf8_lossy(t.raw()).into_owned(),
@@ -76,24 +84,22 @@ pub fn compile_module(funcs: &[Function], config: &Config) -> (Vec<u8>, Vec<Stri
         names.insert(func_name(f), idx);
         indices.push(idx);
     }
-    builder.memory(MEMORY_PAGES, config.memory64);
+    builder.memory(MEMORY_PAGES, config.module.memory64);
     builder.function_table();
     let sp = builder.global(
-        if config.memory64 {
+        if config.module.memory64 {
             ValType::I64
         } else {
             ValType::I32
         },
-        if config.memory64 {
+        if config.module.memory64 {
             ConstExpr::i64_const(STACK_TOP as i64)
         } else {
             ConstExpr::i32_const(STACK_TOP)
         },
     );
-    let config = Config {
-        stack_pointer_global: Some(sp),
-        ..config.clone()
-    };
+    let mut config = config.clone();
+    config.module.stack_pointer_global = Some(sp);
     for (f, &idx) in funcs.iter().zip(&indices) {
         let mut env = TestEnv {
             names: &names,

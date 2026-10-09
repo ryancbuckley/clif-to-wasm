@@ -46,8 +46,8 @@ pub(crate) fn emit_function(
         return unsupported("dynamic stack slots");
     }
     if !func.sized_stack_slots.is_empty() {
-        let Some(sp) = config.stack_pointer_global else {
-            return unsupported("stack slots without Config::stack_pointer_global");
+        let Some(sp) = config.module.stack_pointer_global else {
+            return unsupported("stack slots without ModuleLayout::stack_pointer_global");
         };
         let mut size: u32 = 0;
         for (slot, data) in func.sized_stack_slots.iter() {
@@ -60,10 +60,10 @@ pub(crate) fn emit_function(
             size += data.size;
         }
         let size = size.next_multiple_of(16);
-        let fp = e.new_local(config.ptr_ty());
+        let fp = e.new_local(config.module.ptr_ty());
         e.frame = Some((fp, size));
         e.ins(I::GlobalGet(sp));
-        if config.memory64 {
+        if config.module.memory64 {
             e.ins(I::I64Const(size as i64));
             e.ins(I::I64Sub);
         } else {

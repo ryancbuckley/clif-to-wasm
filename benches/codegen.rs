@@ -28,19 +28,12 @@ fn variants() -> Vec<(&'static str, Config)> {
     vec![
         (
             "naive",
-            Config {
-                stack_values: false,
-                use_tee: false,
-                ..Config::default()
-            },
+            harness::config(|c| {
+                c.opts.stack_values = false;
+                c.opts.use_tee = false;
+            }),
         ),
-        (
-            "no-coalesce",
-            Config {
-                coalesce: false,
-                ..Config::default()
-            },
-        ),
+        ("no-coalesce", harness::config(|c| c.opts.coalesce = false)),
         ("default", Config::default()),
     ]
 }
@@ -193,10 +186,7 @@ fn main() {
             Ok(0)
         }
     }
-    let config = Config {
-        stack_pointer_global: Some(0),
-        ..Config::default()
-    };
+    let config = harness::config(|c| c.module.stack_pointer_global = Some(0));
     for (cname, modules) in &corpora {
         let funcs: Vec<Function> = modules
             .iter()

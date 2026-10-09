@@ -6,27 +6,9 @@ use std::path::Path;
 fn configs() -> Vec<(&'static str, Config)> {
     vec![
         ("default", Config::default()),
-        (
-            "no-tee",
-            Config {
-                use_tee: false,
-                ..Config::default()
-            },
-        ),
-        (
-            "no-coalesce",
-            Config {
-                coalesce: false,
-                ..Config::default()
-            },
-        ),
-        (
-            "memory64",
-            Config {
-                memory64: true,
-                ..Config::default()
-            },
-        ),
+        ("no-tee", harness::config(|c| c.opts.use_tee = false)),
+        ("no-coalesce", harness::config(|c| c.opts.coalesce = false)),
+        ("memory64", harness::config(|c| c.module.memory64 = true)),
     ]
 }
 

@@ -50,7 +50,7 @@ accept only pure trees, so an unconditional effect never becomes conditional.
 - Block-argument moves push every argument before setting any parameter, so
   parallel moves (swaps) need no temporaries.
 - Stack slots live on a shadow stack in linear memory, through a
-  stack-pointer global (`Config::stack_pointer_global`).
+  stack-pointer global (`ModuleLayout::stack_pointer_global`).
 - Traps become `unreachable`; trap codes are not preserved.
 
 ## Usage
@@ -76,10 +76,16 @@ let wasm_fn: wasm_encoder::Function = compiled.to_wasm_function();
 `ModuleBuilder` (`src/module.rs`) assembles a complete module (imports,
 memory, a funcref table, globals, exports) for simple cases and tests.
 
-`Config` options: `memory64`, `memory_index`, `table_index`,
-`stack_pointer_global`, `tail_calls` (use `return_call`, or fall back to
-call + return). The optimizations can be switched off individually,
-mainly for comparisons: `stack_values`, `coalesce` and `use_tee`.
+`Config` has three groups of settings:
+
+| Group | Fields | Meaning |
+|---|---|---|
+| `module: ModuleLayout` | `memory64`, `memory_index`, `table_index`, `stack_pointer_global` | Facts about the module the code goes in; they must match how the embedder builds it. |
+| `engine: EngineFeatures` | `tail_calls` | Wasm features the engine supports. Without tail calls, `return_call` falls back to call + return. |
+| `opts: Optimizations` | `stack_values`, `coalesce`, `use_tee` | Output-quality switches, all on by default; `Optimizations::none()` turns them all off. |
+
+For example, `config.module.stack_pointer_global = Some(sp)` enables stack
+slots, and `config.opts.coalesce = false` disables move coalescing.
 
 ## Supported
 
@@ -184,8 +190,8 @@ cargo run --release --example compile_loop   # compile the random corpus in a lo
 cargo run --example wasm2wat -- target/bench/kernels-default.wasm
 ```
 
-`benches/codegen.rs` compares a `naive` configuration (`stack_values: false`,
-`use_tee: false`), a `no-coalesce` one and the default one on three
+`benches/codegen.rs` compares a `naive` configuration (`opts.stack_values`
+and `opts.use_tee` off), a `no-coalesce` one and the default one on three
 corpora:
 
 - nine kernels in `tests/harness/kernels.rs` (fib, sieve, matmul, crc32,
@@ -216,7 +222,7 @@ before → after):
 | `local.set` | 70,171 → 34,397 (−51%) | 116 → 107 |
 | compile time | 57 → 64 µs/function (+12%) | |
 
-Of these gains, the move hints alone (`coalesce: false` vs. default, on 200 random
+Of these gains, the move hints alone (`opts.coalesce` off vs. default, on 200 random
 functions) account for 33% fewer `local.set`s and 6% fewer bytes. The rest
 comes from the precise live ranges.
 

@@ -23,10 +23,7 @@ fn kernels_match_interpreter() {
     }
     for config in [
         Config::default(),
-        Config {
-            use_tee: false,
-            ..Config::default()
-        },
+        harness::config(|c| c.opts.use_tee = false),
     ] {
         let (wasm, unsupported) = harness::compile_module(&funcs, &config);
         assert!(unsupported.is_empty(), "{unsupported:?}");

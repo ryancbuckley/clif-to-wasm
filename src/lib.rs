@@ -70,57 +70,98 @@ pub(crate) fn unsupported<T>(msg: impl Into<String>) -> Result<T> {
     Err(Error::Unsupported(msg.into()))
 }
 
-/// Code generation settings.
-#[derive(Debug, Clone)]
+/// Code generation settings, in three groups.
+#[derive(Debug, Clone, Default)]
 pub struct Config {
-    /// Whether the target memory is a 64-bit (memory64) memory. This decides
-    /// the wasm type of addresses and of the shadow stack pointer.
+    /// Facts about the wasm module the code will be placed in. They must
+    /// match how the embedder builds that module.
+    pub module: ModuleLayout,
+    /// Wasm features the engine that runs the code supports.
+    pub engine: EngineFeatures,
+    /// Optimizations. They change how good the output is, never what it
+    /// does; turning one off is for benchmarking and debugging.
+    pub opts: Optimizations,
+}
+
+/// Facts about the wasm module that will contain the compiled functions.
+#[derive(Debug, Clone, Default)]
+pub struct ModuleLayout {
+    /// Whether the linear memory uses 64-bit addresses (memory64). This
+    /// decides the wasm type of load/store addresses and of the shadow stack
+    /// pointer. IR addresses of the other width are converted.
     pub memory64: bool,
-    /// The memory that loads and stores access.
+    /// Which linear memory loads and stores access. A module can have
+    /// several (the multi-memory feature); with one memory this is 0.
     pub memory_index: u32,
-    /// The table used by `call_indirect`.
+    /// Which table `call_indirect` looks functions up in. Wasm has no raw
+    /// function pointers: a function "address" is an index into a table of
+    /// function references. With one table this is 0.
     pub table_index: u32,
-    /// A mutable global holding the shadow stack pointer. Required by
-    /// functions that use stack slots. The stack grows downwards and the
-    /// pointer is assumed to be 16-byte aligned.
+    /// A mutable global holding the shadow stack pointer. Stack slots must
+    /// live in linear memory, since wasm has no addressable stack; functions
+    /// that use them move this pointer down on entry and back on exit. The
+    /// stack grows downwards and the pointer is assumed to be 16-byte
+    /// aligned. With `None`, functions that need stack slots are rejected.
     pub stack_pointer_global: Option<u32>,
-    /// Use the tail-call proposal for `return_call`. Without it, tail calls
-    /// are lowered to a call followed by a return.
-    pub tail_calls: bool,
-    /// Use `local.tee` to feed the first use of a multi-use value directly
-    /// from the stack.
-    pub use_tee: bool,
-    /// Pass single-use values on the operand stack, by building expression
-    /// trees (see `expr_trees.rs`). When off, every value goes through a
-    /// local (constants are still rematerialized); this is mainly useful as
-    /// a baseline for comparisons.
-    pub stack_values: bool,
-    /// Try to give a block argument and the parameter it is passed to the
-    /// same local, so that the move disappears.
-    pub coalesce: bool,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Config {
-            memory64: false,
-            memory_index: 0,
-            table_index: 0,
-            stack_pointer_global: None,
-            tail_calls: true,
-            use_tee: true,
-            stack_values: true,
-            coalesce: true,
-        }
-    }
-}
-
-impl Config {
+impl ModuleLayout {
+    /// The wasm type of addresses.
     pub(crate) fn ptr_ty(&self) -> ValType {
         if self.memory64 {
             ValType::I64
         } else {
             ValType::I32
+        }
+    }
+}
+
+/// Wasm features the generated code may use.
+#[derive(Debug, Clone)]
+pub struct EngineFeatures {
+    /// Tail calls (`return_call`). Without them, a Cranelift tail call
+    /// becomes an ordinary call followed by a return, which is correct but
+    /// grows the call stack.
+    pub tail_calls: bool,
+}
+
+impl Default for EngineFeatures {
+    fn default() -> Self {
+        EngineFeatures { tail_calls: true }
+    }
+}
+
+/// Optimization switches; all are on by default.
+#[derive(Debug, Clone)]
+pub struct Optimizations {
+    /// Pass single-use values on the operand stack, by building expression
+    /// trees (see `expr_trees.rs`). When off, every value goes through a
+    /// local (constants are still rematerialized).
+    pub stack_values: bool,
+    /// Try to give a block argument and the parameter it is passed to the
+    /// same local, so that the move disappears.
+    pub coalesce: bool,
+    /// Fuse `local.set x; local.get x` into `local.tee x`.
+    pub use_tee: bool,
+}
+
+impl Optimizations {
+    /// Every optimization switched off.
+    pub fn none() -> Self {
+        Optimizations {
+            stack_values: false,
+            coalesce: false,
+            use_tee: false,
+        }
+    }
+}
+
+impl Default for Optimizations {
+    fn default() -> Self {
+        Optimizations {
+            stack_values: true,
+            coalesce: true,
+            use_tee: true,
         }
     }
 }
@@ -279,9 +320,9 @@ pub fn compile_function(
         func
     };
     let info = analysis::FuncInfo::compute(func)?;
-    let trees = expr_trees::build(func, &info, config.stack_values);
+    let trees = expr_trees::build(func, &info, config.opts.stack_values);
     let ranges = liveness::compute(func, &info, &trees);
-    let locals = locals::allocate(func, &info, &ranges, config.coalesce)?;
+    let locals = locals::allocate(func, &info, &ranges, config.opts.coalesce)?;
     structure::emit_function(func, config, env, &info, &trees, locals)
 }
 
