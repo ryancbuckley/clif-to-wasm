@@ -62,7 +62,7 @@ fn differential() {
         for config in [
             Config::default(),
             Config {
-                stackify: false,
+                stack_values: false,
                 use_tee: false,
                 ..Config::default()
             },

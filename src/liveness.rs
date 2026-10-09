@@ -20,7 +20,7 @@
 //! the parameter it is passed to.
 
 use crate::analysis::{FuncInfo, is_remat};
-use crate::stackify::{Operand, Stackified, operands};
+use crate::expr_trees::{ExprTrees, Operand, operands};
 use cranelift_codegen::entity::{EntityRef, SecondaryMap};
 use cranelift_codegen::ir::{Block, Function, Inst, Value, ValueDef};
 
@@ -48,12 +48,12 @@ impl LiveRanges {
 
 /// Does `v` need a local (as opposed to being dead, rematerialized, or
 /// passed on the stack)?
-pub(crate) fn needs_local(func: &Function, info: &FuncInfo, stack: &Stackified, v: Value) -> bool {
+pub(crate) fn needs_local(func: &Function, info: &FuncInfo, trees: &ExprTrees, v: Value) -> bool {
     if !info.live_val[v] || info.use_count[v] == 0 {
         return false;
     }
     match func.dfg.value_def(v) {
-        ValueDef::Result(d, _) => !stack.inlined[d] && !is_remat(func, d),
+        ValueDef::Result(d, _) => !trees.inlined[d] && !is_remat(func, d),
         ValueDef::Param(..) => true,
         ValueDef::Union(..) => unreachable!(),
     }
@@ -124,7 +124,7 @@ impl Scratch {
 }
 
 /// Compute the live ranges of every value that [needs a local](needs_local).
-pub(crate) fn compute(func: &Function, info: &FuncInfo, stack: &Stackified) -> LiveRanges {
+pub(crate) fn compute(func: &Function, info: &FuncInfo, trees: &ExprTrees) -> LiveRanges {
     let entry = info.rpo[0];
     // Positions.
     let mut pos: SecondaryMap<Inst, u32> = SecondaryMap::new();
@@ -135,7 +135,7 @@ pub(crate) fn compute(func: &Function, info: &FuncInfo, stack: &Stackified) -> L
         start[b] = p;
         p += 1;
         for inst in func.layout.block_insts(b) {
-            if stack.is_root(info, func, inst) {
+            if trees.is_root(info, func, inst) {
                 pos[inst] = p;
                 p += 1;
             }
@@ -147,7 +147,7 @@ pub(crate) fn compute(func: &Function, info: &FuncInfo, stack: &Stackified) -> L
 
     // Uses of each value that needs a local, bucketed by value with a
     // counting sort, and block-argument moves.
-    let is_local = |v: Value| needs_local(func, info, stack, v);
+    let is_local = |v: Value| needs_local(func, info, trees, v);
     let mut use_list: Vec<(Value, Block, u32)> = Vec::new();
     let mut moves: Vec<(Value, Value)> = Vec::new();
     let mut ops: Vec<Operand> = Vec::new();
@@ -156,7 +156,7 @@ pub(crate) fn compute(func: &Function, info: &FuncInfo, stack: &Stackified) -> L
             if !info.live_inst[inst] {
                 continue;
             }
-            let root = stack.root(inst);
+            let root = trees.root(inst);
             let at_block = func.layout.inst_block(root).unwrap();
             operands(func, info, inst, &mut ops);
             for o in &ops {

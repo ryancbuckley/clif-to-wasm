@@ -1,7 +1,7 @@
 //! Lowering of individual Cranelift instructions to wasm instructions.
 //!
 //! Each case takes its operands with [`Emitter::operand`], which pushes them
-//! in the order given by [`crate::stackify::operands`].
+//! in the order given by [`crate::expr_trees::operands`].
 
 use crate::emit::{Emitter, is64, narrow_bits, w};
 use crate::{Name, Result, SymbolValue, unsupported, wasm_type};

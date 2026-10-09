@@ -6,8 +6,8 @@
 
 use crate::analysis::{FuncInfo, is_remat};
 use crate::encode::{Body, ExtraLocals};
+use crate::expr_trees::{ExprTrees, Operand, operands};
 use crate::locals::{Locals, NO_LOCAL};
-use crate::stackify::{Operand, Stackified, operands};
 use crate::{Config, Env, Result, unsupported};
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::{
@@ -45,7 +45,7 @@ pub(crate) struct Emitter<'a> {
     pub config: &'a Config,
     pub env: &'a mut dyn Env,
     pub info: &'a FuncInfo,
-    pub stack: &'a Stackified,
+    pub trees: &'a ExprTrees,
     pub locals: Locals,
     pub labels: Vec<Label>,
     pub tasks: Vec<Task>,
@@ -94,7 +94,7 @@ impl<'a> Emitter<'a> {
         config: &'a Config,
         env: &'a mut dyn Env,
         info: &'a FuncInfo,
-        stack: &'a Stackified,
+        trees: &'a ExprTrees,
         locals: Locals,
     ) -> Self {
         let base = locals.next_index();
@@ -103,7 +103,7 @@ impl<'a> Emitter<'a> {
             config,
             env,
             info,
-            stack,
+            trees,
             locals,
             labels: Vec::new(),
             tasks: Vec::new(),
@@ -164,7 +164,7 @@ impl<'a> Emitter<'a> {
     pub fn value(&mut self, v: Value) -> Result<()> {
         match self.func.dfg.value_def(v) {
             ValueDef::Result(d, _) if is_remat(self.func, d) => self.constant(d),
-            ValueDef::Result(d, _) if self.stack.inlined[d] => self.inst(d),
+            ValueDef::Result(d, _) if self.trees.inlined[d] => self.inst(d),
             _ => {
                 self.ins(I::LocalGet(self.local(v)));
                 Ok(())
@@ -351,7 +351,7 @@ impl<'a> Emitter<'a> {
     /// Emit an instruction, leaving its results on the stack.
     ///
     /// Lowering takes the operands one by one with [`Self::operand`], so they
-    /// are pushed in exactly the order the stackifier assumed.
+    /// are pushed in exactly the order tree building assumed.
     pub fn inst(&mut self, inst: Inst) -> Result<()> {
         let start = self.operand_stack.len();
         let mut ops = std::mem::take(&mut self.ops_tmp);

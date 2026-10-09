@@ -343,7 +343,7 @@ impl Emitter<'_> {
                 self.ins(I::V128Not);
             }
             (Opcode::Bitselect, _) => {
-                // Operands are (x, y, mask); see `stackify::operands`.
+                // Operands are (x, y, mask); see `expr_trees::operands`.
                 self.operand()?;
                 self.operand()?;
                 self.operand()?;

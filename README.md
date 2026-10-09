@@ -18,7 +18,7 @@ not need. The backend works directly on the IR instead.
 |------|------|--------------|--------|
 | Legalize | `src/legalize_i128.rs` | Rewrites `i128` values into `(lo, hi)` pairs of `i64` (signatures, block params, calls) before anything else runs; only when a function uses `i128` | |
 | Analysis | `src/analysis.rs` | RPO, deduplicated CFG edges, dominators, loop headers, merge nodes, reducibility, value-level DCE, use counts | |
-| Stackify | `src/stackify.rs` | Greedy backwards tree building: a single-use def in the same block is folded into its user unless that would reorder side effects. The check is O(1) using Cranelift-style side-effect colors. Constants are rematerialized at every use. `operands()` here defines evaluation order for every later pass | `stackify` |
+| Expression trees | `src/expr_trees.rs` | Greedy backwards tree building: a single-use def in the same block is folded into its user unless that would reorder side effects. The check is O(1) using Cranelift-style side-effect colors. Constants are rematerialized at every use. `operands()` here defines evaluation order for every later pass | `stack_values` |
 | Liveness | `src/liveness.rs` | Positions, and per-block live-range segments for the values that need a local; collects block-argument moves | |
 | Locals | `src/locals.rs` | Greedy coloring per wasm type. A value first tries its move partner's local (argument ↔ parameter), so most block-argument moves disappear | `coalesce` |
 | Structure | `src/structure.rs` | Ramsey's "Beyond Relooper" (ICFP 2022) over the dominator tree, run with an explicit task stack. Irreducible CFGs fall back to a `loop` + `br_table` dispatcher | |
@@ -28,14 +28,14 @@ not need. The backend works directly on the IR instead.
 
 Cross-module contracts are each stated in one place:
 
-- **Evaluation order:** `stackify::operands` defines it, and lowering pulls
+- **Evaluation order:** `expr_trees::operands` defines it, and lowering pulls
   operands from it through `Emitter::operand`. Branches are the one
   documented exception.
 - **When a block-argument move can be skipped:** `Locals::move_needed`
   depends on the live-range conventions documented at the top of
   `liveness.rs`.
 
-The stackifier's safety condition: `color[i]` counts the effectful
+The safety condition for folding into a tree: `color[i]` counts the effectful
 instructions before `i` in its block. An effectful def `d` may join the tree
 rooted at `r` iff `color[r] - color[d] - 1` equals the number of effectful
 defs already moved into that tree. Block arguments of multi-way branches
@@ -79,7 +79,7 @@ memory, a funcref table, globals, exports) for simple cases and tests.
 `Config` options: `memory64`, `memory_index`, `table_index`,
 `stack_pointer_global`, `tail_calls` (use `return_call`, or fall back to
 call + return). The optimizations can be switched off individually,
-mainly for comparisons: `stackify`, `coalesce` and `use_tee`.
+mainly for comparisons: `stack_values`, `coalesce` and `use_tee`.
 
 ## Supported
 
@@ -184,7 +184,7 @@ cargo run --release --example compile_loop   # compile the random corpus in a lo
 cargo run --example wasm2wat -- target/bench/kernels-default.wasm
 ```
 
-`benches/codegen.rs` compares a `naive` configuration (`stackify: false`,
+`benches/codegen.rs` compares a `naive` configuration (`stack_values: false`,
 `use_tee: false`), a `no-coalesce` one and the default one on three
 corpora:
 

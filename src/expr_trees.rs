@@ -1,4 +1,32 @@
-//! Expression tree building ("stackification").
+//! Expression trees: which values are passed on wasm's operand stack instead
+//! of through locals.
+//!
+//! An expression tree is a root instruction plus the single-use definitions
+//! folded into it, emitted together so that each folded result is pushed
+//! right before the instruction that consumes it. This is what the
+//! literature calls *stack scheduling*, and what LLVM's WebAssembly backend
+//! calls *RegStackify* (`WebAssemblyRegStackify.cpp`).
+//!
+//! It is not the control-flow "stackifier" (LLVM's CFGStackify, or Yuri
+//! Iozzelli's Stackifier algorithm): placing `block`/`loop` markers is a
+//! different problem, solved here in `structure.rs` with Ramsey's
+//! algorithm.
+//!
+//! # Prior art
+//!
+//! - The overall shape (walk each block bottom-up, visit operands in
+//!   reverse, move single-use definitions next to their use) follows LLVM's
+//!   RegStackify. LLVM checks that a move is safe by scanning the
+//!   instructions in between.
+//! - Side-effect *colors* come from Cranelift's own lowering, where a load
+//!   may merge into its user only if no side effect lies between them (equal
+//!   colors).
+//! - The rule below, which lets one tree absorb several effectful
+//!   definitions with an O(1) check each, and the rule for conditional
+//!   operands, are specific to this crate. They are checked by differential
+//!   fuzzing against Cranelift's interpreter, not by a published proof.
+//!
+//! # Algorithm
 //!
 //! Each block is walked backwards. Every live instruction that has not been
 //! folded into a later one is a *root*. For each root, its operands are
@@ -32,7 +60,7 @@ use cranelift_codegen::ir::{Function, Inst, Opcode, Value, ValueDef};
 /// Emission recurses over trees, so bound their depth.
 const MAX_TREE_DEPTH: u32 = 100;
 
-pub(crate) struct Stackified {
+pub(crate) struct ExprTrees {
     /// The result of this instruction is consumed directly from the stack by
     /// its only user, so the instruction is emitted as part of that user's
     /// tree.
@@ -41,7 +69,7 @@ pub(crate) struct Stackified {
     pub root_of: SecondaryMap<Inst, Option<Inst>>,
 }
 
-impl Stackified {
+impl ExprTrees {
     pub fn is_root(&self, info: &FuncInfo, func: &Function, inst: Inst) -> bool {
         info.live_inst[inst] && !self.inlined[inst] && !is_remat(func, inst)
     }
@@ -60,8 +88,9 @@ pub(crate) struct Operand {
 }
 
 /// The operands of `inst` in the order they are pushed. This is the single
-/// source of truth for evaluation order: lowering takes its operands from
-/// this list one by one ([`crate::emit::Emitter::operand`]).
+/// source of truth for evaluation order: tree building assumes it, and
+/// lowering takes its operands from this list one by one
+/// ([`crate::emit::Emitter::operand`]).
 ///
 /// The exception is branches (`jump`, `brif`, `br_table`), which
 /// `structure.rs` emits itself: the condition or index first, then each
@@ -110,8 +139,10 @@ pub(crate) fn operands(func: &Function, info: &FuncInfo, inst: Inst, out: &mut V
     }
 }
 
-pub(crate) fn stackify(func: &Function, info: &FuncInfo, enabled: bool) -> Stackified {
-    let mut s = Stackified {
+/// Build the expression trees of every reachable block. With `enabled` off,
+/// every live instruction is its own root.
+pub(crate) fn build(func: &Function, info: &FuncInfo, enabled: bool) -> ExprTrees {
+    let mut s = ExprTrees {
         inlined: SecondaryMap::new(),
         root_of: SecondaryMap::new(),
     };

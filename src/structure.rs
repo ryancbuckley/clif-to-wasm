@@ -24,8 +24,8 @@
 
 use crate::analysis::FuncInfo;
 use crate::emit::{Emitter, Label, Task};
+use crate::expr_trees::ExprTrees;
 use crate::locals::Locals;
-use crate::stackify::Stackified;
 use crate::{CompiledFunction, Config, Env, Result, unsupported, wasm_signature};
 use cranelift_codegen::ir::{Block, BlockCall, Function, Opcode, types};
 use std::borrow::Cow;
@@ -36,11 +36,11 @@ pub(crate) fn emit_function(
     config: &Config,
     env: &mut dyn Env,
     info: &FuncInfo,
-    stack: &Stackified,
+    trees: &ExprTrees,
     locals: Locals,
 ) -> Result<CompiledFunction> {
     let (params, results) = wasm_signature(&func.signature)?;
-    let mut e = Emitter::new(func, config, env, info, stack, locals);
+    let mut e = Emitter::new(func, config, env, info, trees, locals);
 
     if !func.dynamic_stack_slots.is_empty() {
         return unsupported("dynamic stack slots");
@@ -200,7 +200,7 @@ impl Emitter<'_> {
         let func = self.func;
         let term = func.layout.last_inst(b).unwrap();
         for inst in func.layout.block_insts(b) {
-            if inst != term && self.stack.is_root(self.info, func, inst) {
+            if inst != term && self.trees.is_root(self.info, func, inst) {
                 self.root(inst)?;
             }
         }
@@ -210,7 +210,7 @@ impl Emitter<'_> {
     /// Emit the start of a terminator and push the tasks for its successors.
     ///
     /// Branch operands are pushed here directly rather than through
-    /// `Emitter::inst`; see `stackify::operands` for why the order is safe.
+    /// `Emitter::inst`; see `expr_trees::operands` for why the order is safe.
     fn terminator(&mut self, b: Block) -> Result<()> {
         let func = self.func;
         let info = self.info;

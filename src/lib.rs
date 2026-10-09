@@ -10,10 +10,12 @@
 //! 1. **Analysis** ([`analysis`]): reachability, reverse postorder, CFG edges,
 //!    dominators, loop headers and merge nodes, value-level dead code
 //!    elimination and use counts.
-//! 2. **Stackification** ([`stackify`]): greedy, backwards, per-block expression
-//!    tree building. A single-use def is folded into its user when doing so
-//!    does not reorder side effects; this is checked in O(1) with Cranelift-style
-//!    side-effect *colors*. Constants are rematerialized at every use.
+//! 2. **Expression trees** ([`expr_trees`]): greedy, backwards, per-block
+//!    tree building, so that values pass on the operand stack instead of
+//!    through locals. A single-use def is folded into its user when doing so
+//!    does not reorder side effects; this is checked in O(1) with
+//!    Cranelift-style side-effect *colors*. Constants are rematerialized at
+//!    every use.
 //! 3. **Local allocation** ([`liveness`], [`locals`]): values that are not
 //!    consumed directly off the operand stack get a wasm local; locals are
 //!    shared between values whose live ranges do not overlap, preferring to
@@ -31,13 +33,13 @@ use wasm_encoder::ValType;
 mod analysis;
 mod emit;
 mod encode;
+mod expr_trees;
 mod legalize_i128;
 mod liveness;
 mod locals;
 mod lower;
 mod lower_simd;
 pub mod module;
-mod stackify;
 mod structure;
 
 pub use module::ModuleBuilder;
@@ -88,10 +90,11 @@ pub struct Config {
     /// Use `local.tee` to feed the first use of a multi-use value directly
     /// from the stack.
     pub use_tee: bool,
-    /// Build expression trees. When off, every value goes through a local
-    /// (constants are still rematerialized); this is mainly useful as a
-    /// baseline for comparisons.
-    pub stackify: bool,
+    /// Pass single-use values on the operand stack, by building expression
+    /// trees (see `expr_trees.rs`). When off, every value goes through a
+    /// local (constants are still rematerialized); this is mainly useful as
+    /// a baseline for comparisons.
+    pub stack_values: bool,
     /// Try to give a block argument and the parameter it is passed to the
     /// same local, so that the move disappears.
     pub coalesce: bool,
@@ -106,7 +109,7 @@ impl Default for Config {
             stack_pointer_global: None,
             tail_calls: true,
             use_tee: true,
-            stackify: true,
+            stack_values: true,
             coalesce: true,
         }
     }
@@ -276,10 +279,10 @@ pub fn compile_function(
         func
     };
     let info = analysis::FuncInfo::compute(func)?;
-    let stack = stackify::stackify(func, &info, config.stackify);
-    let ranges = liveness::compute(func, &info, &stack);
+    let trees = expr_trees::build(func, &info, config.stack_values);
+    let ranges = liveness::compute(func, &info, &trees);
     let locals = locals::allocate(func, &info, &ranges, config.coalesce)?;
-    structure::emit_function(func, config, env, &info, &stack, locals)
+    structure::emit_function(func, config, env, &info, &trees, locals)
 }
 
 /// One pass over the function: does it use value aliases, and does it
