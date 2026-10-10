@@ -73,8 +73,14 @@ let compiled = compile_function(&func, &Config::default(), &mut MyEnv)?;
 let wasm_fn: wasm_encoder::Function = compiled.to_wasm_function();
 ```
 
-`ModuleBuilder` (`src/module.rs`) assembles a complete module (imports,
-memory, a funcref table, globals, exports) for simple cases and tests.
+`ModuleBuilder` (`src/module.rs`) assembles a complete module whose indices
+agree with your `Config` and `Env` answers. It handles both kinds of module:
+- **Self-contained** modules define their own memory and globals, plus a
+  funcref table where slot `i` holds function `i`. The tests use this.
+- **Modules linked into a running program**, as a JIT running inside wasm
+  needs. Such a module imports the program's memory, table and stack pointer
+  global, and `place_in_table` puts its functions in free slots of that table.
+  `tests/module.rs` walks through this case.
 
 `Config` has three groups of settings:
 
@@ -153,6 +159,9 @@ cargo run --example runclif  -- tests/clif/control.clif
   vector code, and with `i128` code.
 - `tests/simd_ops.rs` checks every vector operation on every vector type it
   accepts, with random inputs, against the interpreter.
+- `tests/module.rs` links a JIT-style module into a host module, sharing the
+  host's memory, table and stack pointer, and calls across in both
+  directions.
 - Upstream runtests: 11,531 run commands pass and 0 fail; 306 of 395 files
   are fully supported. The rest are skipped as unsupported, mostly
   sub-128-bit vectors, two-result overflow ops, atomics, `f16`/`f128` and
