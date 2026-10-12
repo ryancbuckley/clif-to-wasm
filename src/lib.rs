@@ -264,17 +264,18 @@ impl CompiledFunction {
 
 /// Map a Cranelift scalar type to the wasm value type that represents it.
 ///
-/// `i8` and `i16` values live in `i32`s and are kept zero-extended. 128-bit
-/// vectors are `v128`s.
+/// `i8` and `i16` values live in `i32`s and are kept zero-extended. Vectors
+/// are `v128`s; one narrower than 128 bits occupies the low bytes, and the
+/// other bytes are unspecified.
 pub fn wasm_type(ty: ir::Type) -> Result<ValType> {
     use cranelift_codegen::ir::types;
-    Ok(match ty {
+    Ok(match fixed_type(ty) {
         types::I8 | types::I16 | types::I32 => ValType::I32,
         types::I64 => ValType::I64,
         types::F32 => ValType::F32,
         types::F64 => ValType::F64,
         ty if ty.is_vector()
-            && ty.bits() == 128
+            && (16..=128).contains(&ty.bits())
             && matches!(
                 ty.lane_type(),
                 types::I8 | types::I16 | types::I32 | types::I64 | types::F32 | types::F64
@@ -284,6 +285,17 @@ pub fn wasm_type(ty: ir::Type) -> Result<ValType> {
         }
         _ => return unsupported(format!("type {ty}")),
     })
+}
+
+/// The fixed-size type of a dynamic vector type such as `i32x4*gv0`, or
+/// `ty` itself. Dynamic vectors have a target-chosen multiple of a fixed
+/// size; here that multiple is 1, so they are plain vectors.
+pub(crate) fn fixed_type(ty: ir::Type) -> ir::Type {
+    if ty.is_dynamic_vector() {
+        ty.dynamic_to_vector().unwrap_or(ty)
+    } else {
+        ty
+    }
 }
 
 /// The wasm signature of a Cranelift signature.

@@ -196,8 +196,10 @@ impl<'a> Emitter<'a> {
             D::UnaryConst {
                 constant_handle, ..
             } => {
-                let bytes = self.func.dfg.constants.get(constant_handle).as_slice();
-                let bytes: [u8; 16] = bytes.try_into().expect("128-bit vector constant");
+                // A narrower vector fills the low bytes.
+                let data = self.func.dfg.constants.get(constant_handle).as_slice();
+                let mut bytes = [0u8; 16];
+                bytes[..data.len()].copy_from_slice(data);
                 self.ins(I::V128Const(i128::from_le_bytes(bytes)))
             }
             _ => unreachable!(),

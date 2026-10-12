@@ -276,6 +276,10 @@ fn to_val(v: &DataValue) -> Option<Val> {
         DataValue::F32(x) => Val::F32(x.bits()),
         DataValue::F64(x) => Val::F64(x.bits()),
         DataValue::V128(b) => Val::V128(u128::from_le_bytes(b).into()),
+        // Narrower vectors occupy the low bytes.
+        DataValue::V64(b) => Val::V128(u128::from(u64::from_le_bytes(b)).into()),
+        DataValue::V32(b) => Val::V128(u128::from(u32::from_le_bytes(b)).into()),
+        DataValue::V16(b) => Val::V128(u128::from(u16::from_le_bytes(b)).into()),
         _ => return None,
     })
 }
@@ -291,7 +295,15 @@ fn from_val(v: &Val, ty: Type) -> Result<DataValue, String> {
         (Val::I64(x), _) => DataValue::I64(*x),
         (Val::F32(x), _) => DataValue::F32(Ieee32::with_bits(*x)),
         (Val::F64(x), _) => DataValue::F64(Ieee64::with_bits(*x)),
-        (Val::V128(x), _) => DataValue::V128(x.as_u128().to_le_bytes()),
+        (Val::V128(x), _) => {
+            let b = x.as_u128().to_le_bytes();
+            match ty.bytes() {
+                8 => DataValue::V64(b[..8].try_into().unwrap()),
+                4 => DataValue::V32(b[..4].try_into().unwrap()),
+                2 => DataValue::V16(b[..2].try_into().unwrap()),
+                _ => DataValue::V128(b),
+            }
+        }
         _ => return Err(format!("unexpected result {v:?}")),
     })
 }
@@ -314,11 +326,14 @@ pub fn same_results(a: &[DataValue], b: &[DataValue], types: &[Type]) -> bool {
                 float_eq(x.bits().into(), y.bits().into(), 32)
             }
             (DataValue::F64(x), DataValue::F64(y)) => float_eq(x.bits(), y.bits(), 64),
-            (DataValue::V128(x), DataValue::V128(y))
+            (x, y)
                 if types
                     .get(i)
                     .is_some_and(|t| t.is_vector() && t.lane_type().is_float()) =>
             {
+                let (Some(x), Some(y)) = (vector_bytes(x), vector_bytes(y)) else {
+                    return false;
+                };
                 let lb = types[i].lane_bits() as usize / 8;
                 x.chunks(lb).zip(y.chunks(lb)).all(|(p, q)| {
                     let v = |c: &[u8]| c.iter().rev().fold(0u64, |acc, &b| acc << 8 | b as u64);
@@ -327,6 +342,16 @@ pub fn same_results(a: &[DataValue], b: &[DataValue], types: &[Type]) -> bool {
             }
             _ => a == b,
         })
+}
+
+fn vector_bytes(v: &DataValue) -> Option<&[u8]> {
+    match v {
+        DataValue::V128(b) => Some(b),
+        DataValue::V64(b) => Some(b),
+        DataValue::V32(b) => Some(b),
+        DataValue::V16(b) => Some(b),
+        _ => None,
+    }
 }
 
 pub fn run_clif(text: &str, config: &Config) -> Result<Outcome, String> {

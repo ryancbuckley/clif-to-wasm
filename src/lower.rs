@@ -1018,7 +1018,7 @@ impl Emitter<'_> {
     }
 
     /// Push the high half of the product of the `i64` locals `a` and `b`.
-    fn mulhi64_of(&mut self, a: u32, b: u32, signed: bool) {
+    pub(crate) fn mulhi64_of(&mut self, a: u32, b: u32, signed: bool) {
         let [p1, p2] = [(); 2].map(|_| self.scratch(ValType::I64));
         let lo32 = |e: &mut Self, l: u32| {
             e.ins(I::LocalGet(l));

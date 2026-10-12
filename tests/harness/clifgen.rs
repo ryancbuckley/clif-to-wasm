@@ -1076,7 +1076,12 @@ pub fn arg(rng: &mut Rng, ty: Type) -> DataValue {
             for chunk in b.chunks_mut(8) {
                 chunk.copy_from_slice(&rng.int().to_le_bytes());
             }
-            DataValue::V128(b)
+            match ty.bytes() {
+                8 => DataValue::V64(b[..8].try_into().unwrap()),
+                4 => DataValue::V32(b[..4].try_into().unwrap()),
+                2 => DataValue::V16(b[..2].try_into().unwrap()),
+                _ => DataValue::V128(b),
+            }
         }
     }
 }

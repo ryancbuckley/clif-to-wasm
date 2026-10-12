@@ -17,13 +17,21 @@ use cranelift_interpreter::step::ControlFlow;
 use cranelift_wasm_backend::Config;
 use harness::clifgen::{Rng, arg};
 
-const VTYPES: [Type; 6] = [
+const VTYPES: [Type; 13] = [
     types::I8X16,
     types::I16X8,
     types::I32X4,
     types::I64X2,
     types::F32X4,
     types::F64X2,
+    // Narrower than 128 bits.
+    types::I8X8,
+    types::I16X4,
+    types::I32X2,
+    types::F32X2,
+    types::I8X4,
+    types::I16X2,
+    types::I8X2,
 ];
 
 type Build = fn(&mut FunctionBuilder, &[Value], Type) -> Value;
@@ -131,6 +139,8 @@ fn ops() -> Vec<Op> {
         op("ishl", shift, |b, a, _| b.ins().ishl(a[0], a[1])),
         op("ushr", shift, |b, a, _| b.ins().ushr(a[0], a[1])),
         op("sshr", shift, |b, a, _| b.ins().sshr(a[0], a[1])),
+        op("rotl", shift, |b, a, _| b.ins().rotl(a[0], a[1])),
+        op("rotr", shift, |b, a, _| b.ins().rotr(a[0], a[1])),
         op(
             "bitselect",
             |t| vec![t, t, t],

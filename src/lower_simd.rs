@@ -13,9 +13,15 @@
 //! - `uunarrow`: clamp each lane with an unsigned min, then a narrowing
 //!   that would otherwise treat the input as signed.
 //! - `popcnt` of 16- and 32-bit lanes: byte popcounts summed pairwise.
+//!
+//! Vectors narrower than 128 bits (`i32x2`, `i8x4`, ...) live in the low
+//! bytes of a `v128`, and the other bytes are unspecified. Lane-wise
+//! operations ignore them; the few that look across lanes (`vall_true`,
+//! `vany_true`, `vhigh_bits`, `iadd_pairwise`, the `*widen_high` and
+//! narrowing operations), loads and stores account for the lane count.
 
 use crate::emit::Emitter;
-use crate::{Result, unsupported};
+use crate::{Result, fixed_type, unsupported};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{Inst, InstructionData as D, Opcode, Type, types};
 use wasm_encoder::{Instruction as I, MemArg, ValType};
@@ -33,7 +39,7 @@ enum Lane {
 
 impl Lane {
     fn of(ty: Type) -> Result<Lane> {
-        if !ty.is_vector() || ty.bits() != 128 {
+        if !ty.is_vector() || !(16..=128).contains(&ty.bits()) {
             return unsupported(format!("vector type {ty}"));
         }
         Ok(match ty.lane_type() {
@@ -83,7 +89,7 @@ pub(crate) fn is_simd(func: &cranelift_codegen::ir::Function, inst: Inst) -> boo
     // Almost every vector operation has a vector result; check the
     // vector-in, scalar-out ones by their operand.
     match dfg.inst_results(inst).first() {
-        Some(&r) if dfg.value_type(r).is_vector() => {
+        Some(&r) if fixed_type(dfg.value_type(r)).is_vector() => {
             let op = dfg.insts[inst].opcode();
             !op.is_call()
         }
@@ -93,7 +99,7 @@ pub(crate) fn is_simd(func: &cranelift_codegen::ir::Function, inst: Inst) -> boo
             | Opcode::VallTrue
             | Opcode::VhighBits
             | Opcode::Store
-            | Opcode::Bitcast => dfg.value_type(dfg.inst_args(inst)[0]).is_vector(),
+            | Opcode::Bitcast => fixed_type(dfg.value_type(dfg.inst_args(inst)[0])).is_vector(),
             _ => false,
         },
     }
@@ -109,6 +115,11 @@ fn shuffle_bytes(lane_bytes: u32, pick: impl Fn(u32) -> u32) -> [u8; 16] {
         }
     }
     out
+}
+
+/// A `v128` mask with ones in the low `bytes` bytes.
+fn low_bytes(bytes: u32) -> u128 {
+    (1u128 << (bytes * 8)) - 1
 }
 
 /// A `v128` with every lane of `lane` set to `bits`.
@@ -128,14 +139,20 @@ impl Emitter<'_> {
         let data = dfg.insts[inst];
         let op = data.opcode();
         let args = dfg.inst_args(inst);
+        // Dynamic vectors are treated as their fixed-size types.
         let ty = dfg
             .inst_results(inst)
             .first()
-            .map_or(types::INVALID, |&r| dfg.value_type(r));
-        let aty = args.first().map_or(types::INVALID, |&a| dfg.value_type(a));
+            .map_or(types::INVALID, |&r| fixed_type(dfg.value_type(r)));
+        let aty = args
+            .first()
+            .map_or(types::INVALID, |&a| fixed_type(dfg.value_type(a)));
         // The vector type the operation works on.
         let vty = if ty.is_vector() { ty } else { aty };
         let lane = Lane::of(vty)?;
+        // Lanes in use, and lanes in a `v128`.
+        let count = vty.lane_count();
+        let full = 16 / lane.bytes();
 
         match (op, data) {
             (Opcode::Vconst, _) => self.constant(inst)?,
@@ -176,6 +193,11 @@ impl Emitter<'_> {
                 let bytes: [u8; 16] = dfg.immediates[imm].as_slice().try_into().unwrap();
                 self.ins(I::I8x16Shuffle(bytes));
             }
+            // With a dynamic vector the size of its fixed type, only the
+            // first fixed-size piece exists.
+            (Opcode::ExtractVector, D::BinaryImm8 { imm: 0, .. }) => {
+                self.operand()?;
+            }
             (Opcode::Swizzle, _) => {
                 self.operand()?;
                 self.operand()?;
@@ -205,10 +227,10 @@ impl Emitter<'_> {
                 self.ins(lanes!(lane, op;
                     I16 => I::I16x8Mul, I32 => I::I32x4Mul, I64 => I::I64x2Mul));
             }
+            (Opcode::Umulhi | Opcode::Smulhi, _) if lane == Lane::I64 => {
+                self.mulhi_i64x2(op == Opcode::Smulhi)?;
+            }
             (Opcode::Umulhi | Opcode::Smulhi, _) => {
-                if lane == Lane::I64 {
-                    return unsupported(format!("{op} on {vty}"));
-                }
                 // The high half of each double-width product.
                 self.widening_mul(lane, op == Opcode::Smulhi)?;
                 self.ins(I::I8x16Shuffle(shuffle_bytes(lane.bytes(), |i| 2 * i + 1)));
@@ -240,6 +262,11 @@ impl Emitter<'_> {
                         I32 => I::I32x4MaxU),
                 });
             }
+            (Opcode::UaddSat | Opcode::SaddSat | Opcode::UsubSat | Opcode::SsubSat, _)
+                if matches!(lane, Lane::I32 | Lane::I64) =>
+            {
+                self.wide_sat(op, lane)?;
+            }
             (Opcode::UaddSat | Opcode::SaddSat | Opcode::UsubSat | Opcode::SsubSat, _) => {
                 self.operand()?;
                 self.operand()?;
@@ -253,10 +280,61 @@ impl Emitter<'_> {
                     _ => lanes!(lane, op; I8 => I::I8x16SubSatS, I16 => I::I16x8SubSatS),
                 });
             }
+            (Opcode::AvgRound, _) if matches!(lane, Lane::I32 | Lane::I64) => {
+                // (a + b + 1) >> 1 without overflow: (a | b) - ((a ^ b) >> 1).
+                let (shr, sub) = if lane == Lane::I32 {
+                    (I::I32x4ShrU, I::I32x4Sub)
+                } else {
+                    (I::I64x2ShrU, I::I64x2Sub)
+                };
+                let a = self.scratch(ValType::V128);
+                let b = self.scratch(ValType::V128);
+                self.operand()?;
+                self.ins(I::LocalTee(a));
+                self.operand()?;
+                self.ins(I::LocalTee(b));
+                self.ins(I::V128Or);
+                self.ins(I::LocalGet(a));
+                self.ins(I::LocalGet(b));
+                self.ins(I::V128Xor);
+                self.ins(I::I32Const(1));
+                self.ins(shr);
+                self.ins(sub);
+                self.release(ValType::V128, a);
+                self.release(ValType::V128, b);
+            }
             (Opcode::AvgRound, _) => {
                 self.operand()?;
                 self.operand()?;
                 self.ins(lanes!(lane, op; I8 => I::I8x16AvgrU, I16 => I::I16x8AvgrU));
+            }
+            (Opcode::SqmulRoundSat, _) if lane == Lane::I32 => {
+                // (a * b + 2^30) >> 31 on 64-bit products, then the low
+                // halves. Only MIN * MIN overflows; it wraps to MIN, which
+                // no other inputs produce, so turn MIN into MAX.
+                let a = self.scratch(ValType::V128);
+                let b = self.scratch(ValType::V128);
+                self.operand()?;
+                self.ins(I::LocalSet(a));
+                self.operand()?;
+                self.ins(I::LocalSet(b));
+                for mul in [I::I64x2ExtMulLowI32x4S, I::I64x2ExtMulHighI32x4S] {
+                    self.ins(I::LocalGet(a));
+                    self.ins(I::LocalGet(b));
+                    self.ins(mul);
+                    self.ins(splat_const(Lane::I64, 1 << 30));
+                    self.ins(I::I64x2Add);
+                    self.ins(I::I32Const(31));
+                    self.ins(I::I64x2ShrS);
+                }
+                self.ins(I::I8x16Shuffle(shuffle_bytes(4, |i| 2 * i)));
+                self.ins(I::LocalTee(a));
+                self.ins(I::LocalGet(a));
+                self.ins(splat_const(Lane::I32, 0x8000_0000));
+                self.ins(I::I32x4Eq);
+                self.ins(I::V128Xor);
+                self.release(ValType::V128, a);
+                self.release(ValType::V128, b);
             }
             (Opcode::SqmulRoundSat, _) => {
                 self.operand()?;
@@ -265,18 +343,25 @@ impl Emitter<'_> {
             }
             (Opcode::IaddPairwise, _) => {
                 // [x0+x1, x2+x3, ..., y0+y1, ...]: add the even lanes of
-                // x:y to the odd ones.
+                // x then y to the odd ones. Lane `full + k` of the shuffle's
+                // input is lane `k` of y.
                 let x = self.scratch(ValType::V128);
                 let y = self.scratch(ValType::V128);
                 let b = lane.bytes();
+                let half = count / 2;
+                let pick = move |i: u32, odd: u32| match i {
+                    i if i < half => 2 * i + odd,
+                    i if i < count => full + 2 * (i - half) + odd,
+                    _ => 0,
+                };
                 self.operand()?;
                 self.ins(I::LocalTee(x));
                 self.operand()?;
                 self.ins(I::LocalTee(y));
-                self.ins(I::I8x16Shuffle(shuffle_bytes(b, |i| 2 * i)));
+                self.ins(I::I8x16Shuffle(shuffle_bytes(b, |i| pick(i, 0))));
                 self.ins(I::LocalGet(x));
                 self.ins(I::LocalGet(y));
-                self.ins(I::I8x16Shuffle(shuffle_bytes(b, |i| 2 * i + 1)));
+                self.ins(I::I8x16Shuffle(shuffle_bytes(b, |i| pick(i, 1))));
                 self.ins(lanes!(lane, op; I8 => I::I8x16Add, I16 => I::I16x8Add,
                     I32 => I::I32x4Add, I64 => I::I64x2Add));
                 self.release(ValType::V128, x);
@@ -328,6 +413,43 @@ impl Emitter<'_> {
                 });
             }
 
+            (Opcode::Rotl | Opcode::Rotr, _) => {
+                // (x << n) | (x >> (width - n)). Wasm takes shift amounts
+                // modulo the lane width, so n = 0 gives x | x.
+                let (shl, shr) = match lane {
+                    Lane::I8 => (I::I8x16Shl, I::I8x16ShrU),
+                    Lane::I16 => (I::I16x8Shl, I::I16x8ShrU),
+                    Lane::I32 => (I::I32x4Shl, I::I32x4ShrU),
+                    Lane::I64 => (I::I64x2Shl, I::I64x2ShrU),
+                    _ => return unsupported(format!("{op} on {vty}")),
+                };
+                let (first, second) = if op == Opcode::Rotl {
+                    (shl, shr)
+                } else {
+                    (shr, shl)
+                };
+                let x = self.scratch(ValType::V128);
+                let n = self.scratch(ValType::I32);
+                self.operand()?;
+                self.ins(I::LocalSet(x));
+                let amt = self.operand()?;
+                if dfg.value_type(amt) == types::I64 {
+                    self.ins(I::I32WrapI64);
+                }
+                self.ins(I::LocalSet(n));
+                self.ins(I::LocalGet(x));
+                self.ins(I::LocalGet(n));
+                self.ins(first);
+                self.ins(I::LocalGet(x));
+                self.ins(I::I32Const((lane.bytes() * 8) as i32));
+                self.ins(I::LocalGet(n));
+                self.ins(I::I32Sub);
+                self.ins(second);
+                self.ins(I::V128Or);
+                self.release(ValType::V128, x);
+                self.release(ValType::I32, n);
+            }
+
             // Bitwise.
             (Opcode::Band | Opcode::Bor | Opcode::Bxor, _) => {
                 self.operand()?;
@@ -364,10 +486,20 @@ impl Emitter<'_> {
             }
             (Opcode::VanyTrue, _) => {
                 self.operand()?;
+                if count < full {
+                    // Clear the unused bytes.
+                    self.ins(I::V128Const(low_bytes(vty.bytes()) as i128));
+                    self.ins(I::V128And);
+                }
                 self.ins(I::V128AnyTrue);
             }
             (Opcode::VallTrue, _) => {
                 self.operand()?;
+                if count < full {
+                    // Set the unused bytes, so their lanes count as true.
+                    self.ins(I::V128Const(!low_bytes(vty.bytes()) as i128));
+                    self.ins(I::V128Or);
+                }
                 self.ins(
                     lanes!(lane.int(), op; I8 => I::I8x16AllTrue, I16 => I::I16x8AllTrue,
                     I32 => I::I32x4AllTrue, I64 => I::I64x2AllTrue),
@@ -379,6 +511,10 @@ impl Emitter<'_> {
                     lanes!(lane.int(), op; I8 => I::I8x16Bitmask, I16 => I::I16x8Bitmask,
                     I32 => I::I32x4Bitmask, I64 => I::I64x2Bitmask),
                 );
+                if count < full {
+                    self.ins(I::I32Const((1 << count) - 1));
+                    self.ins(I::I32And);
+                }
                 match ty {
                     types::I64 => self.ins(I::I64ExtendI32U),
                     _ => self.mask(ty),
@@ -386,6 +522,17 @@ impl Emitter<'_> {
             }
 
             // Narrowing and widening.
+            (Opcode::Snarrow | Opcode::Unarrow | Opcode::Uunarrow, _)
+                if Lane::of(aty)? == Lane::I64 =>
+            {
+                // Clamp each 64-bit lane to the 32-bit range, then keep the
+                // low halves: [x0, x1, y0, y1].
+                for _ in 0..2 {
+                    self.operand()?;
+                    self.clamp_i64x2(op)?;
+                }
+                self.ins(I::I8x16Shuffle(shuffle_bytes(4, |i| 2 * i)));
+            }
             (Opcode::Snarrow | Opcode::Unarrow, _) => {
                 self.operand()?;
                 self.operand()?;
@@ -397,6 +544,7 @@ impl Emitter<'_> {
                     (Lane::I32, false) => I::I16x8NarrowI32x4U,
                     _ => return unsupported(format!("{op} on {vty}")),
                 });
+                self.join_narrowed(aty)?;
             }
             (Opcode::Uunarrow, _) => {
                 // Clamp as unsigned first; the narrowing then sees only
@@ -413,6 +561,7 @@ impl Emitter<'_> {
                     self.ins(min.clone());
                 }
                 self.ins(narrow);
+                self.join_narrowed(aty)?;
             }
             (
                 Opcode::SwidenLow | Opcode::SwidenHigh | Opcode::UwidenLow | Opcode::UwidenHigh,
@@ -420,6 +569,24 @@ impl Emitter<'_> {
             ) => {
                 self.operand()?;
                 let src = Lane::of(aty)?;
+                let n = aty.lane_count();
+                let op = match op {
+                    // The high half of a narrow vector is not the high half
+                    // of the v128: move it down and widen the low half.
+                    Opcode::SwidenHigh | Opcode::UwidenHigh if n < 16 / src.bytes() => {
+                        let s = self.scratch(ValType::V128);
+                        self.ins(I::LocalTee(s));
+                        self.ins(I::LocalGet(s));
+                        self.ins(I::I8x16Shuffle(shuffle_bytes(src.bytes(), |i| i + n / 2)));
+                        self.release(ValType::V128, s);
+                        if op == Opcode::SwidenHigh {
+                            Opcode::SwidenLow
+                        } else {
+                            Opcode::UwidenLow
+                        }
+                    }
+                    op => op,
+                };
                 self.ins(match (op, src) {
                     (Opcode::SwidenLow, Lane::I8) => I::I16x8ExtendLowI8x16S,
                     (Opcode::SwidenHigh, Lane::I8) => I::I16x8ExtendHighI8x16S,
@@ -556,12 +723,35 @@ impl Emitter<'_> {
                 self.ins(I::F64x2PromoteLowF32x4);
             }
 
-            (Opcode::Bitcast, _) => {
-                // All 128-bit vectors share the `v128` representation;
-                // anything else (e.g. `i128`) is rejected by `Lane::of`.
-                Lane::of(aty)?;
-                Lane::of(ty)?;
+            (Opcode::Bitcast, D::LoadNoOffset { flags, .. }) => {
+                // Vectors of the same size share a representation, with
+                // lanes in little-endian order.
+                if self.big_endian(flags) && aty.lane_bits() != ty.lane_bits() {
+                    return unsupported(format!("big-endian bitcast {aty} -> {ty}"));
+                }
                 self.operand()?;
+                match (aty.is_vector(), ty.is_vector()) {
+                    (true, true) => {
+                        Lane::of(aty)?;
+                    }
+                    // A scalar is lane 0 of a vector of its width.
+                    (true, false) => self.ins(match ty {
+                        types::I64 => I::I64x2ExtractLane(0),
+                        types::F64 => I::F64x2ExtractLane(0),
+                        types::I32 => I::I32x4ExtractLane(0),
+                        types::F32 => I::F32x4ExtractLane(0),
+                        types::I16 => I::I16x8ExtractLaneU(0),
+                        _ => return unsupported(format!("bitcast {aty} -> {ty}")),
+                    }),
+                    (false, _) => self.ins(match aty {
+                        types::I64 => I::I64x2Splat,
+                        types::F64 => I::F64x2Splat,
+                        types::I32 => I::I32x4Splat,
+                        types::F32 => I::F32x4Splat,
+                        types::I16 => I::I16x8Splat,
+                        _ => return unsupported(format!("bitcast {aty} -> {ty}")),
+                    }),
+                }
             }
 
             // Memory.
@@ -580,7 +770,12 @@ impl Emitter<'_> {
                 }
                 let off = self.mem_address(offset.into())?;
                 let (size, i): (u32, fn(MemArg) -> I<'static>) = match op {
-                    Opcode::Load => (16, I::V128Load),
+                    Opcode::Load => match ty.bytes() {
+                        16 => (16, I::V128Load),
+                        8 => (8, I::V128Load64Zero),
+                        4 => (4, I::V128Load32Zero),
+                        _ => (2, I::V128Load16Splat),
+                    },
                     Opcode::Uload8x8 => (8, I::V128Load8x8U),
                     Opcode::Sload8x8 => (8, I::V128Load8x8S),
                     Opcode::Uload16x4 => (8, I::V128Load16x4U),
@@ -597,11 +792,38 @@ impl Emitter<'_> {
                 }
                 let off = self.mem_address(offset.into())?;
                 self.operand()?;
-                let m = self.memarg(off, flags, 16);
-                self.ins(I::V128Store(m));
+                let size = aty.bytes();
+                let memarg = self.memarg(off, flags, size);
+                self.ins(match size {
+                    16 => I::V128Store(memarg),
+                    8 => I::V128Store64Lane { memarg, lane: 0 },
+                    4 => I::V128Store32Lane { memarg, lane: 0 },
+                    _ => I::V128Store16Lane { memarg, lane: 0 },
+                });
             }
 
             _ => return unsupported(format!("instruction `{}`", dfg.display_inst(inst))),
+        }
+        Ok(())
+    }
+
+    /// After a wasm narrowing of two vectors of `src` type, which places
+    /// the lanes of each input at the start of a v128 half, gather the used
+    /// lanes when `src` is narrower than 128 bits: `[x.., y..]`.
+    fn join_narrowed(&mut self, src: Type) -> Result<()> {
+        let n = src.lane_count();
+        let full = 16 / Lane::of(src)?.bytes();
+        if n < full {
+            let s = self.scratch(ValType::V128);
+            // The result's lanes are half the size: `full` of them per
+            // input.
+            let bytes = Lane::of(src)?.bytes() / 2;
+            self.ins(I::LocalTee(s));
+            self.ins(I::LocalGet(s));
+            self.ins(I::I8x16Shuffle(shuffle_bytes(bytes, |i| {
+                if i < n { i } else { full + i - n }
+            })));
+            self.release(ValType::V128, s);
         }
         Ok(())
     }
@@ -664,6 +886,158 @@ impl Emitter<'_> {
         self.ins(hi);
         self.release(ValType::V128, x);
         self.release(ValType::V128, y);
+        Ok(())
+    }
+
+    /// Saturating add or subtract on 32- or 64-bit lanes, which wasm only
+    /// has for 8- and 16-bit lanes: compute the wrapping result, then
+    /// replace the lanes that overflowed.
+    fn wide_sat(&mut self, op: Opcode, lane: Lane) -> Result<()> {
+        let (add, sub, shr_s, max): (I<'static>, I<'static>, I<'static>, u64) = match lane {
+            Lane::I32 => (I::I32x4Add, I::I32x4Sub, I::I32x4ShrS, i32::MAX as u64),
+            _ => (I::I64x2Add, I::I64x2Sub, I::I64x2ShrS, i64::MAX as u64),
+        };
+        let sign_shift = (lane.bytes() * 8 - 1) as i32;
+        let [a, b, r] = [(); 3].map(|_| self.scratch(ValType::V128));
+        self.operand()?;
+        self.ins(I::LocalSet(a));
+        self.operand()?;
+        self.ins(I::LocalSet(b));
+        let adding = matches!(op, Opcode::UaddSat | Opcode::SaddSat);
+        self.ins(I::LocalGet(a));
+        self.ins(I::LocalGet(b));
+        self.ins(if adding { add } else { sub });
+        self.ins(I::LocalSet(r));
+        match op {
+            // A carry out shows as r < a; saturate to all ones.
+            Opcode::UaddSat => {
+                self.ins(I::LocalGet(r));
+                self.lt_u(lane, r, a);
+                self.ins(I::V128Or);
+            }
+            // A borrow happens when a < b; saturate to zero.
+            Opcode::UsubSat => {
+                self.ins(I::LocalGet(r));
+                self.lt_u(lane, a, b);
+                self.ins(I::V128AndNot);
+            }
+            _ => {
+                // The saturated value: MIN where a < 0, MAX elsewhere.
+                self.ins(I::LocalGet(a));
+                self.ins(I::I32Const(sign_shift));
+                self.ins(shr_s.clone());
+                self.ins(splat_const(lane, max));
+                self.ins(I::V128Xor);
+                self.ins(I::LocalGet(r));
+                // Overflow, as an all-ones lane mask:
+                //   add: (a ^ r) & (b ^ r) < 0
+                //   sub: (a ^ b) & (a ^ r) < 0
+                let pairs = if adding {
+                    [(a, r), (b, r)]
+                } else {
+                    [(a, b), (a, r)]
+                };
+                for (x, y) in pairs {
+                    self.ins(I::LocalGet(x));
+                    self.ins(I::LocalGet(y));
+                    self.ins(I::V128Xor);
+                }
+                self.ins(I::V128And);
+                self.ins(I::I32Const(sign_shift));
+                self.ins(shr_s);
+                self.ins(I::V128Bitselect);
+            }
+        }
+        for l in [a, b, r] {
+            self.release(ValType::V128, l);
+        }
+        Ok(())
+    }
+
+    /// Push the lane mask of `x < y`, unsigned, for the locals `x` and `y`.
+    fn lt_u(&mut self, lane: Lane, x: u32, y: u32) {
+        for l in [x, y] {
+            self.ins(I::LocalGet(l));
+            if lane == Lane::I64 {
+                // No unsigned 64-bit lane comparison: flip the sign bits.
+                self.ins(splat_const(Lane::I64, 1 << 63));
+                self.ins(I::V128Xor);
+            }
+        }
+        self.ins(if lane == Lane::I64 {
+            I::I64x2LtS
+        } else {
+            I::I32x4LtU
+        });
+    }
+
+    /// Clamp the `i64x2` on the stack to the result range of a 64-to-32-bit
+    /// narrowing `op`.
+    fn clamp_i64x2(&mut self, op: Opcode) -> Result<()> {
+        const SIGN: u64 = 1 << 63;
+        let s = self.scratch(ValType::V128);
+        self.ins(I::LocalSet(s));
+        // (bound, replace the lane when `lane cmp bound`, compare unsigned)
+        let bounds: &[(u64, I<'static>, bool)] = match op {
+            Opcode::Snarrow => &[
+                (i32::MAX as u64, I::I64x2GtS, false),
+                (i32::MIN as i64 as u64, I::I64x2LtS, false),
+            ],
+            Opcode::Unarrow => &[(u32::MAX as u64, I::I64x2GtS, false), (0, I::I64x2LtS, false)],
+            _ => &[(u32::MAX as u64, I::I64x2GtS, true)],
+        };
+        for (bound, cmp, unsigned) in bounds.iter().cloned() {
+            // s = bitselect(bound, s, s cmp bound); an unsigned comparison
+            // flips both sides' sign bits and compares signed.
+            self.ins(splat_const(Lane::I64, bound));
+            self.ins(I::LocalGet(s));
+            self.ins(I::LocalGet(s));
+            if unsigned {
+                self.ins(splat_const(Lane::I64, SIGN));
+                self.ins(I::V128Xor);
+            }
+            self.ins(splat_const(
+                Lane::I64,
+                if unsigned { bound ^ SIGN } else { bound },
+            ));
+            self.ins(cmp);
+            self.ins(I::V128Bitselect);
+            self.ins(I::LocalSet(s));
+        }
+        self.ins(I::LocalGet(s));
+        self.release(ValType::V128, s);
+        Ok(())
+    }
+
+    /// `umulhi`/`smulhi` on `i64x2`, one lane at a time with the scalar
+    /// algorithm.
+    fn mulhi_i64x2(&mut self, signed: bool) -> Result<()> {
+        let a = self.scratch(ValType::V128);
+        let b = self.scratch(ValType::V128);
+        let sa = self.scratch(ValType::I64);
+        let sb = self.scratch(ValType::I64);
+        self.operand()?;
+        self.ins(I::LocalSet(a));
+        self.operand()?;
+        self.ins(I::LocalSet(b));
+        for i in 0..2 {
+            self.ins(I::LocalGet(a));
+            self.ins(I::I64x2ExtractLane(i));
+            self.ins(I::LocalSet(sa));
+            self.ins(I::LocalGet(b));
+            self.ins(I::I64x2ExtractLane(i));
+            self.ins(I::LocalSet(sb));
+            self.mulhi64_of(sa, sb, signed);
+            self.ins(if i == 0 {
+                I::I64x2Splat
+            } else {
+                I::I64x2ReplaceLane(1)
+            });
+        }
+        self.release(ValType::V128, a);
+        self.release(ValType::V128, b);
+        self.release(ValType::I64, sa);
+        self.release(ValType::I64, sb);
         Ok(())
     }
 

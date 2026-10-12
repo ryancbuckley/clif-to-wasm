@@ -228,12 +228,12 @@ pub(crate) fn is_remat(func: &Function, inst: Inst) -> bool {
             opcode: Opcode::F64const,
             ..
         } => true,
-        // Only 128-bit vector constants fit a `v128.const`; others stay
+        // Vectors of up to 128 bits fit a `v128.const`; others stay
         // ordinary (and unsupported) instructions.
         InstructionData::UnaryConst {
             opcode: Opcode::Vconst,
             ..
-        } => func.dfg.value_type(func.dfg.first_result(inst)).bits() == 128,
+        } => func.dfg.value_type(func.dfg.first_result(inst)).bits() <= 128,
         _ => false,
     }
 }

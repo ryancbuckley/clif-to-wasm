@@ -113,7 +113,7 @@ pub(crate) fn operands(func: &Function, info: &FuncInfo, inst: Inst, out: &mut V
             plain(out, &[args[1], args[2], args[0]]);
         }
         // `v128.bitselect` takes the mask last.
-        Opcode::Bitselect if dfg.value_type(args[0]).is_vector() => {
+        Opcode::Bitselect if crate::fixed_type(dfg.value_type(args[0])).is_vector() => {
             plain(out, &[args[1], args[2], args[0]]);
         }
         Opcode::Store
