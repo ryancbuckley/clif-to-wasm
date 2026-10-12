@@ -1,0 +1,1084 @@
+test run
+
+; Atomic operations on a stack slot. These check the values computed, not
+; atomicity. `nand` and the min/max operations have no wasm instruction and
+; use a compare-exchange loop, as do big-endian read-modify-writes.
+
+
+function %rmw_add_i8(i8, i8) -> i8, i8 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i8, v1: i8):
+    v2 = stack_addr.i64 ss0
+    store.i8 v0, v2
+    v3 = atomic_rmw.i8 add v2, v1
+    v4 = load.i8 v2
+    return v3, v4
+}
+; run: %rmw_add_i8(0x05, 0x03) == [0x05, 0x08]
+; run: %rmw_add_i8(0x7f, 0x80) == [0x7f, 0xff]
+; run: %rmw_add_i8(0xff, 0x01) == [0xff, 0x00]
+; run: %rmw_add_i8(0x80, 0x7f) == [0x80, 0xff]
+
+function %rmw_sub_i8(i8, i8) -> i8, i8 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i8, v1: i8):
+    v2 = stack_addr.i64 ss0
+    store.i8 v0, v2
+    v3 = atomic_rmw.i8 sub v2, v1
+    v4 = load.i8 v2
+    return v3, v4
+}
+; run: %rmw_sub_i8(0x05, 0x03) == [0x05, 0x02]
+; run: %rmw_sub_i8(0x7f, 0x80) == [0x7f, 0xff]
+; run: %rmw_sub_i8(0xff, 0x01) == [0xff, 0xfe]
+; run: %rmw_sub_i8(0x80, 0x7f) == [0x80, 0x01]
+
+function %rmw_and_i8(i8, i8) -> i8, i8 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i8, v1: i8):
+    v2 = stack_addr.i64 ss0
+    store.i8 v0, v2
+    v3 = atomic_rmw.i8 and v2, v1
+    v4 = load.i8 v2
+    return v3, v4
+}
+; run: %rmw_and_i8(0x05, 0x03) == [0x05, 0x01]
+; run: %rmw_and_i8(0x7f, 0x80) == [0x7f, 0x00]
+; run: %rmw_and_i8(0xff, 0x01) == [0xff, 0x01]
+; run: %rmw_and_i8(0x80, 0x7f) == [0x80, 0x00]
+
+function %rmw_nand_i8(i8, i8) -> i8, i8 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i8, v1: i8):
+    v2 = stack_addr.i64 ss0
+    store.i8 v0, v2
+    v3 = atomic_rmw.i8 nand v2, v1
+    v4 = load.i8 v2
+    return v3, v4
+}
+; run: %rmw_nand_i8(0x05, 0x03) == [0x05, 0xfe]
+; run: %rmw_nand_i8(0x7f, 0x80) == [0x7f, 0xff]
+; run: %rmw_nand_i8(0xff, 0x01) == [0xff, 0xfe]
+; run: %rmw_nand_i8(0x80, 0x7f) == [0x80, 0xff]
+
+function %rmw_or_i8(i8, i8) -> i8, i8 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i8, v1: i8):
+    v2 = stack_addr.i64 ss0
+    store.i8 v0, v2
+    v3 = atomic_rmw.i8 or v2, v1
+    v4 = load.i8 v2
+    return v3, v4
+}
+; run: %rmw_or_i8(0x05, 0x03) == [0x05, 0x07]
+; run: %rmw_or_i8(0x7f, 0x80) == [0x7f, 0xff]
+; run: %rmw_or_i8(0xff, 0x01) == [0xff, 0xff]
+; run: %rmw_or_i8(0x80, 0x7f) == [0x80, 0xff]
+
+function %rmw_xor_i8(i8, i8) -> i8, i8 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i8, v1: i8):
+    v2 = stack_addr.i64 ss0
+    store.i8 v0, v2
+    v3 = atomic_rmw.i8 xor v2, v1
+    v4 = load.i8 v2
+    return v3, v4
+}
+; run: %rmw_xor_i8(0x05, 0x03) == [0x05, 0x06]
+; run: %rmw_xor_i8(0x7f, 0x80) == [0x7f, 0xff]
+; run: %rmw_xor_i8(0xff, 0x01) == [0xff, 0xfe]
+; run: %rmw_xor_i8(0x80, 0x7f) == [0x80, 0xff]
+
+function %rmw_xchg_i8(i8, i8) -> i8, i8 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i8, v1: i8):
+    v2 = stack_addr.i64 ss0
+    store.i8 v0, v2
+    v3 = atomic_rmw.i8 xchg v2, v1
+    v4 = load.i8 v2
+    return v3, v4
+}
+; run: %rmw_xchg_i8(0x05, 0x03) == [0x05, 0x03]
+; run: %rmw_xchg_i8(0x7f, 0x80) == [0x7f, 0x80]
+; run: %rmw_xchg_i8(0xff, 0x01) == [0xff, 0x01]
+; run: %rmw_xchg_i8(0x80, 0x7f) == [0x80, 0x7f]
+
+function %rmw_umin_i8(i8, i8) -> i8, i8 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i8, v1: i8):
+    v2 = stack_addr.i64 ss0
+    store.i8 v0, v2
+    v3 = atomic_rmw.i8 umin v2, v1
+    v4 = load.i8 v2
+    return v3, v4
+}
+; run: %rmw_umin_i8(0x05, 0x03) == [0x05, 0x03]
+; run: %rmw_umin_i8(0x7f, 0x80) == [0x7f, 0x7f]
+; run: %rmw_umin_i8(0xff, 0x01) == [0xff, 0x01]
+; run: %rmw_umin_i8(0x80, 0x7f) == [0x80, 0x7f]
+
+function %rmw_umax_i8(i8, i8) -> i8, i8 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i8, v1: i8):
+    v2 = stack_addr.i64 ss0
+    store.i8 v0, v2
+    v3 = atomic_rmw.i8 umax v2, v1
+    v4 = load.i8 v2
+    return v3, v4
+}
+; run: %rmw_umax_i8(0x05, 0x03) == [0x05, 0x05]
+; run: %rmw_umax_i8(0x7f, 0x80) == [0x7f, 0x80]
+; run: %rmw_umax_i8(0xff, 0x01) == [0xff, 0xff]
+; run: %rmw_umax_i8(0x80, 0x7f) == [0x80, 0x80]
+
+function %rmw_smin_i8(i8, i8) -> i8, i8 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i8, v1: i8):
+    v2 = stack_addr.i64 ss0
+    store.i8 v0, v2
+    v3 = atomic_rmw.i8 smin v2, v1
+    v4 = load.i8 v2
+    return v3, v4
+}
+; run: %rmw_smin_i8(0x05, 0x03) == [0x05, 0x03]
+; run: %rmw_smin_i8(0x7f, 0x80) == [0x7f, 0x80]
+; run: %rmw_smin_i8(0xff, 0x01) == [0xff, 0xff]
+; run: %rmw_smin_i8(0x80, 0x7f) == [0x80, 0x80]
+
+function %rmw_smax_i8(i8, i8) -> i8, i8 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i8, v1: i8):
+    v2 = stack_addr.i64 ss0
+    store.i8 v0, v2
+    v3 = atomic_rmw.i8 smax v2, v1
+    v4 = load.i8 v2
+    return v3, v4
+}
+; run: %rmw_smax_i8(0x05, 0x03) == [0x05, 0x05]
+; run: %rmw_smax_i8(0x7f, 0x80) == [0x7f, 0x7f]
+; run: %rmw_smax_i8(0xff, 0x01) == [0xff, 0x01]
+; run: %rmw_smax_i8(0x80, 0x7f) == [0x80, 0x7f]
+
+function %rmw_add_i16(i16, i16) -> i16, i16 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i16, v1: i16):
+    v2 = stack_addr.i64 ss0
+    store.i16 v0, v2
+    v3 = atomic_rmw.i16 add v2, v1
+    v4 = load.i16 v2
+    return v3, v4
+}
+; run: %rmw_add_i16(0x1234, 0x00ff) == [0x1234, 0x1333]
+; run: %rmw_add_i16(0x7fff, 0x8000) == [0x7fff, 0xffff]
+; run: %rmw_add_i16(0xffff, 0x0002) == [0xffff, 0x0001]
+; run: %rmw_add_i16(0x8001, 0x7ffe) == [0x8001, 0xffff]
+
+function %rmw_sub_i16(i16, i16) -> i16, i16 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i16, v1: i16):
+    v2 = stack_addr.i64 ss0
+    store.i16 v0, v2
+    v3 = atomic_rmw.i16 sub v2, v1
+    v4 = load.i16 v2
+    return v3, v4
+}
+; run: %rmw_sub_i16(0x1234, 0x00ff) == [0x1234, 0x1135]
+; run: %rmw_sub_i16(0x7fff, 0x8000) == [0x7fff, 0xffff]
+; run: %rmw_sub_i16(0xffff, 0x0002) == [0xffff, 0xfffd]
+; run: %rmw_sub_i16(0x8001, 0x7ffe) == [0x8001, 0x0003]
+
+function %rmw_and_i16(i16, i16) -> i16, i16 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i16, v1: i16):
+    v2 = stack_addr.i64 ss0
+    store.i16 v0, v2
+    v3 = atomic_rmw.i16 and v2, v1
+    v4 = load.i16 v2
+    return v3, v4
+}
+; run: %rmw_and_i16(0x1234, 0x00ff) == [0x1234, 0x0034]
+; run: %rmw_and_i16(0x7fff, 0x8000) == [0x7fff, 0x0000]
+; run: %rmw_and_i16(0xffff, 0x0002) == [0xffff, 0x0002]
+; run: %rmw_and_i16(0x8001, 0x7ffe) == [0x8001, 0x0000]
+
+function %rmw_nand_i16(i16, i16) -> i16, i16 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i16, v1: i16):
+    v2 = stack_addr.i64 ss0
+    store.i16 v0, v2
+    v3 = atomic_rmw.i16 nand v2, v1
+    v4 = load.i16 v2
+    return v3, v4
+}
+; run: %rmw_nand_i16(0x1234, 0x00ff) == [0x1234, 0xffcb]
+; run: %rmw_nand_i16(0x7fff, 0x8000) == [0x7fff, 0xffff]
+; run: %rmw_nand_i16(0xffff, 0x0002) == [0xffff, 0xfffd]
+; run: %rmw_nand_i16(0x8001, 0x7ffe) == [0x8001, 0xffff]
+
+function %rmw_or_i16(i16, i16) -> i16, i16 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i16, v1: i16):
+    v2 = stack_addr.i64 ss0
+    store.i16 v0, v2
+    v3 = atomic_rmw.i16 or v2, v1
+    v4 = load.i16 v2
+    return v3, v4
+}
+; run: %rmw_or_i16(0x1234, 0x00ff) == [0x1234, 0x12ff]
+; run: %rmw_or_i16(0x7fff, 0x8000) == [0x7fff, 0xffff]
+; run: %rmw_or_i16(0xffff, 0x0002) == [0xffff, 0xffff]
+; run: %rmw_or_i16(0x8001, 0x7ffe) == [0x8001, 0xffff]
+
+function %rmw_xor_i16(i16, i16) -> i16, i16 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i16, v1: i16):
+    v2 = stack_addr.i64 ss0
+    store.i16 v0, v2
+    v3 = atomic_rmw.i16 xor v2, v1
+    v4 = load.i16 v2
+    return v3, v4
+}
+; run: %rmw_xor_i16(0x1234, 0x00ff) == [0x1234, 0x12cb]
+; run: %rmw_xor_i16(0x7fff, 0x8000) == [0x7fff, 0xffff]
+; run: %rmw_xor_i16(0xffff, 0x0002) == [0xffff, 0xfffd]
+; run: %rmw_xor_i16(0x8001, 0x7ffe) == [0x8001, 0xffff]
+
+function %rmw_xchg_i16(i16, i16) -> i16, i16 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i16, v1: i16):
+    v2 = stack_addr.i64 ss0
+    store.i16 v0, v2
+    v3 = atomic_rmw.i16 xchg v2, v1
+    v4 = load.i16 v2
+    return v3, v4
+}
+; run: %rmw_xchg_i16(0x1234, 0x00ff) == [0x1234, 0x00ff]
+; run: %rmw_xchg_i16(0x7fff, 0x8000) == [0x7fff, 0x8000]
+; run: %rmw_xchg_i16(0xffff, 0x0002) == [0xffff, 0x0002]
+; run: %rmw_xchg_i16(0x8001, 0x7ffe) == [0x8001, 0x7ffe]
+
+function %rmw_umin_i16(i16, i16) -> i16, i16 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i16, v1: i16):
+    v2 = stack_addr.i64 ss0
+    store.i16 v0, v2
+    v3 = atomic_rmw.i16 umin v2, v1
+    v4 = load.i16 v2
+    return v3, v4
+}
+; run: %rmw_umin_i16(0x1234, 0x00ff) == [0x1234, 0x00ff]
+; run: %rmw_umin_i16(0x7fff, 0x8000) == [0x7fff, 0x7fff]
+; run: %rmw_umin_i16(0xffff, 0x0002) == [0xffff, 0x0002]
+; run: %rmw_umin_i16(0x8001, 0x7ffe) == [0x8001, 0x7ffe]
+
+function %rmw_umax_i16(i16, i16) -> i16, i16 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i16, v1: i16):
+    v2 = stack_addr.i64 ss0
+    store.i16 v0, v2
+    v3 = atomic_rmw.i16 umax v2, v1
+    v4 = load.i16 v2
+    return v3, v4
+}
+; run: %rmw_umax_i16(0x1234, 0x00ff) == [0x1234, 0x1234]
+; run: %rmw_umax_i16(0x7fff, 0x8000) == [0x7fff, 0x8000]
+; run: %rmw_umax_i16(0xffff, 0x0002) == [0xffff, 0xffff]
+; run: %rmw_umax_i16(0x8001, 0x7ffe) == [0x8001, 0x8001]
+
+function %rmw_smin_i16(i16, i16) -> i16, i16 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i16, v1: i16):
+    v2 = stack_addr.i64 ss0
+    store.i16 v0, v2
+    v3 = atomic_rmw.i16 smin v2, v1
+    v4 = load.i16 v2
+    return v3, v4
+}
+; run: %rmw_smin_i16(0x1234, 0x00ff) == [0x1234, 0x00ff]
+; run: %rmw_smin_i16(0x7fff, 0x8000) == [0x7fff, 0x8000]
+; run: %rmw_smin_i16(0xffff, 0x0002) == [0xffff, 0xffff]
+; run: %rmw_smin_i16(0x8001, 0x7ffe) == [0x8001, 0x8001]
+
+function %rmw_smax_i16(i16, i16) -> i16, i16 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i16, v1: i16):
+    v2 = stack_addr.i64 ss0
+    store.i16 v0, v2
+    v3 = atomic_rmw.i16 smax v2, v1
+    v4 = load.i16 v2
+    return v3, v4
+}
+; run: %rmw_smax_i16(0x1234, 0x00ff) == [0x1234, 0x1234]
+; run: %rmw_smax_i16(0x7fff, 0x8000) == [0x7fff, 0x7fff]
+; run: %rmw_smax_i16(0xffff, 0x0002) == [0xffff, 0x0002]
+; run: %rmw_smax_i16(0x8001, 0x7ffe) == [0x8001, 0x7ffe]
+
+function %rmw_add_i32(i32, i32) -> i32, i32 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i32, v1: i32):
+    v2 = stack_addr.i64 ss0
+    store.i32 v0, v2
+    v3 = atomic_rmw.i32 add v2, v1
+    v4 = load.i32 v2
+    return v3, v4
+}
+; run: %rmw_add_i32(0x12345678, 0x0f0f0f0f) == [0x12345678, 0x21436587]
+; run: %rmw_add_i32(0x7fffffff, 0x80000000) == [0x7fffffff, 0xffffffff]
+; run: %rmw_add_i32(0xffffffff, 0x00000002) == [0xffffffff, 0x00000001]
+; run: %rmw_add_i32(0x80000001, 0x7ffffffe) == [0x80000001, 0xffffffff]
+
+function %rmw_sub_i32(i32, i32) -> i32, i32 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i32, v1: i32):
+    v2 = stack_addr.i64 ss0
+    store.i32 v0, v2
+    v3 = atomic_rmw.i32 sub v2, v1
+    v4 = load.i32 v2
+    return v3, v4
+}
+; run: %rmw_sub_i32(0x12345678, 0x0f0f0f0f) == [0x12345678, 0x03254769]
+; run: %rmw_sub_i32(0x7fffffff, 0x80000000) == [0x7fffffff, 0xffffffff]
+; run: %rmw_sub_i32(0xffffffff, 0x00000002) == [0xffffffff, 0xfffffffd]
+; run: %rmw_sub_i32(0x80000001, 0x7ffffffe) == [0x80000001, 0x00000003]
+
+function %rmw_and_i32(i32, i32) -> i32, i32 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i32, v1: i32):
+    v2 = stack_addr.i64 ss0
+    store.i32 v0, v2
+    v3 = atomic_rmw.i32 and v2, v1
+    v4 = load.i32 v2
+    return v3, v4
+}
+; run: %rmw_and_i32(0x12345678, 0x0f0f0f0f) == [0x12345678, 0x02040608]
+; run: %rmw_and_i32(0x7fffffff, 0x80000000) == [0x7fffffff, 0x00000000]
+; run: %rmw_and_i32(0xffffffff, 0x00000002) == [0xffffffff, 0x00000002]
+; run: %rmw_and_i32(0x80000001, 0x7ffffffe) == [0x80000001, 0x00000000]
+
+function %rmw_nand_i32(i32, i32) -> i32, i32 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i32, v1: i32):
+    v2 = stack_addr.i64 ss0
+    store.i32 v0, v2
+    v3 = atomic_rmw.i32 nand v2, v1
+    v4 = load.i32 v2
+    return v3, v4
+}
+; run: %rmw_nand_i32(0x12345678, 0x0f0f0f0f) == [0x12345678, 0xfdfbf9f7]
+; run: %rmw_nand_i32(0x7fffffff, 0x80000000) == [0x7fffffff, 0xffffffff]
+; run: %rmw_nand_i32(0xffffffff, 0x00000002) == [0xffffffff, 0xfffffffd]
+; run: %rmw_nand_i32(0x80000001, 0x7ffffffe) == [0x80000001, 0xffffffff]
+
+function %rmw_or_i32(i32, i32) -> i32, i32 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i32, v1: i32):
+    v2 = stack_addr.i64 ss0
+    store.i32 v0, v2
+    v3 = atomic_rmw.i32 or v2, v1
+    v4 = load.i32 v2
+    return v3, v4
+}
+; run: %rmw_or_i32(0x12345678, 0x0f0f0f0f) == [0x12345678, 0x1f3f5f7f]
+; run: %rmw_or_i32(0x7fffffff, 0x80000000) == [0x7fffffff, 0xffffffff]
+; run: %rmw_or_i32(0xffffffff, 0x00000002) == [0xffffffff, 0xffffffff]
+; run: %rmw_or_i32(0x80000001, 0x7ffffffe) == [0x80000001, 0xffffffff]
+
+function %rmw_xor_i32(i32, i32) -> i32, i32 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i32, v1: i32):
+    v2 = stack_addr.i64 ss0
+    store.i32 v0, v2
+    v3 = atomic_rmw.i32 xor v2, v1
+    v4 = load.i32 v2
+    return v3, v4
+}
+; run: %rmw_xor_i32(0x12345678, 0x0f0f0f0f) == [0x12345678, 0x1d3b5977]
+; run: %rmw_xor_i32(0x7fffffff, 0x80000000) == [0x7fffffff, 0xffffffff]
+; run: %rmw_xor_i32(0xffffffff, 0x00000002) == [0xffffffff, 0xfffffffd]
+; run: %rmw_xor_i32(0x80000001, 0x7ffffffe) == [0x80000001, 0xffffffff]
+
+function %rmw_xchg_i32(i32, i32) -> i32, i32 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i32, v1: i32):
+    v2 = stack_addr.i64 ss0
+    store.i32 v0, v2
+    v3 = atomic_rmw.i32 xchg v2, v1
+    v4 = load.i32 v2
+    return v3, v4
+}
+; run: %rmw_xchg_i32(0x12345678, 0x0f0f0f0f) == [0x12345678, 0x0f0f0f0f]
+; run: %rmw_xchg_i32(0x7fffffff, 0x80000000) == [0x7fffffff, 0x80000000]
+; run: %rmw_xchg_i32(0xffffffff, 0x00000002) == [0xffffffff, 0x00000002]
+; run: %rmw_xchg_i32(0x80000001, 0x7ffffffe) == [0x80000001, 0x7ffffffe]
+
+function %rmw_umin_i32(i32, i32) -> i32, i32 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i32, v1: i32):
+    v2 = stack_addr.i64 ss0
+    store.i32 v0, v2
+    v3 = atomic_rmw.i32 umin v2, v1
+    v4 = load.i32 v2
+    return v3, v4
+}
+; run: %rmw_umin_i32(0x12345678, 0x0f0f0f0f) == [0x12345678, 0x0f0f0f0f]
+; run: %rmw_umin_i32(0x7fffffff, 0x80000000) == [0x7fffffff, 0x7fffffff]
+; run: %rmw_umin_i32(0xffffffff, 0x00000002) == [0xffffffff, 0x00000002]
+; run: %rmw_umin_i32(0x80000001, 0x7ffffffe) == [0x80000001, 0x7ffffffe]
+
+function %rmw_umax_i32(i32, i32) -> i32, i32 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i32, v1: i32):
+    v2 = stack_addr.i64 ss0
+    store.i32 v0, v2
+    v3 = atomic_rmw.i32 umax v2, v1
+    v4 = load.i32 v2
+    return v3, v4
+}
+; run: %rmw_umax_i32(0x12345678, 0x0f0f0f0f) == [0x12345678, 0x12345678]
+; run: %rmw_umax_i32(0x7fffffff, 0x80000000) == [0x7fffffff, 0x80000000]
+; run: %rmw_umax_i32(0xffffffff, 0x00000002) == [0xffffffff, 0xffffffff]
+; run: %rmw_umax_i32(0x80000001, 0x7ffffffe) == [0x80000001, 0x80000001]
+
+function %rmw_smin_i32(i32, i32) -> i32, i32 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i32, v1: i32):
+    v2 = stack_addr.i64 ss0
+    store.i32 v0, v2
+    v3 = atomic_rmw.i32 smin v2, v1
+    v4 = load.i32 v2
+    return v3, v4
+}
+; run: %rmw_smin_i32(0x12345678, 0x0f0f0f0f) == [0x12345678, 0x0f0f0f0f]
+; run: %rmw_smin_i32(0x7fffffff, 0x80000000) == [0x7fffffff, 0x80000000]
+; run: %rmw_smin_i32(0xffffffff, 0x00000002) == [0xffffffff, 0xffffffff]
+; run: %rmw_smin_i32(0x80000001, 0x7ffffffe) == [0x80000001, 0x80000001]
+
+function %rmw_smax_i32(i32, i32) -> i32, i32 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i32, v1: i32):
+    v2 = stack_addr.i64 ss0
+    store.i32 v0, v2
+    v3 = atomic_rmw.i32 smax v2, v1
+    v4 = load.i32 v2
+    return v3, v4
+}
+; run: %rmw_smax_i32(0x12345678, 0x0f0f0f0f) == [0x12345678, 0x12345678]
+; run: %rmw_smax_i32(0x7fffffff, 0x80000000) == [0x7fffffff, 0x7fffffff]
+; run: %rmw_smax_i32(0xffffffff, 0x00000002) == [0xffffffff, 0x00000002]
+; run: %rmw_smax_i32(0x80000001, 0x7ffffffe) == [0x80000001, 0x7ffffffe]
+
+function %rmw_add_i64(i64, i64) -> i64, i64 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i64, v1: i64):
+    v2 = stack_addr.i64 ss0
+    store.i64 v0, v2
+    v3 = atomic_rmw.i64 add v2, v1
+    v4 = load.i64 v2
+    return v3, v4
+}
+; run: %rmw_add_i64(0x123456789abcdef0, 0x0f0f0f0f0f0f0f0f) == [0x123456789abcdef0, 0x21436587a9cbedff]
+; run: %rmw_add_i64(0x7fffffffffffffff, 0x8000000000000000) == [0x7fffffffffffffff, 0xffffffffffffffff]
+; run: %rmw_add_i64(0xffffffffffffffff, 0x0000000000000002) == [0xffffffffffffffff, 0x0000000000000001]
+; run: %rmw_add_i64(0x8000000000000001, 0x7ffffffffffffffe) == [0x8000000000000001, 0xffffffffffffffff]
+
+function %rmw_sub_i64(i64, i64) -> i64, i64 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i64, v1: i64):
+    v2 = stack_addr.i64 ss0
+    store.i64 v0, v2
+    v3 = atomic_rmw.i64 sub v2, v1
+    v4 = load.i64 v2
+    return v3, v4
+}
+; run: %rmw_sub_i64(0x123456789abcdef0, 0x0f0f0f0f0f0f0f0f) == [0x123456789abcdef0, 0x032547698badcfe1]
+; run: %rmw_sub_i64(0x7fffffffffffffff, 0x8000000000000000) == [0x7fffffffffffffff, 0xffffffffffffffff]
+; run: %rmw_sub_i64(0xffffffffffffffff, 0x0000000000000002) == [0xffffffffffffffff, 0xfffffffffffffffd]
+; run: %rmw_sub_i64(0x8000000000000001, 0x7ffffffffffffffe) == [0x8000000000000001, 0x0000000000000003]
+
+function %rmw_and_i64(i64, i64) -> i64, i64 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i64, v1: i64):
+    v2 = stack_addr.i64 ss0
+    store.i64 v0, v2
+    v3 = atomic_rmw.i64 and v2, v1
+    v4 = load.i64 v2
+    return v3, v4
+}
+; run: %rmw_and_i64(0x123456789abcdef0, 0x0f0f0f0f0f0f0f0f) == [0x123456789abcdef0, 0x020406080a0c0e00]
+; run: %rmw_and_i64(0x7fffffffffffffff, 0x8000000000000000) == [0x7fffffffffffffff, 0x0000000000000000]
+; run: %rmw_and_i64(0xffffffffffffffff, 0x0000000000000002) == [0xffffffffffffffff, 0x0000000000000002]
+; run: %rmw_and_i64(0x8000000000000001, 0x7ffffffffffffffe) == [0x8000000000000001, 0x0000000000000000]
+
+function %rmw_nand_i64(i64, i64) -> i64, i64 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i64, v1: i64):
+    v2 = stack_addr.i64 ss0
+    store.i64 v0, v2
+    v3 = atomic_rmw.i64 nand v2, v1
+    v4 = load.i64 v2
+    return v3, v4
+}
+; run: %rmw_nand_i64(0x123456789abcdef0, 0x0f0f0f0f0f0f0f0f) == [0x123456789abcdef0, 0xfdfbf9f7f5f3f1ff]
+; run: %rmw_nand_i64(0x7fffffffffffffff, 0x8000000000000000) == [0x7fffffffffffffff, 0xffffffffffffffff]
+; run: %rmw_nand_i64(0xffffffffffffffff, 0x0000000000000002) == [0xffffffffffffffff, 0xfffffffffffffffd]
+; run: %rmw_nand_i64(0x8000000000000001, 0x7ffffffffffffffe) == [0x8000000000000001, 0xffffffffffffffff]
+
+function %rmw_or_i64(i64, i64) -> i64, i64 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i64, v1: i64):
+    v2 = stack_addr.i64 ss0
+    store.i64 v0, v2
+    v3 = atomic_rmw.i64 or v2, v1
+    v4 = load.i64 v2
+    return v3, v4
+}
+; run: %rmw_or_i64(0x123456789abcdef0, 0x0f0f0f0f0f0f0f0f) == [0x123456789abcdef0, 0x1f3f5f7f9fbfdfff]
+; run: %rmw_or_i64(0x7fffffffffffffff, 0x8000000000000000) == [0x7fffffffffffffff, 0xffffffffffffffff]
+; run: %rmw_or_i64(0xffffffffffffffff, 0x0000000000000002) == [0xffffffffffffffff, 0xffffffffffffffff]
+; run: %rmw_or_i64(0x8000000000000001, 0x7ffffffffffffffe) == [0x8000000000000001, 0xffffffffffffffff]
+
+function %rmw_xor_i64(i64, i64) -> i64, i64 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i64, v1: i64):
+    v2 = stack_addr.i64 ss0
+    store.i64 v0, v2
+    v3 = atomic_rmw.i64 xor v2, v1
+    v4 = load.i64 v2
+    return v3, v4
+}
+; run: %rmw_xor_i64(0x123456789abcdef0, 0x0f0f0f0f0f0f0f0f) == [0x123456789abcdef0, 0x1d3b597795b3d1ff]
+; run: %rmw_xor_i64(0x7fffffffffffffff, 0x8000000000000000) == [0x7fffffffffffffff, 0xffffffffffffffff]
+; run: %rmw_xor_i64(0xffffffffffffffff, 0x0000000000000002) == [0xffffffffffffffff, 0xfffffffffffffffd]
+; run: %rmw_xor_i64(0x8000000000000001, 0x7ffffffffffffffe) == [0x8000000000000001, 0xffffffffffffffff]
+
+function %rmw_xchg_i64(i64, i64) -> i64, i64 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i64, v1: i64):
+    v2 = stack_addr.i64 ss0
+    store.i64 v0, v2
+    v3 = atomic_rmw.i64 xchg v2, v1
+    v4 = load.i64 v2
+    return v3, v4
+}
+; run: %rmw_xchg_i64(0x123456789abcdef0, 0x0f0f0f0f0f0f0f0f) == [0x123456789abcdef0, 0x0f0f0f0f0f0f0f0f]
+; run: %rmw_xchg_i64(0x7fffffffffffffff, 0x8000000000000000) == [0x7fffffffffffffff, 0x8000000000000000]
+; run: %rmw_xchg_i64(0xffffffffffffffff, 0x0000000000000002) == [0xffffffffffffffff, 0x0000000000000002]
+; run: %rmw_xchg_i64(0x8000000000000001, 0x7ffffffffffffffe) == [0x8000000000000001, 0x7ffffffffffffffe]
+
+function %rmw_umin_i64(i64, i64) -> i64, i64 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i64, v1: i64):
+    v2 = stack_addr.i64 ss0
+    store.i64 v0, v2
+    v3 = atomic_rmw.i64 umin v2, v1
+    v4 = load.i64 v2
+    return v3, v4
+}
+; run: %rmw_umin_i64(0x123456789abcdef0, 0x0f0f0f0f0f0f0f0f) == [0x123456789abcdef0, 0x0f0f0f0f0f0f0f0f]
+; run: %rmw_umin_i64(0x7fffffffffffffff, 0x8000000000000000) == [0x7fffffffffffffff, 0x7fffffffffffffff]
+; run: %rmw_umin_i64(0xffffffffffffffff, 0x0000000000000002) == [0xffffffffffffffff, 0x0000000000000002]
+; run: %rmw_umin_i64(0x8000000000000001, 0x7ffffffffffffffe) == [0x8000000000000001, 0x7ffffffffffffffe]
+
+function %rmw_umax_i64(i64, i64) -> i64, i64 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i64, v1: i64):
+    v2 = stack_addr.i64 ss0
+    store.i64 v0, v2
+    v3 = atomic_rmw.i64 umax v2, v1
+    v4 = load.i64 v2
+    return v3, v4
+}
+; run: %rmw_umax_i64(0x123456789abcdef0, 0x0f0f0f0f0f0f0f0f) == [0x123456789abcdef0, 0x123456789abcdef0]
+; run: %rmw_umax_i64(0x7fffffffffffffff, 0x8000000000000000) == [0x7fffffffffffffff, 0x8000000000000000]
+; run: %rmw_umax_i64(0xffffffffffffffff, 0x0000000000000002) == [0xffffffffffffffff, 0xffffffffffffffff]
+; run: %rmw_umax_i64(0x8000000000000001, 0x7ffffffffffffffe) == [0x8000000000000001, 0x8000000000000001]
+
+function %rmw_smin_i64(i64, i64) -> i64, i64 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i64, v1: i64):
+    v2 = stack_addr.i64 ss0
+    store.i64 v0, v2
+    v3 = atomic_rmw.i64 smin v2, v1
+    v4 = load.i64 v2
+    return v3, v4
+}
+; run: %rmw_smin_i64(0x123456789abcdef0, 0x0f0f0f0f0f0f0f0f) == [0x123456789abcdef0, 0x0f0f0f0f0f0f0f0f]
+; run: %rmw_smin_i64(0x7fffffffffffffff, 0x8000000000000000) == [0x7fffffffffffffff, 0x8000000000000000]
+; run: %rmw_smin_i64(0xffffffffffffffff, 0x0000000000000002) == [0xffffffffffffffff, 0xffffffffffffffff]
+; run: %rmw_smin_i64(0x8000000000000001, 0x7ffffffffffffffe) == [0x8000000000000001, 0x8000000000000001]
+
+function %rmw_smax_i64(i64, i64) -> i64, i64 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i64, v1: i64):
+    v2 = stack_addr.i64 ss0
+    store.i64 v0, v2
+    v3 = atomic_rmw.i64 smax v2, v1
+    v4 = load.i64 v2
+    return v3, v4
+}
+; run: %rmw_smax_i64(0x123456789abcdef0, 0x0f0f0f0f0f0f0f0f) == [0x123456789abcdef0, 0x123456789abcdef0]
+; run: %rmw_smax_i64(0x7fffffffffffffff, 0x8000000000000000) == [0x7fffffffffffffff, 0x7fffffffffffffff]
+; run: %rmw_smax_i64(0xffffffffffffffff, 0x0000000000000002) == [0xffffffffffffffff, 0x0000000000000002]
+; run: %rmw_smax_i64(0x8000000000000001, 0x7ffffffffffffffe) == [0x8000000000000001, 0x7ffffffffffffffe]
+
+function %rmw_big_add_i16(i16, i16) -> i16, i16, i16 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i16, v1: i16):
+    v2 = stack_addr.i64 ss0
+    store.i16 big v0, v2
+    v3 = atomic_rmw.i16 big add v2, v1
+    v4 = load.i16 big v2
+    v5 = load.i16 little v2
+    return v3, v4, v5
+}
+; run: %rmw_big_add_i16(0x1234, 0x00ff) == [0x1234, 0x1333, 0x3313]
+; run: %rmw_big_add_i16(0x7fff, 0x8000) == [0x7fff, 0xffff, 0xffff]
+
+function %rmw_big_sub_i16(i16, i16) -> i16, i16, i16 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i16, v1: i16):
+    v2 = stack_addr.i64 ss0
+    store.i16 big v0, v2
+    v3 = atomic_rmw.i16 big sub v2, v1
+    v4 = load.i16 big v2
+    v5 = load.i16 little v2
+    return v3, v4, v5
+}
+; run: %rmw_big_sub_i16(0x1234, 0x00ff) == [0x1234, 0x1135, 0x3511]
+; run: %rmw_big_sub_i16(0x7fff, 0x8000) == [0x7fff, 0xffff, 0xffff]
+
+function %rmw_big_xor_i16(i16, i16) -> i16, i16, i16 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i16, v1: i16):
+    v2 = stack_addr.i64 ss0
+    store.i16 big v0, v2
+    v3 = atomic_rmw.i16 big xor v2, v1
+    v4 = load.i16 big v2
+    v5 = load.i16 little v2
+    return v3, v4, v5
+}
+; run: %rmw_big_xor_i16(0x1234, 0x00ff) == [0x1234, 0x12cb, 0xcb12]
+; run: %rmw_big_xor_i16(0x7fff, 0x8000) == [0x7fff, 0xffff, 0xffff]
+
+function %rmw_big_umax_i16(i16, i16) -> i16, i16, i16 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i16, v1: i16):
+    v2 = stack_addr.i64 ss0
+    store.i16 big v0, v2
+    v3 = atomic_rmw.i16 big umax v2, v1
+    v4 = load.i16 big v2
+    v5 = load.i16 little v2
+    return v3, v4, v5
+}
+; run: %rmw_big_umax_i16(0x1234, 0x00ff) == [0x1234, 0x1234, 0x3412]
+; run: %rmw_big_umax_i16(0x7fff, 0x8000) == [0x7fff, 0x8000, 0x0080]
+
+function %rmw_big_xchg_i16(i16, i16) -> i16, i16, i16 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i16, v1: i16):
+    v2 = stack_addr.i64 ss0
+    store.i16 big v0, v2
+    v3 = atomic_rmw.i16 big xchg v2, v1
+    v4 = load.i16 big v2
+    v5 = load.i16 little v2
+    return v3, v4, v5
+}
+; run: %rmw_big_xchg_i16(0x1234, 0x00ff) == [0x1234, 0x00ff, 0xff00]
+; run: %rmw_big_xchg_i16(0x7fff, 0x8000) == [0x7fff, 0x8000, 0x0080]
+
+function %rmw_big_add_i32(i32, i32) -> i32, i32, i32 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i32, v1: i32):
+    v2 = stack_addr.i64 ss0
+    store.i32 big v0, v2
+    v3 = atomic_rmw.i32 big add v2, v1
+    v4 = load.i32 big v2
+    v5 = load.i32 little v2
+    return v3, v4, v5
+}
+; run: %rmw_big_add_i32(0x12345678, 0x0f0f0f0f) == [0x12345678, 0x21436587, 0x87654321]
+; run: %rmw_big_add_i32(0x7fffffff, 0x80000000) == [0x7fffffff, 0xffffffff, 0xffffffff]
+
+function %rmw_big_sub_i32(i32, i32) -> i32, i32, i32 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i32, v1: i32):
+    v2 = stack_addr.i64 ss0
+    store.i32 big v0, v2
+    v3 = atomic_rmw.i32 big sub v2, v1
+    v4 = load.i32 big v2
+    v5 = load.i32 little v2
+    return v3, v4, v5
+}
+; run: %rmw_big_sub_i32(0x12345678, 0x0f0f0f0f) == [0x12345678, 0x03254769, 0x69472503]
+; run: %rmw_big_sub_i32(0x7fffffff, 0x80000000) == [0x7fffffff, 0xffffffff, 0xffffffff]
+
+function %rmw_big_xor_i32(i32, i32) -> i32, i32, i32 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i32, v1: i32):
+    v2 = stack_addr.i64 ss0
+    store.i32 big v0, v2
+    v3 = atomic_rmw.i32 big xor v2, v1
+    v4 = load.i32 big v2
+    v5 = load.i32 little v2
+    return v3, v4, v5
+}
+; run: %rmw_big_xor_i32(0x12345678, 0x0f0f0f0f) == [0x12345678, 0x1d3b5977, 0x77593b1d]
+; run: %rmw_big_xor_i32(0x7fffffff, 0x80000000) == [0x7fffffff, 0xffffffff, 0xffffffff]
+
+function %rmw_big_umax_i32(i32, i32) -> i32, i32, i32 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i32, v1: i32):
+    v2 = stack_addr.i64 ss0
+    store.i32 big v0, v2
+    v3 = atomic_rmw.i32 big umax v2, v1
+    v4 = load.i32 big v2
+    v5 = load.i32 little v2
+    return v3, v4, v5
+}
+; run: %rmw_big_umax_i32(0x12345678, 0x0f0f0f0f) == [0x12345678, 0x12345678, 0x78563412]
+; run: %rmw_big_umax_i32(0x7fffffff, 0x80000000) == [0x7fffffff, 0x80000000, 0x00000080]
+
+function %rmw_big_xchg_i32(i32, i32) -> i32, i32, i32 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i32, v1: i32):
+    v2 = stack_addr.i64 ss0
+    store.i32 big v0, v2
+    v3 = atomic_rmw.i32 big xchg v2, v1
+    v4 = load.i32 big v2
+    v5 = load.i32 little v2
+    return v3, v4, v5
+}
+; run: %rmw_big_xchg_i32(0x12345678, 0x0f0f0f0f) == [0x12345678, 0x0f0f0f0f, 0x0f0f0f0f]
+; run: %rmw_big_xchg_i32(0x7fffffff, 0x80000000) == [0x7fffffff, 0x80000000, 0x00000080]
+
+function %rmw_big_add_i64(i64, i64) -> i64, i64, i64 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i64, v1: i64):
+    v2 = stack_addr.i64 ss0
+    store.i64 big v0, v2
+    v3 = atomic_rmw.i64 big add v2, v1
+    v4 = load.i64 big v2
+    v5 = load.i64 little v2
+    return v3, v4, v5
+}
+; run: %rmw_big_add_i64(0x123456789abcdef0, 0x0f0f0f0f0f0f0f0f) == [0x123456789abcdef0, 0x21436587a9cbedff, 0xffedcba987654321]
+; run: %rmw_big_add_i64(0x7fffffffffffffff, 0x8000000000000000) == [0x7fffffffffffffff, 0xffffffffffffffff, 0xffffffffffffffff]
+
+function %rmw_big_sub_i64(i64, i64) -> i64, i64, i64 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i64, v1: i64):
+    v2 = stack_addr.i64 ss0
+    store.i64 big v0, v2
+    v3 = atomic_rmw.i64 big sub v2, v1
+    v4 = load.i64 big v2
+    v5 = load.i64 little v2
+    return v3, v4, v5
+}
+; run: %rmw_big_sub_i64(0x123456789abcdef0, 0x0f0f0f0f0f0f0f0f) == [0x123456789abcdef0, 0x032547698badcfe1, 0xe1cfad8b69472503]
+; run: %rmw_big_sub_i64(0x7fffffffffffffff, 0x8000000000000000) == [0x7fffffffffffffff, 0xffffffffffffffff, 0xffffffffffffffff]
+
+function %rmw_big_xor_i64(i64, i64) -> i64, i64, i64 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i64, v1: i64):
+    v2 = stack_addr.i64 ss0
+    store.i64 big v0, v2
+    v3 = atomic_rmw.i64 big xor v2, v1
+    v4 = load.i64 big v2
+    v5 = load.i64 little v2
+    return v3, v4, v5
+}
+; run: %rmw_big_xor_i64(0x123456789abcdef0, 0x0f0f0f0f0f0f0f0f) == [0x123456789abcdef0, 0x1d3b597795b3d1ff, 0xffd1b39577593b1d]
+; run: %rmw_big_xor_i64(0x7fffffffffffffff, 0x8000000000000000) == [0x7fffffffffffffff, 0xffffffffffffffff, 0xffffffffffffffff]
+
+function %rmw_big_umax_i64(i64, i64) -> i64, i64, i64 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i64, v1: i64):
+    v2 = stack_addr.i64 ss0
+    store.i64 big v0, v2
+    v3 = atomic_rmw.i64 big umax v2, v1
+    v4 = load.i64 big v2
+    v5 = load.i64 little v2
+    return v3, v4, v5
+}
+; run: %rmw_big_umax_i64(0x123456789abcdef0, 0x0f0f0f0f0f0f0f0f) == [0x123456789abcdef0, 0x123456789abcdef0, 0xf0debc9a78563412]
+; run: %rmw_big_umax_i64(0x7fffffffffffffff, 0x8000000000000000) == [0x7fffffffffffffff, 0x8000000000000000, 0x0000000000000080]
+
+function %rmw_big_xchg_i64(i64, i64) -> i64, i64, i64 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i64, v1: i64):
+    v2 = stack_addr.i64 ss0
+    store.i64 big v0, v2
+    v3 = atomic_rmw.i64 big xchg v2, v1
+    v4 = load.i64 big v2
+    v5 = load.i64 little v2
+    return v3, v4, v5
+}
+; run: %rmw_big_xchg_i64(0x123456789abcdef0, 0x0f0f0f0f0f0f0f0f) == [0x123456789abcdef0, 0x0f0f0f0f0f0f0f0f, 0x0f0f0f0f0f0f0f0f]
+; run: %rmw_big_xchg_i64(0x7fffffffffffffff, 0x8000000000000000) == [0x7fffffffffffffff, 0x8000000000000000, 0x0000000000000080]
+
+function %cas_i8(i8, i8, i8) -> i8, i8 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i8, v1: i8, v2: i8):
+    v3 = stack_addr.i64 ss0
+    store.i8 v0, v3
+    v4 = atomic_cas.i8 v3, v1, v2
+    v5 = load.i8 v3
+    return v4, v5
+}
+; run: %cas_i8(0x05, 0x05, 0x03) == [0x05, 0x03]
+; run: %cas_i8(0x05, 0x03, 0x03) == [0x05, 0x05]
+
+function %cas_big_i8(i8, i8, i8) -> i8, i8 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i8, v1: i8, v2: i8):
+    v3 = stack_addr.i64 ss0
+    store.i8 big v0, v3
+    v4 = atomic_cas.i8 big v3, v1, v2
+    v5 = load.i8 big v3
+    return v4, v5
+}
+; run: %cas_big_i8(0x05, 0x05, 0x03) == [0x05, 0x03]
+; run: %cas_big_i8(0x05, 0x03, 0x03) == [0x05, 0x05]
+
+function %cas_i16(i16, i16, i16) -> i16, i16 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i16, v1: i16, v2: i16):
+    v3 = stack_addr.i64 ss0
+    store.i16 v0, v3
+    v4 = atomic_cas.i16 v3, v1, v2
+    v5 = load.i16 v3
+    return v4, v5
+}
+; run: %cas_i16(0x1234, 0x1234, 0x00ff) == [0x1234, 0x00ff]
+; run: %cas_i16(0x1234, 0x00ff, 0x00ff) == [0x1234, 0x1234]
+
+function %cas_big_i16(i16, i16, i16) -> i16, i16 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i16, v1: i16, v2: i16):
+    v3 = stack_addr.i64 ss0
+    store.i16 big v0, v3
+    v4 = atomic_cas.i16 big v3, v1, v2
+    v5 = load.i16 big v3
+    return v4, v5
+}
+; run: %cas_big_i16(0x1234, 0x1234, 0x00ff) == [0x1234, 0x00ff]
+; run: %cas_big_i16(0x1234, 0x00ff, 0x00ff) == [0x1234, 0x1234]
+
+function %cas_i32(i32, i32, i32) -> i32, i32 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i32, v1: i32, v2: i32):
+    v3 = stack_addr.i64 ss0
+    store.i32 v0, v3
+    v4 = atomic_cas.i32 v3, v1, v2
+    v5 = load.i32 v3
+    return v4, v5
+}
+; run: %cas_i32(0x12345678, 0x12345678, 0x0f0f0f0f) == [0x12345678, 0x0f0f0f0f]
+; run: %cas_i32(0x12345678, 0x0f0f0f0f, 0x0f0f0f0f) == [0x12345678, 0x12345678]
+
+function %cas_big_i32(i32, i32, i32) -> i32, i32 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i32, v1: i32, v2: i32):
+    v3 = stack_addr.i64 ss0
+    store.i32 big v0, v3
+    v4 = atomic_cas.i32 big v3, v1, v2
+    v5 = load.i32 big v3
+    return v4, v5
+}
+; run: %cas_big_i32(0x12345678, 0x12345678, 0x0f0f0f0f) == [0x12345678, 0x0f0f0f0f]
+; run: %cas_big_i32(0x12345678, 0x0f0f0f0f, 0x0f0f0f0f) == [0x12345678, 0x12345678]
+
+function %cas_i64(i64, i64, i64) -> i64, i64 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i64, v1: i64, v2: i64):
+    v3 = stack_addr.i64 ss0
+    store.i64 v0, v3
+    v4 = atomic_cas.i64 v3, v1, v2
+    v5 = load.i64 v3
+    return v4, v5
+}
+; run: %cas_i64(0x123456789abcdef0, 0x123456789abcdef0, 0x0f0f0f0f0f0f0f0f) == [0x123456789abcdef0, 0x0f0f0f0f0f0f0f0f]
+; run: %cas_i64(0x123456789abcdef0, 0x0f0f0f0f0f0f0f0f, 0x0f0f0f0f0f0f0f0f) == [0x123456789abcdef0, 0x123456789abcdef0]
+
+function %cas_big_i64(i64, i64, i64) -> i64, i64 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i64, v1: i64, v2: i64):
+    v3 = stack_addr.i64 ss0
+    store.i64 big v0, v3
+    v4 = atomic_cas.i64 big v3, v1, v2
+    v5 = load.i64 big v3
+    return v4, v5
+}
+; run: %cas_big_i64(0x123456789abcdef0, 0x123456789abcdef0, 0x0f0f0f0f0f0f0f0f) == [0x123456789abcdef0, 0x0f0f0f0f0f0f0f0f]
+; run: %cas_big_i64(0x123456789abcdef0, 0x0f0f0f0f0f0f0f0f, 0x0f0f0f0f0f0f0f0f) == [0x123456789abcdef0, 0x123456789abcdef0]
+
+function %load_store_i8(i8) -> i8, i8 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i8):
+    v1 = stack_addr.i64 ss0
+    atomic_store.i8 v0, v1
+    fence
+    v2 = atomic_load.i8 v1
+    v3 = load.i8 little v1
+    return v2, v3
+}
+; run: %load_store_i8(0x05) == [0x05, 0x05]
+
+function %load_store_big_i8(i8) -> i8, i8 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i8):
+    v1 = stack_addr.i64 ss0
+    atomic_store.i8 big v0, v1
+    fence
+    v2 = atomic_load.i8 big v1
+    v3 = load.i8 little v1
+    return v2, v3
+}
+; run: %load_store_big_i8(0x05) == [0x05, 0x05]
+
+function %load_store_i16(i16) -> i16, i16 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i16):
+    v1 = stack_addr.i64 ss0
+    atomic_store.i16 v0, v1
+    fence
+    v2 = atomic_load.i16 v1
+    v3 = load.i16 little v1
+    return v2, v3
+}
+; run: %load_store_i16(0x1234) == [0x1234, 0x1234]
+
+function %load_store_big_i16(i16) -> i16, i16 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i16):
+    v1 = stack_addr.i64 ss0
+    atomic_store.i16 big v0, v1
+    fence
+    v2 = atomic_load.i16 big v1
+    v3 = load.i16 little v1
+    return v2, v3
+}
+; run: %load_store_big_i16(0x1234) == [0x1234, 0x3412]
+
+function %load_store_i32(i32) -> i32, i32 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i32):
+    v1 = stack_addr.i64 ss0
+    atomic_store.i32 v0, v1
+    fence
+    v2 = atomic_load.i32 v1
+    v3 = load.i32 little v1
+    return v2, v3
+}
+; run: %load_store_i32(0x12345678) == [0x12345678, 0x12345678]
+
+function %load_store_big_i32(i32) -> i32, i32 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i32):
+    v1 = stack_addr.i64 ss0
+    atomic_store.i32 big v0, v1
+    fence
+    v2 = atomic_load.i32 big v1
+    v3 = load.i32 little v1
+    return v2, v3
+}
+; run: %load_store_big_i32(0x12345678) == [0x12345678, 0x78563412]
+
+function %load_store_i64(i64) -> i64, i64 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i64):
+    v1 = stack_addr.i64 ss0
+    atomic_store.i64 v0, v1
+    fence
+    v2 = atomic_load.i64 v1
+    v3 = load.i64 little v1
+    return v2, v3
+}
+; run: %load_store_i64(0x123456789abcdef0) == [0x123456789abcdef0, 0x123456789abcdef0]
+
+function %load_store_big_i64(i64) -> i64, i64 {
+    ss0 = explicit_slot 8, align = 8
+
+block0(v0: i64):
+    v1 = stack_addr.i64 ss0
+    atomic_store.i64 big v0, v1
+    fence
+    v2 = atomic_load.i64 big v1
+    v3 = load.i64 little v1
+    return v2, v3
+}
+; run: %load_store_big_i64(0x123456789abcdef0) == [0x123456789abcdef0, 0xf0debc9a78563412]

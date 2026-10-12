@@ -1,0 +1,114 @@
+test run
+
+; Big-endian loads and stores. Wasm memory is little-endian, so these
+; reverse bytes; little-endian loads of the same bytes show the order.
+
+
+function %store_big_i16(i16) -> i16, i16 {
+    ss0 = explicit_slot 8
+
+block0(v0: i16):
+    v1 = stack_addr.i64 ss0
+    store.i16 big v0, v1
+    v2 = load.i16 big v1
+    v3 = load.i16 little v1
+    return v2, v3
+}
+; run: %store_big_i16(0x1280) == [0x1280, 0x8012]
+
+function %store_big_i32(i32) -> i32, i32 {
+    ss0 = explicit_slot 8
+
+block0(v0: i32):
+    v1 = stack_addr.i64 ss0
+    store.i32 big v0, v1
+    v2 = load.i32 big v1
+    v3 = load.i32 little v1
+    return v2, v3
+}
+; run: %store_big_i32(0x12345680) == [0x12345680, 0x80563412]
+
+function %store_big_i64(i64) -> i64, i64 {
+    ss0 = explicit_slot 8
+
+block0(v0: i64):
+    v1 = stack_addr.i64 ss0
+    store.i64 big v0, v1
+    v2 = load.i64 big v1
+    v3 = load.i64 little v1
+    return v2, v3
+}
+; run: %store_big_i64(0x123456789abcde80) == [0x123456789abcde80, 0x80debc9a78563412]
+
+; The bytes 80 12 34 56 (big-endian 0x80123456).
+function %narrow_loads_big() -> i32, i32, i64, i64, i32, i32 {
+    ss0 = explicit_slot 8
+
+block0:
+    v0 = stack_addr.i64 ss0
+    v1 = iconst.i32 0x80123456
+    store big v1, v0
+    v2 = uload16.i32 big v0
+    v3 = sload16.i32 big v0
+    v4 = uload16.i64 big v0
+    v5 = sload16.i64 big v0
+    v6 = uload8.i32 big v0
+    v7 = sload8.i32 big v0
+    return v2, v3, v4, v5, v6, v7
+}
+; run: %narrow_loads_big() == [0x8012, 0xffff8012, 0x8012, 0xffffffffffff8012, 0x80, 0xffffff80]
+
+function %load32_big() -> i64, i64 {
+    ss0 = explicit_slot 8
+
+block0:
+    v0 = stack_addr.i64 ss0
+    v1 = iconst.i64 0x80123456_789abcde
+    store big v1, v0
+    v2 = uload32.i64 big v0
+    v3 = sload32.i64 big v0
+    return v2, v3
+}
+; run: %load32_big() == [0x80123456, 0xffffffff80123456]
+
+function %narrow_stores_big(i64) -> i64 {
+    ss0 = explicit_slot 8
+
+block0(v0: i64):
+    v1 = stack_addr.i64 ss0
+    v2 = iconst.i64 0
+    store v2, v1
+    istore32 big v0, v1
+    istore16 big v0, v1+4
+    istore8 big v0, v1+6
+    v5 = load.i64 big v1
+    return v5
+}
+; run: %narrow_stores_big(0x11223344_55667788) == 0x55667788_77888800
+
+function %narrow_types_big(i16) -> i16, i8 {
+    ss0 = explicit_slot 8
+
+block0(v0: i16):
+    v1 = stack_addr.i64 ss0
+    store big v0, v1
+    v2 = load.i16 big v1
+    v3 = load.i8 big v1
+    return v2, v3
+}
+; run: %narrow_types_big(0xabcd) == [0xabcd, 0xab]
+
+function %float_big(f32, f64) -> f32, f64, i32, i64 {
+    ss0 = explicit_slot 16
+
+block0(v0: f32, v1: f64):
+    v2 = stack_addr.i64 ss0
+    store big v0, v2
+    store big v1, v2+8
+    v4 = load.f32 big v2
+    v5 = load.f64 big v2+8
+    v6 = load.i32 little v2
+    v7 = load.i64 little v2+8
+    return v4, v5, v6, v7
+}
+; run: %float_big(0x1.8p0, -0x1.2p1) == [0x1.8p0, -0x1.2p1, 0x0000c03f, 0x00000000000002c0]

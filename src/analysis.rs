@@ -270,5 +270,7 @@ pub(crate) fn must_lower_even_if_unused(func: &Function, inst: Inst) -> bool {
 /// Cranelift's lowering uses to compute side-effect colors.
 pub(crate) fn has_lowering_side_effect(func: &Function, inst: Inst) -> bool {
     let op = func.dfg.insts[inst].opcode();
-    op != Opcode::GetPinnedReg && (must_lower_even_if_unused(func, inst) || op.can_load())
+    // Unlike Cranelift's version, `get_pinned_reg` counts: here it reads a
+    // global that `set_pinned_reg` writes, so the two must not be reordered.
+    must_lower_even_if_unused(func, inst) || op.can_load()
 }

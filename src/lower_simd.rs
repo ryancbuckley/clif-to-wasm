@@ -575,7 +575,10 @@ impl Emitter<'_> {
                 | Opcode::Sload32x2,
                 D::Load { flags, offset, .. },
             ) => {
-                let off = self.mem_address(offset.into(), flags)?;
+                if self.big_endian(flags) {
+                    return unsupported("big-endian vector load");
+                }
+                let off = self.mem_address(offset.into())?;
                 let (size, i): (u32, fn(MemArg) -> I<'static>) = match op {
                     Opcode::Load => (16, I::V128Load),
                     Opcode::Uload8x8 => (8, I::V128Load8x8U),
@@ -589,7 +592,10 @@ impl Emitter<'_> {
                 self.ins(i(m));
             }
             (Opcode::Store, D::Store { flags, offset, .. }) => {
-                let off = self.mem_address(offset.into(), flags)?;
+                if self.big_endian(flags) {
+                    return unsupported("big-endian vector store");
+                }
+                let off = self.mem_address(offset.into())?;
                 self.operand()?;
                 let m = self.memarg(off, flags, 16);
                 self.ins(I::V128Store(m));

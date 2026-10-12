@@ -38,6 +38,7 @@ mod legalize_i128;
 mod liveness;
 mod locals;
 mod lower;
+mod lower_atomic;
 mod lower_simd;
 pub mod module;
 mod structure;
@@ -104,6 +105,10 @@ pub struct ModuleLayout {
     /// stack grows downwards and the pointer is assumed to be 16-byte
     /// aligned. With `None`, functions that need stack slots are rejected.
     pub stack_pointer_global: Option<u32>,
+    /// A mutable `i64` global standing in for Cranelift's pinned register
+    /// (`get_pinned_reg`/`set_pinned_reg`). With `None`, functions that use
+    /// it are rejected.
+    pub pinned_reg_global: Option<u32>,
 }
 
 impl ModuleLayout {

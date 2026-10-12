@@ -367,7 +367,7 @@ impl Gen<'_, '_> {
             15 => {
                 let f = self.rng.pick(&[types::F32, types::F64]);
                 let a = self.expr(f, d);
-                if ty == types::I32 || ty == types::I64 {
+                if ty == types::I32 || ty == types::I64 || self.rng.chance(50) {
                     if self.rng.chance(50) {
                         self.b.ins().fcvt_to_sint_sat(ty, a)
                     } else {
@@ -396,6 +396,38 @@ impl Gen<'_, '_> {
                 let v = self.load(ty);
                 self.store();
                 v
+            }
+            20 => {
+                // Arithmetic with an overflow flag; use the result or the
+                // flag. i128 has only the add and subtract forms.
+                let (a, b) = (self.expr(ty, d), self.expr(ty, d));
+                let n = if ty == types::I128 { 8 } else { 10 };
+                let k = self.rng.below(n);
+                let c = if (2..4).contains(&k) || (6..8).contains(&k) {
+                    self.expr(types::I8, d)
+                } else {
+                    a
+                };
+                let ins = self.b.ins();
+                let (r, flag) = match k {
+                    0 => ins.uadd_overflow(a, b),
+                    1 => ins.sadd_overflow(a, b),
+                    2 => ins.uadd_overflow_cin(a, b, c),
+                    3 => ins.sadd_overflow_cin(a, b, c),
+                    4 => ins.usub_overflow(a, b),
+                    5 => ins.ssub_overflow(a, b),
+                    6 => ins.usub_overflow_bin(a, b, c),
+                    7 => ins.ssub_overflow_bin(a, b, c),
+                    8 => ins.umul_overflow(a, b),
+                    _ => ins.smul_overflow(a, b),
+                };
+                if self.rng.chance(50) {
+                    r
+                } else if ty == types::I8 {
+                    flag
+                } else {
+                    self.b.ins().uextend(ty, flag)
+                }
             }
             _ => self.leaf(ty),
         }

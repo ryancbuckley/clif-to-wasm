@@ -1,0 +1,94 @@
+test run
+
+; Smaller features: overflow flags, narrow saturating conversions, float
+; bitwise operations, the pinned register and libcalls.
+
+function %uadd_overflow_cin_i64(i64, i64, i8) -> i64, i8 {
+block0(v0: i64, v1: i64, v2: i8):
+    v3, v4 = uadd_overflow_cin v0, v1, v2
+    return v3, v4
+}
+; run: %uadd_overflow_cin_i64(-1, 0, 1) == [0, 1]
+; run: %uadd_overflow_cin_i64(-2, 0, 1) == [-1, 0]
+; run: %uadd_overflow_cin_i64(-1, -1, 1) == [-1, 1]
+
+function %ssub_overflow_bin_i32(i32, i32, i8) -> i32, i8 {
+block0(v0: i32, v1: i32, v2: i8):
+    v3, v4 = ssub_overflow_bin v0, v1, v2
+    return v3, v4
+}
+; run: %ssub_overflow_bin_i32(0x80000000, 0, 1) == [0x7fffffff, 1]
+; run: %ssub_overflow_bin_i32(0, 0x7fffffff, 1) == [0x80000000, 0]
+
+function %smul_overflow_i64(i64, i64) -> i64, i8 {
+block0(v0: i64, v1: i64):
+    v2, v3 = smul_overflow v0, v1
+    return v2, v3
+}
+; run: %smul_overflow_i64(0x100000000, 0x7fffffff) == [0x7fffffff00000000, 0]
+; run: %smul_overflow_i64(0x100000000, 0x80000000) == [0x8000000000000000, 1]
+; run: %smul_overflow_i64(-1, 0x8000000000000000) == [0x8000000000000000, 1]
+
+function %umul_overflow_i16(i16, i16) -> i16, i8 {
+block0(v0: i16, v1: i16):
+    v2, v3 = umul_overflow v0, v1
+    return v2, v3
+}
+; run: %umul_overflow_i16(0xff, 0x101) == [0xffff, 0]
+; run: %umul_overflow_i16(0x100, 0x100) == [0, 1]
+
+function %uadd_overflow_i128(i128, i128) -> i128, i8 {
+block0(v0: i128, v1: i128):
+    v2, v3 = uadd_overflow v0, v1
+    return v2, v3
+}
+; run: %uadd_overflow_i128(-1, 1) == [0, 1]
+; run: %uadd_overflow_i128(0xffffffffffffffff, 1) == [0x10000000000000000, 0]
+
+function %sat_i8(f32) -> i8 {
+block0(v0: f32):
+    v1 = fcvt_to_sint_sat.i8 v0
+    return v1
+}
+; run: %sat_i8(0x1.2cp8) == 127
+; run: %sat_i8(-0x1.2cp8) == -128
+; run: %sat_i8(-0x1.4p2) == -5
+; run: %sat_i8(+NaN) == 0
+
+function %sat_u16(f64) -> i16 {
+block0(v0: f64):
+    v1 = fcvt_to_uint_sat.i16 v0
+    return v1
+}
+; run: %sat_u16(-0x1.4p2) == 0
+; run: %sat_u16(0x1.11700p16) == 0xffff
+; run: %sat_u16(0x1.0p15) == 0x8000
+
+function %float_bitops(f64, f64) -> f64, f64, f64 {
+block0(v0: f64, v1: f64):
+    v2 = bxor v0, v1
+    v3 = band v0, v1
+    v4 = bnot v1
+    return v2, v3, v4
+}
+; Flipping and keeping the sign bit: -0.0 has only the sign set.
+; run: %float_bitops(0x1.8p0, -0x0.0) == [-0x1.8p0, 0x0.0, +NaN]
+
+function %pinned_reg(i64) -> i64 {
+block0(v0: i64):
+    v1 = get_pinned_reg.i64
+    set_pinned_reg v0
+    v2 = get_pinned_reg.i64
+    set_pinned_reg v1
+    return v2
+}
+; run: %pinned_reg(0x1234) == 0x1234
+
+function %libcall(f64) -> f64 {
+    fn0 = %FloorF64(f64) -> f64
+
+block0(v0: f64):
+    v1 = call fn0(v0)
+    return v1
+}
+; run: %libcall(-0x1.8p0) == -0x1.0p1

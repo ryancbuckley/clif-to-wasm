@@ -296,6 +296,50 @@ impl Legalizer<'_> {
                 };
                 vec![Out::Pair(lo, hi)]
             }
+            (
+                Opcode::UaddOverflow
+                | Opcode::SaddOverflow
+                | Opcode::UaddOverflowCin
+                | Opcode::SaddOverflowCin
+                | Opcode::UsubOverflow
+                | Opcode::SsubOverflow
+                | Opcode::UsubOverflowBin
+                | Opcode::SsubOverflowBin,
+                _,
+            ) => {
+                // The low halves' carry or borrow feeds the high halves,
+                // whose own flag is the result's.
+                let ((al, ah), (bl, bh)) = (p(0)?, p(1)?);
+                let add = matches!(
+                    op,
+                    Opcode::UaddOverflow
+                        | Opcode::SaddOverflow
+                        | Opcode::UaddOverflowCin
+                        | Opcode::SaddOverflowCin
+                );
+                let signed = matches!(
+                    op,
+                    Opcode::SaddOverflow
+                        | Opcode::SaddOverflowCin
+                        | Opcode::SsubOverflow
+                        | Opcode::SsubOverflowBin
+                );
+                let c_in = args.get(2).copied();
+                let mut pos = FuncCursor::new(self.func).at_inst(inst);
+                let (lo, c) = match (add, c_in) {
+                    (true, None) => pos.ins().uadd_overflow(al, bl),
+                    (true, Some(c)) => pos.ins().uadd_overflow_cin(al, bl, c),
+                    (false, None) => pos.ins().usub_overflow(al, bl),
+                    (false, Some(c)) => pos.ins().usub_overflow_bin(al, bl, c),
+                };
+                let (hi, of) = match (add, signed) {
+                    (true, false) => pos.ins().uadd_overflow_cin(ah, bh, c),
+                    (true, true) => pos.ins().sadd_overflow_cin(ah, bh, c),
+                    (false, false) => pos.ins().usub_overflow_bin(ah, bh, c),
+                    (false, true) => pos.ins().ssub_overflow_bin(ah, bh, c),
+                };
+                vec![Out::Pair(lo, hi), Out::Value(of)]
+            }
             (Opcode::Band | Opcode::Bor | Opcode::Bxor, _) => {
                 let ((al, ah), (bl, bh)) = (p(0)?, p(1)?);
                 let mut pos = FuncCursor::new(self.func).at_inst(inst);

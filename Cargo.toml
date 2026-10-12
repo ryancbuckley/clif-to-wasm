@@ -14,7 +14,7 @@ cranelift-reader = "=0.136.2"
 target-lexicon = "0.13.5"
 wasmparser = "0.245"
 wasmprinter = "0.245"
-wasmtime = { version = "=49.0.2", default-features = false, features = ["cranelift", "runtime", "std"] }
+wasmtime = { version = "=49.0.2", default-features = false, features = ["cranelift", "runtime", "std", "threads"] }
 wat = "1.261.0"
 
 [[bench]]

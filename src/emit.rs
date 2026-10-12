@@ -303,16 +303,15 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// Does an access with these flags use big-endian byte order? Wasm
+    /// memory is little-endian, so such accesses reverse their bytes.
+    pub(crate) fn big_endian(&self, flags: cranelift_codegen::ir::MemFlags) -> bool {
+        self.func.dfg.mem_flags[flags].explicit_endianness() == Some(Endianness::Big)
+    }
+
     /// Push the next operand, an address, and return the static offset to
     /// use in the memarg.
-    pub(crate) fn mem_address(
-        &mut self,
-        offset: i32,
-        flags: cranelift_codegen::ir::MemFlags,
-    ) -> Result<u64> {
-        if self.func.dfg.mem_flags[flags].explicit_endianness() == Some(Endianness::Big) {
-            return unsupported("big-endian memory access");
-        }
+    pub(crate) fn mem_address(&mut self, offset: i32) -> Result<u64> {
         self.address()?;
         if offset >= 0 {
             Ok(offset as u64)

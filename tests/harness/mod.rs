@@ -6,7 +6,7 @@ pub mod clifgen;
 pub mod kernels;
 
 use cranelift_codegen::data_value::DataValue;
-use cranelift_codegen::ir::{Function, Type, UserFuncName, immediates::*, types};
+use cranelift_codegen::ir::{ExternalName, Function, Type, UserFuncName, immediates::*, types};
 use cranelift_reader::{Comparison, ParseOptions, RunCommand, parse_run_command, parse_test};
 use cranelift_wasm_backend::{
     Config, Env, Error, ModuleBuilder, Name, compile_function, wasm_signature,
@@ -73,12 +73,44 @@ pub struct Outcome {
     pub unsupported: Vec<String>,
 }
 
+/// CLIF implementations of libcalls, added to a module that calls them. In
+/// a real embedding these would be runtime functions provided by the host.
+const LIBCALLS: &str = "
+function %CeilF32(f32) -> f32 { block0(v0: f32): v1 = ceil v0  return v1 }
+function %CeilF64(f64) -> f64 { block0(v0: f64): v1 = ceil v0  return v1 }
+function %FloorF32(f32) -> f32 { block0(v0: f32): v1 = floor v0  return v1 }
+function %FloorF64(f64) -> f64 { block0(v0: f64): v1 = floor v0  return v1 }
+function %TruncF32(f32) -> f32 { block0(v0: f32): v1 = trunc v0  return v1 }
+function %TruncF64(f64) -> f64 { block0(v0: f64): v1 = trunc v0  return v1 }
+function %NearestF32(f32) -> f32 { block0(v0: f32): v1 = nearest v0  return v1 }
+function %NearestF64(f64) -> f64 { block0(v0: f64): v1 = nearest v0  return v1 }
+";
+
+/// The libcall implementations that `funcs` call.
+fn libcalls_used(funcs: &[Function]) -> Vec<Function> {
+    let used: Vec<String> = funcs
+        .iter()
+        .flat_map(|f| f.dfg.ext_funcs.values())
+        .filter_map(|ext| match &ext.name {
+            ExternalName::LibCall(l) => Some(format!("{l:?}")),
+            _ => None,
+        })
+        .collect();
+    cranelift_reader::parse_functions(LIBCALLS)
+        .unwrap()
+        .into_iter()
+        .filter(|f| used.contains(&func_name(f)))
+        .collect()
+}
+
 pub fn compile_module(funcs: &[Function], config: &Config) -> (Vec<u8>, Vec<String>) {
+    let libcalls = libcalls_used(funcs);
+    let funcs: Vec<&Function> = funcs.iter().chain(&libcalls).collect();
     let mut builder = ModuleBuilder::new();
     let mut names = HashMap::new();
     let mut indices = Vec::new();
     let mut unsupported = Vec::new();
-    for f in funcs {
+    for &f in &funcs {
         let (p, r) = wasm_signature(&f.signature).unwrap_or_default();
         let idx = builder.declare_function(&p, &r);
         names.insert(func_name(f), idx);
@@ -98,10 +130,12 @@ pub fn compile_module(funcs: &[Function], config: &Config) -> (Vec<u8>, Vec<Stri
             ConstExpr::i32_const(STACK_TOP)
         },
     );
+    let pinned = builder.global(ValType::I64, ConstExpr::i64_const(0));
     let mut config = config.clone();
+    config.module.pinned_reg_global = Some(pinned);
     config.module.table_index = Some(table);
     config.module.stack_pointer_global = Some(sp);
-    for (f, &idx) in funcs.iter().zip(&indices) {
+    for (&f, &idx) in funcs.iter().zip(&indices) {
         let mut env = TestEnv {
             names: &names,
             builder: &mut builder,
@@ -151,7 +185,9 @@ pub struct Runner {
 impl Runner {
     pub fn new(wasm: &[u8]) -> Result<Self, String> {
         let mut cfg = wasmtime::Config::new();
-        cfg.wasm_tail_call(true).wasm_memory64(true);
+        cfg.wasm_tail_call(true)
+            .wasm_memory64(true)
+            .wasm_threads(true);
         let engine = wasmtime::Engine::new(&cfg).map_err(|e| e.to_string())?;
         let module = wasmtime::Module::new(&engine, wasm).map_err(|e| e.to_string())?;
         Ok(Runner { engine, module })
@@ -265,15 +301,9 @@ fn from_val(v: &Val, ty: Type) -> Result<DataValue, String> {
 /// compared lane by lane.
 pub fn same_results(a: &[DataValue], b: &[DataValue], types: &[Type]) -> bool {
     fn float_eq(x: u64, y: u64, bits: u32) -> bool {
-        let exp = if bits == 32 {
-            0x7f80_0000
-        } else {
-            0x7ff0_0000_0000_0000
-        };
-        let man = if bits == 32 {
-            0x007f_ffff
-        } else {
-            0x000f_ffff_ffff_ffff
+        let (exp, man) = match bits {
+            32 => (0x7f80_0000, 0x007f_ffff),
+            _ => (0x7ff0_0000_0000_0000, 0x000f_ffff_ffff_ffff),
         };
         let nan = |v: u64| v & exp == exp && v & man != 0;
         x == y || (nan(x) && nan(y))

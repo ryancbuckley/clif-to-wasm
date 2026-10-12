@@ -116,7 +116,11 @@ pub(crate) fn operands(func: &Function, info: &FuncInfo, inst: Inst, out: &mut V
         Opcode::Bitselect if dfg.value_type(args[0]).is_vector() => {
             plain(out, &[args[1], args[2], args[0]]);
         }
-        Opcode::Store | Opcode::Istore8 | Opcode::Istore16 | Opcode::Istore32 => {
+        Opcode::Store
+        | Opcode::Istore8
+        | Opcode::Istore16
+        | Opcode::Istore32
+        | Opcode::AtomicStore => {
             plain(out, &[args[1], args[0]]);
         }
         Opcode::CallIndirect | Opcode::ReturnCallIndirect => {
