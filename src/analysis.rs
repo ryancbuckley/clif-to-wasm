@@ -227,6 +227,10 @@ pub(crate) fn is_remat(func: &Function, inst: Inst) -> bool {
         | InstructionData::UnaryIeee64 {
             opcode: Opcode::F64const,
             ..
+        }
+        | InstructionData::UnaryIeee16 {
+            opcode: Opcode::F16const,
+            ..
         } => true,
         // Vectors of up to 128 bits fit a `v128.const`; others stay
         // ordinary (and unsupported) instructions.

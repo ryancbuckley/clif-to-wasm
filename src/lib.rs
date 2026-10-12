@@ -39,6 +39,7 @@ mod liveness;
 mod locals;
 mod lower;
 mod lower_atomic;
+mod lower_float;
 mod lower_simd;
 pub mod module;
 mod structure;
@@ -270,7 +271,8 @@ impl CompiledFunction {
 pub fn wasm_type(ty: ir::Type) -> Result<ValType> {
     use cranelift_codegen::ir::types;
     Ok(match fixed_type(ty) {
-        types::I8 | types::I16 | types::I32 => ValType::I32,
+        // An f16 is its bits, like an i16.
+        types::I8 | types::I16 | types::I32 | types::F16 => ValType::I32,
         types::I64 => ValType::I64,
         types::F32 => ValType::F32,
         types::F64 => ValType::F64,
@@ -278,7 +280,13 @@ pub fn wasm_type(ty: ir::Type) -> Result<ValType> {
             && (16..=128).contains(&ty.bits())
             && matches!(
                 ty.lane_type(),
-                types::I8 | types::I16 | types::I32 | types::I64 | types::F32 | types::F64
+                types::I8
+                    | types::I16
+                    | types::I32
+                    | types::I64
+                    | types::F16
+                    | types::F32
+                    | types::F64
             ) =>
         {
             ValType::V128

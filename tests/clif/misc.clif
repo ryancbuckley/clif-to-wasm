@@ -1,8 +1,8 @@
 test run
 
 ; Smaller features: overflow flags, narrow saturating conversions, float
-; bitwise operations, vector rotates, dynamic vectors, the pinned register
-; and libcalls.
+; bitwise operations, vector rotates, dynamic vectors, f16, fma, the
+; pinned register and libcalls.
 
 function %uadd_overflow_cin_i64(i64, i64, i8) -> i64, i8 {
 block0(v0: i64, v1: i64, v2: i8):
@@ -103,6 +103,41 @@ block0(v0: i32, v1: i32):
     return v5
 }
 ; run: %dynamic_add(40, 2) == [42 42 42 42]
+
+function %f16_arith(f16, f16) -> f16, f16, f16 {
+block0(v0: f16, v1: f16):
+    v2 = fadd v0, v1
+    v3 = fdiv v0, v1
+    v4 = fneg v0
+    return v2, v3, v4
+}
+; run: %f16_arith(0x1.0p0, 0x1.8p1) == [0x1.0p2, 0x1.554p-2, -0x1.0p0]
+
+function %f16_compare(f16, f16) -> i8 {
+block0(v0: f16, v1: f16):
+    v2 = fcmp lt v0, v1
+    return v2
+}
+; run: %f16_compare(-0x1.0p0, 0x1.0p-24) == 1
+; run: %f16_compare(+NaN, 0x1.0p0) == 0
+
+function %f16_from_int(i32) -> f16 {
+block0(v0: i32):
+    v1 = fcvt_from_sint.f16 v0
+    return v1
+}
+; Ties between neighbors 2 apart go to the even mantissa.
+; run: %f16_from_int(2049) == 0x1.000p11
+; run: %f16_from_int(2051) == 0x1.008p11
+; run: %f16_from_int(70000) == +Inf
+
+function %fma_f32(f32, f32, f32) -> f32 {
+block0(v0: f32, v1: f32, v2: f32):
+    v3 = fma v0, v1, v2
+    return v3
+}
+; (1 + 2^-23) * (1 - 2^-23) - 1 is -2^-46 exactly; unfused, it is 0.
+; run: %fma_f32(0x1.000002p0, 0x1.fffffcp-1, -0x1.0p0) == -0x1.0p-46
 
 function %pinned_reg(i64) -> i64 {
 block0(v0: i64):

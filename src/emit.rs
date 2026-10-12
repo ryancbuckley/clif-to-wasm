@@ -187,6 +187,7 @@ impl<'a> Emitter<'a> {
         let ty = self.ty(self.func.dfg.first_result(inst));
         match self.func.dfg.insts[inst] {
             D::UnaryImm { imm, .. } => self.iconst(ty, imm.bits()),
+            D::UnaryIeee16 { imm, .. } => self.ins(I::I32Const(imm.bits().into())),
             D::UnaryIeee32 { imm, .. } => {
                 self.ins(I::F32Const(wasm_encoder::Ieee32::new(imm.bits())))
             }

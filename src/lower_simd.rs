@@ -44,7 +44,9 @@ impl Lane {
         }
         Ok(match ty.lane_type() {
             types::I8 => Lane::I8,
-            types::I16 => Lane::I16,
+            // f16 lanes can be moved around like i16 lanes; arithmetic
+            // on them is rejected below as on any integer lane.
+            types::I16 | types::F16 => Lane::I16,
             types::I32 => Lane::I32,
             types::I64 => Lane::I64,
             types::F32 => Lane::F32,
@@ -669,6 +671,7 @@ impl Emitter<'_> {
                     _ => I::F64x2Nearest,
                 });
             }
+            (Opcode::Fma, _) if lane == Lane::F32 => self.fma_f32_lanes(vty)?,
             (Opcode::Fcopysign, _) => {
                 // (x & ~sign) | (y & sign) == bitselect(x, y, ~sign).
                 self.operand()?;
@@ -740,7 +743,7 @@ impl Emitter<'_> {
                         types::F64 => I::F64x2ExtractLane(0),
                         types::I32 => I::I32x4ExtractLane(0),
                         types::F32 => I::F32x4ExtractLane(0),
-                        types::I16 => I::I16x8ExtractLaneU(0),
+                        types::I16 | types::F16 => I::I16x8ExtractLaneU(0),
                         _ => return unsupported(format!("bitcast {aty} -> {ty}")),
                     }),
                     (false, _) => self.ins(match aty {
@@ -748,7 +751,7 @@ impl Emitter<'_> {
                         types::F64 => I::F64x2Splat,
                         types::I32 => I::I32x4Splat,
                         types::F32 => I::F32x4Splat,
-                        types::I16 => I::I16x8Splat,
+                        types::I16 | types::F16 => I::I16x8Splat,
                         _ => return unsupported(format!("bitcast {aty} -> {ty}")),
                     }),
                 }

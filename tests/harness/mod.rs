@@ -273,6 +273,7 @@ fn to_val(v: &DataValue) -> Option<Val> {
         DataValue::I16(x) => Val::I32(x as u16 as i32),
         DataValue::I32(x) => Val::I32(x),
         DataValue::I64(x) => Val::I64(x),
+        DataValue::F16(x) => Val::I32(x.bits().into()),
         DataValue::F32(x) => Val::F32(x.bits()),
         DataValue::F64(x) => Val::F64(x.bits()),
         DataValue::V128(b) => Val::V128(u128::from_le_bytes(b).into()),
@@ -288,7 +289,10 @@ fn from_val(v: &Val, ty: Type) -> Result<DataValue, String> {
     Ok(match (v, ty) {
         (Val::I32(x), types::I8) if (*x as u32) <= 0xff => DataValue::I8(*x as i8),
         (Val::I32(x), types::I16) if (*x as u32) <= 0xffff => DataValue::I16(*x as i16),
-        (Val::I32(x), types::I8 | types::I16) => {
+        (Val::I32(x), types::F16) if (*x as u32) <= 0xffff => {
+            DataValue::F16(Ieee16::with_bits(*x as u16))
+        }
+        (Val::I32(x), types::I8 | types::I16 | types::F16) => {
             return Err(format!("{ty} result {x:#x} is not zero-extended"));
         }
         (Val::I32(x), _) => DataValue::I32(*x),
@@ -314,6 +318,7 @@ fn from_val(v: &Val, ty: Type) -> Result<DataValue, String> {
 pub fn same_results(a: &[DataValue], b: &[DataValue], types: &[Type]) -> bool {
     fn float_eq(x: u64, y: u64, bits: u32) -> bool {
         let (exp, man) = match bits {
+            16 => (0x7c00, 0x03ff),
             32 => (0x7f80_0000, 0x007f_ffff),
             _ => (0x7ff0_0000_0000_0000, 0x000f_ffff_ffff_ffff),
         };
@@ -326,6 +331,9 @@ pub fn same_results(a: &[DataValue], b: &[DataValue], types: &[Type]) -> bool {
                 float_eq(x.bits().into(), y.bits().into(), 32)
             }
             (DataValue::F64(x), DataValue::F64(y)) => float_eq(x.bits(), y.bits(), 64),
+            (DataValue::F16(x), DataValue::F16(y)) => {
+                float_eq(x.bits().into(), y.bits().into(), 16)
+            }
             (x, y)
                 if types
                     .get(i)

@@ -26,10 +26,24 @@ impl Emitter<'_> {
             .map(|&a| dfg.value_type(a))
             .unwrap_or(types::INVALID);
 
+        if (ty == types::F16 || aty == types::F16) && self.lower_f16(inst)? {
+            return Ok(());
+        }
+
         match (op, data) {
             (Opcode::Nop | Opcode::Debugtrap | Opcode::SequencePoint, _) => {}
 
-            (Opcode::Iconst | Opcode::F32const | Opcode::F64const, _) => self.constant(inst)?,
+            (Opcode::Iconst | Opcode::F16const | Opcode::F32const | Opcode::F64const, _) => {
+                self.constant(inst)?
+            }
+            (Opcode::Fma, _) if ty == types::F32 => {
+                self.fma_f64(&mut |e, _| {
+                    e.operand()?;
+                    e.ins(I::F64PromoteF32);
+                    Ok(())
+                })?;
+                self.ins(I::F32DemoteF64);
+            }
 
             // Integer arithmetic.
             (Opcode::Iadd | Opcode::Isub | Opcode::Imul, _) => {
@@ -472,6 +486,8 @@ impl Emitter<'_> {
                     (types::F32, types::I32) => self.ins(I::I32ReinterpretF32),
                     (types::I64, types::F64) => self.ins(I::F64ReinterpretI64),
                     (types::F64, types::I64) => self.ins(I::I64ReinterpretF64),
+                    // An f16 is its bits in an i32, like an i16.
+                    (types::I16, types::F16) | (types::F16, types::I16) => {}
                     _ => return unsupported(format!("bitcast {aty} -> {ty}")),
                 }
             }
@@ -503,12 +519,7 @@ impl Emitter<'_> {
             }
             (Opcode::FcvtToSint | Opcode::FcvtToUint, _) => {
                 let signed = op == Opcode::FcvtToSint;
-                let f64 = match aty {
-                    types::F32 => false,
-                    types::F64 => true,
-                    _ => return unsupported(format!("{op} {aty}")),
-                };
-                self.operand()?;
+                let f64 = self.float_operand()? == types::F64;
                 self.ins(match (is64(ty), f64, signed) {
                     (false, false, true) => I::I32TruncF32S,
                     (false, false, false) => I::I32TruncF32U,
@@ -541,8 +552,7 @@ impl Emitter<'_> {
                 if matches!(ty, types::I32 | types::I64) =>
             {
                 let signed = op == Opcode::FcvtToSintSat;
-                self.operand()?;
-                let f64 = aty == types::F64;
+                let f64 = self.float_operand()? == types::F64;
                 self.ins(match (is64(ty), f64, signed) {
                     (false, false, true) => I::I32TruncSatF32S,
                     (false, false, false) => I::I32TruncSatF32U,
@@ -558,8 +568,7 @@ impl Emitter<'_> {
                 // Saturate to i32, then clamp to the narrow range.
                 let signed = op == Opcode::FcvtToSintSat;
                 let bits = narrow_bits(ty).unwrap();
-                self.operand()?;
-                let f64 = aty == types::F64;
+                let f64 = self.float_operand()? == types::F64;
                 self.ins(match (f64, signed) {
                     (false, true) => I::I32TruncSatF32S,
                     (false, false) => I::I32TruncSatF32U,
@@ -668,7 +677,7 @@ impl Emitter<'_> {
                     (types::I64, types::I64) => {}
                     (_, types::I64) if signed => self.ins(I::I64ExtendI32S),
                     (_, types::I64) => self.ins(I::I64ExtendI32U),
-                    (_, types::I8 | types::I16 | types::I32) => self.mask(ty),
+                    (_, types::I8 | types::I16 | types::I32 | types::F16) => self.mask(ty),
                     _ => return unsupported(format!("{op}.{ty}")),
                 }
             }
@@ -690,6 +699,7 @@ impl Emitter<'_> {
                     (Opcode::Load, types::I64) => (8, I::I64Load as _),
                     (Opcode::Load, types::F32) => (4, I::F32Load as _),
                     (Opcode::Load, types::F64) => (8, I::F64Load as _),
+                    (Opcode::Load, types::F16) => (2, I::I32Load16U as _),
                     (Opcode::Uload8, types::I16 | types::I32) => (1, I::I32Load8U as _),
                     (Opcode::Uload8, types::I64) => (1, I::I64Load8U as _),
                     (Opcode::Sload8, types::I16 | types::I32) => (1, I::I32Load8S as _),
@@ -730,7 +740,7 @@ impl Emitter<'_> {
                     types::F32 => self.ins(I::I32ReinterpretF32),
                     types::F64 => self.ins(I::I64ReinterpretF64),
                     types::I64 if bytes < 8 => self.ins(I::I32WrapI64),
-                    t if t.is_int() && !t.is_vector() => {}
+                    t if t == types::F16 || (t.is_int() && !t.is_vector()) => {}
                     _ => return unsupported(format!("{op}.{vty}")),
                 }
                 let raw = types::Type::int_with_byte_size(bytes as u16).unwrap();
@@ -762,6 +772,7 @@ impl Emitter<'_> {
                     (Opcode::Store, types::I64) => (8, I::I64Store as _),
                     (Opcode::Store, types::F32) => (4, I::F32Store as _),
                     (Opcode::Store, types::F64) => (8, I::F64Store as _),
+                    (Opcode::Store, types::F16) => (2, I::I32Store16 as _),
                     (Opcode::Istore8, types::I16 | types::I32) => (1, I::I32Store8 as _),
                     (Opcode::Istore8, types::I64) => (1, I::I64Store8 as _),
                     (Opcode::Istore16, types::I32) => (2, I::I32Store16 as _),
@@ -1240,6 +1251,8 @@ impl Emitter<'_> {
 
     /// Push both operands and compare them.
     fn fcmp(&mut self, cond: FloatCC, ty: Type) -> Result<()> {
+        // f16 operands are compared as f32, which is exact.
+        let ty = if ty == types::F16 { types::F32 } else { ty };
         let vt = wasm_type(ty)?;
         let simple = |cc| -> Option<(I<'static>, bool)> {
             Some(match cc {
@@ -1258,8 +1271,8 @@ impl Emitter<'_> {
             })
         };
         if let Some((i, negate)) = simple(cond) {
-            self.operand()?;
-            self.operand()?;
+            self.float_operand()?;
+            self.float_operand()?;
             self.ins(i);
             if negate {
                 self.ins(I::I32Eqz);
@@ -1276,20 +1289,20 @@ impl Emitter<'_> {
                 } else {
                     (w!(ty, F32Ne, F64Ne), I::I32Or)
                 };
-                self.operand()?;
+                self.float_operand()?;
                 self.ins(I::LocalTee(sa));
                 self.ins(I::LocalGet(sa));
                 self.ins(cmp.clone());
-                self.operand()?;
+                self.float_operand()?;
                 self.ins(I::LocalTee(sb));
                 self.ins(I::LocalGet(sb));
                 self.ins(cmp);
                 self.ins(comb);
             }
             FloatCC::OrderedNotEqual | FloatCC::UnorderedOrEqual => {
-                self.operand()?;
+                self.float_operand()?;
                 self.ins(I::LocalTee(sa));
-                self.operand()?;
+                self.float_operand()?;
                 self.ins(I::LocalTee(sb));
                 self.ins(w!(ty, F32Lt, F64Lt));
                 self.ins(I::LocalGet(sa));
