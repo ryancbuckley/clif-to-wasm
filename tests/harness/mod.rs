@@ -85,7 +85,7 @@ pub fn compile_module(funcs: &[Function], config: &Config) -> (Vec<u8>, Vec<Stri
         indices.push(idx);
     }
     builder.memory(MEMORY_PAGES, config.module.memory64);
-    builder.function_table();
+    let table = builder.function_table();
     let sp = builder.global(
         if config.module.memory64 {
             ValType::I64
@@ -99,6 +99,7 @@ pub fn compile_module(funcs: &[Function], config: &Config) -> (Vec<u8>, Vec<Stri
         },
     );
     let mut config = config.clone();
+    config.module.table_index = Some(table);
     config.module.stack_pointer_global = Some(sp);
     for (f, &idx) in funcs.iter().zip(&indices) {
         let mut env = TestEnv {

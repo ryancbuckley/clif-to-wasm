@@ -139,7 +139,7 @@ fn jit_module_links_into_host() {
     host.export("sp", ExportKind::Global, sp);
     let mut config = Config::default();
     config.module.memory_index = mem;
-    config.module.table_index = table;
+    config.module.table_index = Some(table);
     config.module.stack_pointer_global = Some(sp);
     // In the host's own table, slot i holds function i.
     let host_indices = add_functions(
@@ -205,7 +205,7 @@ fn jit_module_links_into_host() {
     );
     let mut config = Config::default();
     config.module.memory_index = mem;
-    config.module.table_index = table_idx;
+    config.module.table_index = Some(table_idx);
     config.module.stack_pointer_global = Some(sp_idx);
     let names = HashMap::from([("double".to_string(), double_idx)]);
     // `double` keeps the slot it has in the host's table.
@@ -243,4 +243,66 @@ fn jit_module_links_into_host() {
         call_slot.call(&mut store, (base as i32 + 1, 3)).is_err(),
         "slot base+1 holds %jit, whose signature differs"
     );
+}
+
+/// An environment that only knows table slots.
+struct SlotsOnly;
+
+impl Env for SlotsOnly {
+    fn func_index(&mut self, name: Name<'_>) -> Result<u32, Error> {
+        Err(Error::Env(key(name)))
+    }
+    fn type_index(&mut self, _: &Signature) -> Result<u32, Error> {
+        Ok(0)
+    }
+    fn func_table_slot(&mut self, _: Name<'_>) -> Result<u64, Error> {
+        Ok(7)
+    }
+}
+
+#[test]
+fn call_indirect_needs_a_table() {
+    let funcs = parse_functions(
+        "
+function %call_ptr(i32, i32) -> i32 {
+    sig0 = (i32) -> i32
+block0(v0: i32, v1: i32):
+    v2 = call_indirect sig0, v0(v1)
+    return v2
+}
+
+function %tail_call_ptr(i32, i32) -> i32 tail {
+    sig0 = (i32) -> i32 tail
+block0(v0: i32, v1: i32):
+    return_call_indirect sig0, v0(v1)
+}
+
+function %addr() -> i32 {
+    fn0 = %callee(i32) -> i32
+block0:
+    v0 = func_addr.i32 fn0
+    return v0
+}
+",
+    )
+    .unwrap();
+    let mut config = Config::default();
+    assert_eq!(config.module.table_index, None);
+
+    // Calling through a pointer needs to know which table to use.
+    for f in &funcs[..2] {
+        assert_eq!(
+            compile_function(f, &config, &mut SlotsOnly).unwrap_err(),
+            Error::Unsupported("call_indirect without ModuleLayout::table_index".into()),
+            "{}",
+            f.name
+        );
+    }
+    // Taking an address only needs the slot, which the Env provides.
+    compile_function(&funcs[2], &config, &mut SlotsOnly).unwrap();
+
+    config.module.table_index = Some(0);
+    for f in &funcs {
+        compile_function(f, &config, &mut SlotsOnly).unwrap();
+    }
 }

@@ -95,8 +95,9 @@ pub struct ModuleLayout {
     pub memory_index: u32,
     /// Which table `call_indirect` looks functions up in. Wasm has no raw
     /// function pointers: a function "address" is an index into a table of
-    /// function references. With one table this is 0.
-    pub table_index: u32,
+    /// function references. With one table this is `Some(0)`. With `None`,
+    /// functions that use `call_indirect` are rejected.
+    pub table_index: Option<u32>,
     /// A mutable global holding the shadow stack pointer. Stack slots must
     /// live in linear memory, since wasm has no addressable stack; functions
     /// that use them move this pointer down on entry and back on exit. The

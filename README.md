@@ -91,7 +91,8 @@ agree with your `Config` and `Env` answers. It handles both kinds of module:
 | `opts: Optimizations` | `stack_values`, `coalesce`, `use_tee` | Output-quality switches, all on by default; `Optimizations::none()` turns them all off. |
 
 For example, `config.module.stack_pointer_global = Some(sp)` enables stack
-slots, and `config.opts.coalesce = false` disables move coalescing.
+slots, `config.module.table_index = Some(t)` enables `call_indirect`, and
+`config.opts.coalesce = false` disables move coalescing.
 
 ## Supported
 

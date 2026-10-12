@@ -712,8 +712,10 @@ impl Emitter<'_> {
                 if is64(aty) {
                     self.ins(I::I32WrapI64);
                 }
+                let Some(table_index) = self.config.module.table_index else {
+                    return unsupported("call_indirect without ModuleLayout::table_index");
+                };
                 let type_index = self.env.type_index(&dfg.signatures[sig_ref])?;
-                let table_index = self.config.module.table_index;
                 if op == Opcode::ReturnCallIndirect {
                     self.epilogue();
                     if self.config.engine.tail_calls {
