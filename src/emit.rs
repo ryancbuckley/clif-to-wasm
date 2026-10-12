@@ -38,6 +38,13 @@ pub(crate) enum Task {
     Else,
     /// Close the innermost label.
     End,
+    /// Like `Branch`, along an exception edge of a `try_call` whose wasm
+    /// label left the payload on the stack (if `payload`).
+    Catch {
+        src: cranelift_codegen::ir::Block,
+        call: cranelift_codegen::ir::BlockCall,
+        payload: bool,
+    },
 }
 
 pub(crate) struct Emitter<'a> {
@@ -54,6 +61,10 @@ pub(crate) struct Emitter<'a> {
     pub slot_offset: SecondaryMap<StackSlot, u32>,
     /// The label local, when emitting a dispatch loop.
     pub dispatch_label: Option<u32>,
+    /// Locals holding the call results and the exception payload of the
+    /// `try_call` ending each block, which its edges pass as `ret0`/`exn0`.
+    pub try_results: SecondaryMap<cranelift_codegen::ir::Block, Vec<u32>>,
+    pub try_payload: SecondaryMap<cranelift_codegen::ir::Block, Vec<u32>>,
     body: Body,
     /// Locals created during emission (scratch, frame pointer, label).
     extra: ExtraLocals,
@@ -110,6 +121,8 @@ impl<'a> Emitter<'a> {
             frame: None,
             slot_offset: SecondaryMap::new(),
             dispatch_label: None,
+            try_results: SecondaryMap::new(),
+            try_payload: SecondaryMap::new(),
             body: Body::new(config.opts.use_tee),
             extra: ExtraLocals::new(base),
             operand_stack: Vec::new(),

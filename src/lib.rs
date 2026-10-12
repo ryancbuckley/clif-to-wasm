@@ -241,6 +241,17 @@ pub trait Env {
             "symbol_value {name} requires Env::symbol_value"
         )))
     }
+
+    /// The wasm tag index of a Cranelift exception tag, for the handlers of
+    /// `try_call`. The tag's parameters are the exception payload of the
+    /// callee's calling convention: two pointer-sized integers (`i64`, or
+    /// `i32` if the handlers' payload values are `i32`). Exceptions are
+    /// thrown by the embedder's runtime with wasm `throw`.
+    fn exception_tag(&mut self, tag: ir::ExceptionTag) -> Result<u32> {
+        Err(Error::Env(format!(
+            "exception tag {tag} requires Env::exception_tag"
+        )))
+    }
 }
 
 /// A compiled function: its wasm type, locals and encoded body.

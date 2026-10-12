@@ -1,0 +1,192 @@
+test run
+
+; Exceptions. `try_call` becomes a wasm `try_table`. The harness defines
+; `%throw_tag<N>(i64, i64)` as a wasm `throw` of tag N with that payload,
+; standing in for an embedder's runtime.
+
+; Throws tag `t` (1 or 2) with payload (a, b), or returns a + b for t = 0.
+function %thrower(i64, i64, i32) -> i64 tail {
+    fn1 = %throw_tag1(i64, i64) tail
+    fn2 = %throw_tag2(i64, i64) tail
+
+block0(v0: i64, v1: i64, v2: i32):
+    br_table v2, block3, [block3, block1, block2]
+
+block1:
+    call fn1(v0, v1)
+    trap user1
+
+block2:
+    call fn2(v0, v1)
+    trap user1
+
+block3:
+    v3 = iadd v0, v1
+    return v3
+}
+
+function %catch_payload(i64, i64, i32) -> i64 {
+    sig0 = (i64, i64, i32) -> i64 tail
+    fn0 = %thrower(i64, i64, i32) -> i64 tail
+
+block0(v0: i64, v1: i64, v2: i32):
+    try_call fn0(v0, v1, v2), sig0, block1(ret0), [ tag1: block2(exn0, exn1) ]
+
+block1(v3: i64):
+    return v3
+
+block2(v4: i64, v5: i64):
+    v6 = isub v5, v4
+    return v6
+}
+; run: %catch_payload(10, 52, 0) == 62
+; run: %catch_payload(10, 52, 1) == 42
+
+; Call results and payloads mix with ordinary arguments, in any order; an
+; unmatched tag falls to the catch-all handler.
+function %mixed_args(i64, i32) -> i64 {
+    sig0 = (i64, i64, i32) -> i64 tail
+    fn0 = %thrower(i64, i64, i32) -> i64 tail
+
+block0(v0: i64, v1: i32):
+    v2 = iconst.i64 7
+    try_call fn0(v0, v2, v1), sig0, block1(v2, ret0, v0), [ tag1: block2(exn1, v0, exn0), default: block3(v0) ]
+
+block1(v3: i64, v4: i64, v5: i64):
+    ; 7 * 1000 + (v0 + 7) * 10 + v0
+    v100 = iconst.i64 1000
+    v6 = imul v3, v100
+    v101 = iconst.i64 10
+    v7 = imul v4, v101
+    v8 = iadd v6, v7
+    v9 = iadd v8, v5
+    return v9
+
+block2(v10: i64, v11: i64, v12: i64):
+    ; payload (v0, 7): 7 * 100 + v0 * 10 + v0
+    v102 = iconst.i64 100
+    v13 = imul v10, v102
+    v103 = iconst.i64 10
+    v14 = imul v11, v103
+    v15 = iadd v13, v14
+    v16 = iadd v15, v12
+    return v16
+
+block3(v17: i64):
+    v18 = iconst.i64 -1000
+    v19 = iadd v17, v18
+    return v19
+}
+; run: %mixed_args(3, 0) == 7103
+; run: %mixed_args(3, 1) == 733
+; run: %mixed_args(3, 2) == -997
+
+; An exception that the inner try_call does not catch reaches the outer one.
+function %inner(i64, i32) -> i64 tail {
+    sig0 = (i64, i64, i32) -> i64 tail
+    fn0 = %thrower(i64, i64, i32) -> i64 tail
+
+block0(v0: i64, v1: i32):
+    v2 = iconst.i64 1
+    try_call fn0(v0, v2, v1), sig0, block1(ret0), [ tag1: block2(exn0) ]
+
+block1(v3: i64):
+    return v3
+
+block2(v4: i64):
+    v5 = iconst.i64 100
+    v6 = iadd v4, v5
+    return v6
+}
+
+function %outer(i64, i32) -> i64 {
+    sig0 = (i64, i32) -> i64 tail
+    fn0 = %inner(i64, i32) -> i64 tail
+
+block0(v0: i64, v1: i32):
+    try_call fn0(v0, v1), sig0, block1(ret0), [ tag2: block2(exn0) ]
+
+block1(v2: i64):
+    return v2
+
+block2(v3: i64):
+    v4 = iconst.i64 200
+    v5 = iadd v3, v4
+    return v5
+}
+; run: %outer(5, 0) == 6
+; run: %outer(5, 1) == 105
+; run: %outer(5, 2) == 205
+
+function %indirect(i64, i32) -> i64 {
+    sig0 = (i64, i64, i32) -> i64 tail
+    fn0 = %thrower(i64, i64, i32) -> i64 tail
+
+block0(v0: i64, v1: i32):
+    v2 = func_addr.i64 fn0
+    try_call_indirect v2(v0, v0, v1), sig0, block1(ret0), [ tag2: block2(exn1) ]
+
+block1(v3: i64):
+    return v3
+
+block2(v4: i64):
+    v5 = ineg v4
+    return v5
+}
+; run: %indirect(4, 0) == 8
+; run: %indirect(4, 2) == -4
+
+; Inside a loop, so the loop's label sits outside the handlers' blocks.
+; For each i in 0..n, an even i returns i normally and an odd i throws the
+; payload (i, 0), whose second half the handler adds: the sum of the even i.
+function %in_loop(i64) -> i64 {
+    sig0 = (i64, i64, i32) -> i64 tail
+    fn0 = %thrower(i64, i64, i32) -> i64 tail
+
+block0(v0: i64):
+    v1 = iconst.i64 0
+    jump block1(v1, v1)
+
+block1(v2: i64, v3: i64):
+    v4 = icmp ult v2, v0
+    brif v4, block2, block4(v3)
+
+block2:
+    v104 = iconst.i64 1
+    v5 = band v2, v104
+    v6 = ireduce.i32 v5
+    v7 = iconst.i64 0
+    try_call fn0(v2, v7, v6), sig0, block3(ret0), [ tag1: block3(exn1) ]
+
+block3(v8: i64):
+    v9 = iadd v3, v8
+    v105 = iconst.i64 1
+    v10 = iadd v2, v105
+    jump block1(v10, v9)
+
+block4(v11: i64):
+    return v11
+}
+; run: %in_loop(6) == 6
+; run: %in_loop(9) == 20
+
+; Handlers that share a block, and a catch-all without a payload.
+function %shared_handler(i32) -> i64 {
+    sig0 = (i64, i64, i32) -> i64 tail
+    fn0 = %thrower(i64, i64, i32) -> i64 tail
+
+block0(v0: i32):
+    v1 = iconst.i64 1
+    v2 = iconst.i64 2
+    try_call fn0(v1, v2, v0), sig0, block1(ret0), [ tag1: block2(), tag2: block2(), default: block2() ]
+
+block1(v3: i64):
+    return v3
+
+block2:
+    v4 = iconst.i64 99
+    return v4
+}
+; run: %shared_handler(0) == 3
+; run: %shared_handler(1) == 99
+; run: %shared_handler(2) == 99

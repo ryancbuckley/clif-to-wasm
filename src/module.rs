@@ -11,6 +11,9 @@
 //!   pointer global, and places its functions in free slots of that table
 //!   ([`ModuleBuilder::place_in_table`]).
 //!
+//! Either kind can also define or import exception tags, for functions that
+//! catch exceptions (`try_call`).
+//!
 //! The indices this returns are the ones to put in [`crate::Config`] and to
 //! answer [`crate::Env`] queries with. Embedders with other needs can use
 //! `wasm_encoder` directly with [`CompiledFunction::to_wasm_function`].
@@ -19,7 +22,7 @@ use crate::CompiledFunction;
 use wasm_encoder::{
     CodeSection, ConstExpr, ElementSection, Elements, EntityType, ExportKind, ExportSection,
     FunctionSection, GlobalSection, GlobalType, ImportSection, MemorySection, MemoryType, Module,
-    RefType, TableSection, TableType, TypeSection, ValType,
+    RefType, TableSection, TableType, TagKind, TagSection, TagType, TypeSection, ValType,
 };
 
 #[derive(Default)]
@@ -30,6 +33,7 @@ pub struct ModuleBuilder {
     num_imported_memories: u32,
     num_imported_globals: u32,
     num_imported_tables: u32,
+    num_imported_tags: u32,
     /// Type index and body of each defined function.
     funcs: Vec<(u32, Option<CompiledFunction>)>,
     exports: Vec<(String, ExportKind, u32)>,
@@ -41,6 +45,8 @@ pub struct ModuleBuilder {
     function_table: Option<u32>,
     /// Active element segments: table, first slot, functions.
     elements: Vec<(u32, u64, Vec<u32>)>,
+    /// The type index of each defined exception tag.
+    tags: Vec<u32>,
 }
 
 impl ModuleBuilder {
@@ -124,6 +130,23 @@ impl ModuleBuilder {
         self.num_imported_tables - 1
     }
 
+    /// Import an exception tag whose payload has the given types. Returns
+    /// its tag index.
+    pub fn import_tag(&mut self, module: &str, name: &str, params: &[ValType]) -> u32 {
+        assert!(self.tags.is_empty(), "tag imports must precede defined tags");
+        let ty = self.type_index(params, &[]);
+        self.import(
+            module,
+            name,
+            EntityType::Tag(TagType {
+                kind: TagKind::Exception,
+                func_type_idx: ty,
+            }),
+        );
+        self.num_imported_tags += 1;
+        self.num_imported_tags - 1
+    }
+
     fn import(&mut self, module: &str, name: &str, ty: EntityType) {
         self.imports.push((module.into(), name.into(), ty));
     }
@@ -170,6 +193,14 @@ impl ModuleBuilder {
             init,
         ));
         self.num_imported_globals + self.globals.len() as u32 - 1
+    }
+
+    /// Define an exception tag whose payload has the given types. Returns its
+    /// tag index.
+    pub fn tag(&mut self, params: &[ValType]) -> u32 {
+        let ty = self.type_index(params, &[]);
+        self.tags.push(ty);
+        self.num_imported_tags + self.tags.len() as u32 - 1
     }
 
     /// Define a funcref table where slot `i` holds function `i`, for every
@@ -258,6 +289,17 @@ impl ModuleBuilder {
                 memories.memory(*m);
             }
             module.section(&memories);
+        }
+
+        if !self.tags.is_empty() {
+            let mut tags = TagSection::new();
+            for &ty in &self.tags {
+                tags.tag(TagType {
+                    kind: TagKind::Exception,
+                    func_type_idx: ty,
+                });
+            }
+            module.section(&tags);
         }
 
         if !self.globals.is_empty() {

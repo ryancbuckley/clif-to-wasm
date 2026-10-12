@@ -74,15 +74,22 @@ impl FuncInfo {
                 | Opcode::Return
                 | Opcode::ReturnCall
                 | Opcode::ReturnCallIndirect
+                | Opcode::TryCall
+                | Opcode::TryCallIndirect
                 | Opcode::Trap => {}
                 op => return unsupported(format!("terminator {op}")),
             }
+            // A `try_call` keeps every edge, in exception-table order with
+            // the normal return last, because each becomes its own wasm
+            // label; its edges may pass call results (`ret0`) and exception
+            // payloads (`exn0`) instead of values.
+            let is_try = matches!(data.opcode(), Opcode::TryCall | Opcode::TryCallIndirect);
             let mut ds: Vec<BlockCall> = Vec::new();
             for call in data.branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables) {
-                if call.args(pool).any(|a| !matches!(a, BlockArg::Value(_))) {
+                if !is_try && call.args(pool).any(|a| !matches!(a, BlockArg::Value(_))) {
                     return unsupported("non-value block argument");
                 }
-                if !ds.iter().any(|d| same_call(func, d, call)) {
+                if is_try || !ds.iter().any(|d| same_call(func, d, call)) {
                     ds.push(*call);
                 }
             }

@@ -6,13 +6,16 @@ pub mod clifgen;
 pub mod kernels;
 
 use cranelift_codegen::data_value::DataValue;
-use cranelift_codegen::ir::{ExternalName, Function, Type, UserFuncName, immediates::*, types};
+use cranelift_codegen::ir::{
+    ExceptionTableItem, ExceptionTag, ExternalName, Function, Type, UserFuncName, immediates::*,
+    types,
+};
 use cranelift_reader::{Comparison, ParseOptions, RunCommand, parse_run_command, parse_test};
 use cranelift_wasm_backend::{
     Config, Env, Error, ModuleBuilder, Name, compile_function, wasm_signature,
 };
-use std::collections::HashMap;
-use wasm_encoder::{ConstExpr, ValType};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use wasm_encoder::{ConstExpr, Encode, Instruction, ValType};
 use wasmtime::Val;
 
 pub const MEMORY_PAGES: u64 = 32;
@@ -20,6 +23,8 @@ pub const STACK_TOP: i32 = MEMORY_PAGES as i32 * 65536;
 
 struct TestEnv<'a> {
     names: &'a HashMap<String, u32>,
+    /// Wasm tag index of each Cranelift exception tag number.
+    tags: &'a HashMap<u32, u32>,
     builder: &'a mut ModuleBuilder,
 }
 
@@ -33,6 +38,12 @@ impl Env for TestEnv<'_> {
     }
     fn func_table_slot(&mut self, name: Name<'_>) -> Result<u64, Error> {
         self.lookup(name).map(u64::from)
+    }
+    fn exception_tag(&mut self, tag: ExceptionTag) -> Result<u32, Error> {
+        self.tags
+            .get(&tag.as_u32())
+            .copied()
+            .ok_or_else(|| Error::Env(format!("unknown exception {tag}")))
     }
 }
 
@@ -103,6 +114,38 @@ fn libcalls_used(funcs: &[Function]) -> Vec<Function> {
         .collect()
 }
 
+/// Exceptions: tests catch them with `try_call`, and throw them by calling
+/// `%throw_tag<N>(i64, i64)`, which the harness defines as a wasm `throw`
+/// of tag N with that payload (the payload of Cranelift's calling
+/// conventions on a 64-bit target). Returns the Cranelift tag numbers used
+/// and the tag number of each thrower function.
+fn exceptions_used(funcs: &[&Function]) -> (BTreeSet<u32>, BTreeMap<String, u32>) {
+    let defined: Vec<String> = funcs.iter().map(|f| func_name(f)).collect();
+    let mut tags = BTreeSet::new();
+    let mut throwers = BTreeMap::new();
+    for f in funcs {
+        for table in f.dfg.exception_tables.values() {
+            for item in table.items() {
+                if let ExceptionTableItem::Tag(tag, _) = item {
+                    tags.insert(tag.as_u32());
+                }
+            }
+        }
+        for ext in f.dfg.ext_funcs.values() {
+            if let ExternalName::TestCase(t) = &ext.name {
+                let name = String::from_utf8_lossy(t.raw()).into_owned();
+                if let Some(n) = name.strip_prefix("throw_tag").and_then(|n| n.parse().ok())
+                    && !defined.contains(&name)
+                {
+                    tags.insert(n);
+                    throwers.insert(name, n);
+                }
+            }
+        }
+    }
+    (tags, throwers)
+}
+
 pub fn compile_module(funcs: &[Function], config: &Config) -> (Vec<u8>, Vec<String>) {
     let libcalls = libcalls_used(funcs);
     let funcs: Vec<&Function> = funcs.iter().chain(&libcalls).collect();
@@ -115,6 +158,34 @@ pub fn compile_module(funcs: &[Function], config: &Config) -> (Vec<u8>, Vec<Stri
         let idx = builder.declare_function(&p, &r);
         names.insert(func_name(f), idx);
         indices.push(idx);
+    }
+    let (used_tags, throwers) = exceptions_used(&funcs);
+    let payload = [ValType::I64, ValType::I64];
+    let tags: HashMap<u32, u32> = used_tags
+        .into_iter()
+        .map(|n| (n, builder.tag(&payload)))
+        .collect();
+    for (name, n) in &throwers {
+        let idx = builder.declare_function(&payload, &[]);
+        names.insert(name.clone(), idx);
+        let mut body = Vec::new();
+        for i in [
+            Instruction::LocalGet(0),
+            Instruction::LocalGet(1),
+            Instruction::Throw(tags[n]),
+            Instruction::End,
+        ] {
+            i.encode(&mut body);
+        }
+        builder.define_function(
+            idx,
+            cranelift_wasm_backend::CompiledFunction {
+                params: payload.to_vec(),
+                results: vec![],
+                locals: vec![],
+                body,
+            },
+        );
     }
     builder.memory(MEMORY_PAGES, config.module.memory64);
     let table = builder.function_table();
@@ -138,6 +209,7 @@ pub fn compile_module(funcs: &[Function], config: &Config) -> (Vec<u8>, Vec<Stri
     for (&f, &idx) in funcs.iter().zip(&indices) {
         let mut env = TestEnv {
             names: &names,
+            tags: &tags,
             builder: &mut builder,
         };
         let compiled = match compile_function(f, &config, &mut env) {

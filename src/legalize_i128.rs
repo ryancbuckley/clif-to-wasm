@@ -203,6 +203,19 @@ impl Legalizer<'_> {
                 c.args(&dfg.value_lists)
                     .any(|a| a.as_value().is_some_and(|v| dfg.value_type(v) == I128))
             });
+        // Splitting a try_call's i128 results or payload would renumber the
+        // `ret`/`exn` arguments of its edges; not supported.
+        if let Some(et) = dfg.insts[inst].exception_table() {
+            let sig = &dfg.signatures[dfg.exception_tables[et].signature()];
+            let wide_sig = sig
+                .params
+                .iter()
+                .chain(&sig.returns)
+                .any(|p| p.value_type == I128);
+            if wide_sig || wide_arg || wide_branch_arg {
+                return unsupported("i128 in try_call");
+            }
+        }
         if !wide_arg && !wide_res && !wide_branch_arg {
             return Ok(());
         }

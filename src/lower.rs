@@ -885,10 +885,7 @@ impl Emitter<'_> {
                 if is64(aty) {
                     self.ins(I::I32WrapI64);
                 }
-                let Some(table_index) = self.config.module.table_index else {
-                    return unsupported("call_indirect without ModuleLayout::table_index");
-                };
-                let type_index = self.env.type_index(&dfg.signatures[sig_ref])?;
+                let (type_index, table_index) = self.indirect_call(sig_ref)?;
                 if op == Opcode::ReturnCallIndirect {
                     self.epilogue();
                     if self.config.engine.tail_calls {
@@ -932,6 +929,18 @@ impl Emitter<'_> {
             _ => return unsupported(format!("instruction `{}`", dfg.display_inst(inst))),
         }
         Ok(())
+    }
+
+    /// The type and table indices for an indirect call with signature `sig`.
+    pub(crate) fn indirect_call(
+        &mut self,
+        sig: cranelift_codegen::ir::SigRef,
+    ) -> Result<(u32, u32)> {
+        let Some(table_index) = self.config.module.table_index else {
+            return unsupported("call_indirect without ModuleLayout::table_index");
+        };
+        let type_index = self.env.type_index(&self.func.dfg.signatures[sig])?;
+        Ok((type_index, table_index))
     }
 
     /// Replace the `i32` on the stack by `bound` unless `cmp(value, bound)`

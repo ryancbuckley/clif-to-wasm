@@ -92,11 +92,12 @@ pub(crate) struct Operand {
 /// lowering takes its operands from this list one by one
 /// ([`crate::emit::Emitter::operand`]).
 ///
-/// The exception is branches (`jump`, `brif`, `br_table`), which
-/// `structure.rs` emits itself: the condition or index first, then each
-/// edge's arguments inside that edge's arm. Only the first operand there can
-/// hold side effects, because arguments of a multi-way branch only accept
-/// pure trees, so the order among the arguments does not matter.
+/// The exception is branches (`jump`, `brif`, `br_table`, `try_call`), which
+/// `structure.rs` emits itself: the condition, index or call arguments
+/// first, then each edge's arguments inside that edge's arm. Only those
+/// first operands can hold side effects, because the arguments of a
+/// multi-way branch or of a `try_call` (evaluated after the call) only
+/// accept pure trees, so the order among the arguments does not matter.
 pub(crate) fn operands(func: &Function, info: &FuncInfo, inst: Inst, out: &mut Vec<Operand>) {
     out.clear();
     let dfg = &func.dfg;
@@ -126,6 +127,23 @@ pub(crate) fn operands(func: &Function, info: &FuncInfo, inst: Inst, out: &mut V
         Opcode::CallIndirect | Opcode::ReturnCallIndirect => {
             plain(out, &args[1..]);
             plain(out, &args[..1]);
+        }
+        // A `try_call`'s edge arguments are evaluated after the call, so,
+        // like those of a multi-way branch, they accept only pure trees.
+        Opcode::TryCall | Opcode::TryCallIndirect => {
+            if op == Opcode::TryCallIndirect {
+                plain(out, &args[1..]);
+                plain(out, &args[..1]);
+            } else {
+                plain(out, args);
+            }
+            let block = func.layout.inst_block(inst).unwrap();
+            for &call in &info.dests[block] {
+                out.extend(info.live_args(func, call).map(|value| Operand {
+                    value,
+                    conditional: true,
+                }));
+            }
         }
         Opcode::Jump | Opcode::Brif | Opcode::BrTable => {
             plain(out, args);

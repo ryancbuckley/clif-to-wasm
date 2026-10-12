@@ -71,7 +71,7 @@ impl Env for MyEnv {
         todo!()
     }
     // Optional: type_index (call_indirect), func_table_slot (func_addr),
-    // symbol_value.
+    // symbol_value, exception_tag (try_call handlers).
 }
 
 let compiled = compile_function(&func, &Config::default(), &mut MyEnv)?;
@@ -127,6 +127,15 @@ expand into `i64` code. Division and remainder become a 128-iteration
 shift-subtract loop, and conversions from `i128` to floats are correctly
 rounded (round to odd, then convert).
 
+Exceptions use wasm's exception handling. A `try_call` becomes a call
+inside a `try_table` whose `catch` clauses branch to one block per handler;
+`Env::exception_tag` maps each Cranelift exception tag to a wasm tag, whose
+payload is the calling convention's two pointer-sized values. A catch-all
+handler (`default`) cannot use the payload, since wasm's `catch_all` provides
+none. Throwing is up to the embedder's runtime (a wasm `throw`), as it is in
+Cranelift, where only a native unwinder can throw; so the upstream
+`throw.clif`, which uses that unwinder, is not supported.
+
 `f16` and `fma` (`src/lower_float.rs`) are emulated, with correctly rounded
 results:
 
@@ -165,7 +174,8 @@ Not yet supported (functions using these return `Error::Unsupported`):
 - `i128` atomics, and `umul_overflow`/`smul_overflow`/`umulhi`/`smulhi` on
   `i128`.
 - Big-endian vector loads and stores, and arithmetic on `f16` lanes.
-- Exceptions (`try_call`), dynamic stack slots.
+- `try_call` with `i128` arguments, results or payloads; dynamic stack
+  slots; `get_return_address`.
 
 ## Testing
 
@@ -205,10 +215,13 @@ cargo run --example runclif  -- tests/clif/control.clif
   directions.
 - The harness provides what upstream tests expect from an embedder:
   libcalls (`CeilF32` and friends, compiled from CLIF), a pinned-register
-  global, and atomics (wasmtime's `threads` feature).
-- Upstream runtests: 13,495 run commands pass and 0 fail; 382 of 395 files
+  global, atomics (wasmtime's `threads` feature), and exception tags. A
+  test throws by calling `%throw_tag<N>(i64, i64)`, which the harness
+  defines as a wasm `throw` (`tests/clif/exceptions.clif`).
+- Upstream runtests: 13,497 run commands pass and 0 fail; 383 of 395 files
   are fully supported. The rest use `f128` (4 files), `f64` `fma` (4),
-  `i128` atomics (2) or exceptions (2). Files that only run under
+  `i128` atomics (2) or Cranelift's native unwinder (`throw.clif`). Files
+  that only run under
   Cranelift's interpreter
   (`test interpret` without `test run`) are reported separately:
   `i128-conversion.clif` expects the interpreter's saturating
@@ -312,8 +325,7 @@ Findings:
 ## Possible next steps
 
 - The unsupported operations listed above: `f64` `fma` (double-double
-  arithmetic), `f128` (software floating point), exceptions (wasm's
-  exception handling).
+  arithmetic), `f128` (software floating point).
 - Operand commutation and pre-passes that increase the number of
   single-use values (as LLVM does).
 - Compile speed: the allocator, analysis and emission each take roughly a

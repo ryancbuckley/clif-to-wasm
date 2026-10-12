@@ -26,10 +26,13 @@ use crate::analysis::FuncInfo;
 use crate::emit::{Emitter, Label, Task};
 use crate::expr_trees::ExprTrees;
 use crate::locals::Locals;
-use crate::{CompiledFunction, Config, Env, Result, unsupported, wasm_signature};
-use cranelift_codegen::ir::{Block, BlockCall, Function, Opcode, types};
+use crate::{CompiledFunction, Config, Env, Name, Result, unsupported, wasm_signature, wasm_type};
+use cranelift_codegen::ir::{
+    AbiParam, Block, BlockArg, BlockCall, ExceptionTableItem, ExceptionTag, Function, Inst,
+    InstructionData, Opcode, Signature, types,
+};
 use std::borrow::Cow;
-use wasm_encoder::{BlockType, Instruction as I, ValType};
+use wasm_encoder::{BlockType, Catch, Instruction as I, ValType};
 
 pub(crate) fn emit_function(
     func: &Function,
@@ -122,6 +125,14 @@ impl Emitter<'_> {
             match task {
                 Task::Tree(x) => self.tree(x)?,
                 Task::Branch { src, call } => self.branch(src, call)?,
+                Task::Catch { src, call, payload } => {
+                    if payload {
+                        for &l in self.try_payload[src].clone().iter().rev() {
+                            self.ins(I::LocalSet(l));
+                        }
+                    }
+                    self.branch(src, call)?;
+                }
                 Task::Else => self.ins(I::Else),
                 Task::End => {
                     self.labels.pop();
@@ -245,6 +256,7 @@ impl Emitter<'_> {
                 self.tasks.push(Task::Branch { src: b, call: then });
             }
             Opcode::BrTable => self.br_table(b, term)?,
+            Opcode::TryCall | Opcode::TryCallIndirect => self.try_call(b, term)?,
             _ => self.root(term)?,
         }
         Ok(())
@@ -308,19 +320,188 @@ impl Emitter<'_> {
         Ok(())
     }
 
+    /// A `try_call`. The call runs inside a `try_table` whose catch clauses
+    /// branch out to one wasm block per exception-table entry; the call's
+    /// results and the exception payload go to locals, from which the edges
+    /// pass them on as `ret`/`exn` arguments:
+    ///
+    /// ```text
+    /// block                        ;; entry n-1
+    ///   ...
+    ///     block (result payload)   ;; entry 0, a tag
+    ///       try_table (catch tag 0) ... (catch_all n-1)
+    ///         <args> call f
+    ///         local.set results
+    ///       end
+    ///       <normal edge>
+    ///     end
+    ///     local.set payload
+    ///     <edge of entry 0>
+    ///   ...
+    /// end
+    /// <edge of entry n-1>
+    /// ```
+    ///
+    /// Context items of the exception table are ignored: they tell a native
+    /// unwinder how to interpret tags, which `Env::exception_tag` resolves
+    /// statically here.
+    fn try_call(&mut self, b: Block, term: Inst) -> Result<()> {
+        let func = self.func;
+        let dfg = &func.dfg;
+        let pool = &dfg.value_lists;
+        let (func_ref, et) = match dfg.insts[term] {
+            InstructionData::TryCall {
+                func_ref,
+                exception,
+                ..
+            } => (Some(func_ref), exception),
+            InstructionData::TryCallIndirect { exception, .. } => (None, exception),
+            _ => unreachable!(),
+        };
+        let table = &dfg.exception_tables[et];
+        let sig_ref = table.signature();
+        let sig = &dfg.signatures[sig_ref];
+        let (_, results) = wasm_signature(sig)?;
+        let normal = *table.normal_return();
+        let entries: Vec<(Option<ExceptionTag>, BlockCall)> = table
+            .items()
+            .filter_map(|item| match item {
+                ExceptionTableItem::Tag(tag, call) => Some((Some(tag), call)),
+                ExceptionTableItem::Default(call) => Some((None, call)),
+                ExceptionTableItem::Context(_) => None,
+            })
+            .collect();
+
+        // The payload: the calling convention's, with pointer-sized values
+        // as wide as the handlers say (i64 if none uses them).
+        let exn_ty = |call: &BlockCall| {
+            let params = dfg.block_params(call.block(pool));
+            call.args(pool)
+                .zip(params)
+                .find_map(|(a, &p)| matches!(a, BlockArg::TryCallExn(_)).then(|| dfg.value_type(p)))
+        };
+        let ptr = entries
+            .iter()
+            .find_map(|(_, call)| exn_ty(call))
+            .unwrap_or(types::I64);
+        let payload_ir = sig.call_conv.exception_payload_types(ptr).to_vec();
+        if !entries.is_empty() && payload_ir.is_empty() {
+            return unsupported(format!("exceptions with calling convention {}", sig.call_conv));
+        }
+        for (tag, call) in &entries {
+            if tag.is_none() && exn_ty(call).is_some() {
+                return unsupported("catch-all handler using the exception payload");
+            }
+        }
+        let payload: Vec<ValType> = payload_ir.iter().map(|&t| wasm_type(t)).collect::<Result<_>>()?;
+        let payload_block = match payload[..] {
+            [] => BlockType::Empty,
+            [t] => BlockType::Result(t),
+            _ => {
+                let mut s = Signature::new(sig.call_conv);
+                s.returns.extend(payload_ir.iter().map(|&t| AbiParam::new(t)));
+                BlockType::FunctionType(self.env.type_index(&s)?)
+            }
+        };
+
+        // One label per entry, entry 0 innermost.
+        let mut catches = Vec::with_capacity(entries.len());
+        for (i, (tag, _)) in entries.iter().enumerate() {
+            let label = i as u32;
+            catches.push(match tag {
+                Some(tag) => Catch::One {
+                    tag: self.env.exception_tag(*tag)?,
+                    label,
+                },
+                None => Catch::All { label },
+            });
+        }
+        for (tag, _) in entries.iter().rev() {
+            self.ins(I::Block(if tag.is_some() {
+                payload_block
+            } else {
+                BlockType::Empty
+            }));
+            self.labels.push(Label::Other);
+        }
+
+        let result_locals: Vec<u32> = results.iter().map(|&t| self.new_local(t)).collect();
+        let payload_locals: Vec<u32> = payload.iter().map(|&t| self.new_local(t)).collect();
+        self.ins(I::TryTable(BlockType::Empty, Cow::Owned(catches)));
+        self.labels.push(Label::Other);
+        let args = dfg.inst_args(term);
+        match func_ref {
+            Some(func_ref) => {
+                for &a in args {
+                    self.value(a)?;
+                }
+                let name = &dfg.ext_funcs[func_ref].name;
+                let idx = self.env.func_index(Name::resolve(func, name))?;
+                self.ins(I::Call(idx));
+            }
+            None => {
+                for &a in &args[1..] {
+                    self.value(a)?;
+                }
+                self.value(args[0])?;
+                if dfg.value_type(args[0]) == types::I64 {
+                    self.ins(I::I32WrapI64);
+                }
+                let (type_index, table_index) = self.indirect_call(sig_ref)?;
+                self.ins(I::CallIndirect {
+                    type_index,
+                    table_index,
+                });
+            }
+        }
+        for &l in result_locals.iter().rev() {
+            self.ins(I::LocalSet(l));
+        }
+        self.labels.pop();
+        self.ins(I::End);
+        self.try_results[b] = result_locals;
+        self.try_payload[b] = payload_locals;
+
+        // After the i-th `end` comes the edge of the i-th entry.
+        for &(tag, call) in entries.iter().rev() {
+            self.tasks.push(Task::Catch {
+                src: b,
+                call,
+                payload: tag.is_some(),
+            });
+            self.tasks.push(Task::End);
+        }
+        self.tasks.push(Task::Branch { src: b, call: normal });
+        Ok(())
+    }
+
     /// Move the block arguments into the target's parameters and transfer
     /// control.
     fn branch(&mut self, src: Block, call: BlockCall) -> Result<()> {
         let func = self.func;
         let info = self.info;
-        let moves: Vec<_> = info
-            .live_arg_pairs(func, call)
-            .filter(|&(a, p)| self.locals.move_needed(a, p))
-            .collect();
-        for &(a, _) in &moves {
-            self.value(a)?;
+        let pool = &func.dfg.value_lists;
+        let params = func.dfg.block_params(call.block(pool));
+        // Push every argument, then set the parameters in reverse. The
+        // `ret`/`exn` arguments of a `try_call` edge come from locals.
+        let mut sets = Vec::new();
+        for (a, &p) in call.args(pool).zip(params) {
+            if !info.live_val[p] {
+                continue;
+            }
+            match a {
+                BlockArg::Value(a) if self.locals.move_needed(a, p) => self.value(a)?,
+                BlockArg::Value(_) => continue,
+                BlockArg::TryCallRet(i) => {
+                    self.ins(I::LocalGet(self.try_results[src][i as usize]))
+                }
+                BlockArg::TryCallExn(i) => {
+                    self.ins(I::LocalGet(self.try_payload[src][i as usize]))
+                }
+            }
+            sets.push(p);
         }
-        for &(_, p) in moves.iter().rev() {
+        for &p in sets.iter().rev() {
             self.ins(I::LocalSet(self.local(p)));
         }
 
