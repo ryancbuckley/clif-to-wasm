@@ -143,6 +143,11 @@ fn ops() -> Vec<Op> {
             |t| vec![t, t, t],
             |b, a, _| b.ins().bitselect(a[0], a[1], a[2]),
         ),
+        op(
+            "fma",
+            |t| vec![t, t, t],
+            |b, a, _| b.ins().fma(a[0], a[1], a[2]),
+        ),
         op("snarrow", wider2, |b, a, _| b.ins().snarrow(a[0], a[1])),
         op("unarrow", wider2, |b, a, _| b.ins().unarrow(a[0], a[1])),
         op("uunarrow", wider2, |b, a, _| b.ins().uunarrow(a[0], a[1])),

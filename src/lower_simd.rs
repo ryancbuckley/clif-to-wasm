@@ -670,6 +670,7 @@ impl Emitter<'_> {
                 });
             }
             (Opcode::Fma, _) if lane == Lane::F32 => self.fma_f32_lanes(vty)?,
+            (Opcode::Fma, _) if lane == Lane::F64 => self.fma_f64_lanes()?,
             (Opcode::Fcopysign, _) => {
                 // (x & ~sign) | (y & sign) == bitselect(x, y, ~sign).
                 self.operand()?;

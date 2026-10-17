@@ -21,15 +21,19 @@
 //! the last bit set if anything was lost). A round-to-odd result with at
 //! least two more bits than the target rounds to the correctly rounded
 //! target result (Boldo and Melquiond, "Emulation of FMA and correctly
-//! rounded sums: proved algorithms using rounding to odd", 2008). `f64`
-//! `fma` would need a wider type and is not supported.
+//! rounded sums: proved algorithms using rounding to odd", 2008).
+//!
+//! `fma` on `f64` (and `f64x2`) unpacks finite non-zero operands into
+//! 53-bit integer significands, computes the exact 106-bit product in a
+//! 128-bit `(lo, hi)` pair, aligns and adds/subtracts the third operand with
+//! a sticky bit, and rounds once to nearest-even.
 
 use crate::emit::Emitter;
 use crate::locals::Local;
 use crate::{Result, fixed_type, unsupported};
 use cranelift_codegen::ir::condcodes::FloatCC;
 use cranelift_codegen::ir::{Inst, Opcode, Type, types};
-use wasm_encoder::{Ieee32, Ieee64, Instruction as I, ValType};
+use wasm_encoder::{BlockType, Ieee32, Ieee64, Instruction as I, ValType};
 
 /// The instruction set for lowering a [`FloatCC`] comparison on a specific
 /// scalar or vector float type.
@@ -548,5 +552,547 @@ impl Emitter<'_> {
             });
         }
         Ok(())
+    }
+
+    /// `fma` on `f64x2` vector lanes, one lane at a time.
+    pub(crate) fn fma_f64_lanes(&mut self) -> Result<()> {
+        let vs = self.scratches::<3>(ValType::V128);
+        for &v in &vs {
+            self.operand()?;
+            self.local_set(v);
+        }
+        for lane in 0..2u8 {
+            for &v in &vs {
+                self.local_get(v);
+                self.ins(I::F64x2ExtractLane(lane));
+            }
+            self.fma_f64_exact();
+            self.ins(if lane == 0 {
+                I::F64x2Splat
+            } else {
+                I::F64x2ReplaceLane(lane)
+            });
+        }
+        Ok(())
+    }
+
+    /// Correctly rounded `a * b + c` on three `f64` values already on the
+    /// operand stack (`a` bottom, `b` middle, `c` top).
+    pub(crate) fn fma_f64_exact(&mut self) {
+        let mark = self.scratch_mark();
+        let [fa, fb, fc] = self.scratches(ValType::F64);
+        let [aa, ba, ca] = self.scratches(ValType::I64);
+        self.local_tee(fc);
+        self.ins(I::I64ReinterpretF64);
+        self.local_set(ca);
+        self.local_tee(fb);
+        self.ins(I::I64ReinterpretF64);
+        self.local_set(ba);
+        self.local_tee(fa);
+        self.ins(I::I64ReinterpretF64);
+        self.local_set(aa);
+
+        // Fast path 1: if a or b is ±0, ±Inf, or NaN, `a * b` has no rounding
+        // error, so `(a * b) + c` in standard f64 arithmetic is exact.
+        self.is_special_f64(aa);
+        self.is_special_f64(ba);
+        self.ins(I::I32Or);
+        self.ins(I::If(BlockType::Result(ValType::F64)));
+        self.local_get(fa);
+        self.local_get(fb);
+        self.ins(I::F64Mul);
+        self.local_get(fc);
+        self.ins(I::F64Add);
+        self.ins(I::Else);
+
+        // Fast path 2: a and b are finite and non-zero. If c is ±0, the exact
+        // real sum is `a * b != 0`, so `f64.mul(a, b)` rounds once with the
+        // right sign; if c is ±Inf or NaN, the result is `c + c`.
+        self.is_special_f64(ca);
+        self.ins(I::If(BlockType::Result(ValType::F64)));
+        self.local_get(fa);
+        self.local_get(fb);
+        self.ins(I::F64Mul);
+        self.local_get(fc);
+        self.local_get(fc);
+        self.ins(I::F64Add);
+        self.local_get(ca);
+        self.ins(I::I64Const(0x7fff_ffff_ffff_ffff));
+        self.ins(I::I64And);
+        self.ins(I::I64Eqz);
+        self.ins(I::Select);
+        self.ins(I::Else);
+
+        // Main path: a, b, and c are all finite and non-zero.
+        let (a_sign, a_exp, a_sig) = self.unpack_f64(aa);
+        let (b_sign, b_exp, b_sig) = self.unpack_f64(ba);
+        let (c_sign, c_exp, c_sig) = self.unpack_f64(ca);
+
+        // Exact 106-bit product p = a_sig * b_sig in [2^104, 2^106), shifted
+        // left by 19 or 20 bits so its leading 1-bit sits at bit 124 (bit 60
+        // of p_hi).
+        let [p_sign, p_exp, p_lo, p_hi, top, sh] = self.scratches(ValType::I64);
+        self.local_get(a_sign);
+        self.local_get(b_sign);
+        self.ins(I::I64Xor);
+        self.local_set(p_sign);
+
+        self.local_get(a_sig);
+        self.local_get(b_sig);
+        self.ins(I::I64Mul);
+        self.local_set(p_lo);
+        self.mulhi64_of(a_sig, b_sig, false);
+        self.local_tee(p_hi);
+        self.ins(I::I64Const(41));
+        self.ins(I::I64ShrU);
+        self.ins(I::I64Const(1));
+        self.ins(I::I64And);
+        self.local_set(top);
+
+        self.local_get(a_exp);
+        self.local_get(b_exp);
+        self.ins(I::I64Add);
+        self.ins(I::I64Const(1023));
+        self.ins(I::I64Sub);
+        self.local_get(top);
+        self.ins(I::I64Add);
+        self.local_set(p_exp);
+
+        self.ins(I::I64Const(20));
+        self.local_get(top);
+        self.ins(I::I64Sub);
+        self.local_set(sh);
+
+        self.local_get(p_hi);
+        self.local_get(sh);
+        self.ins(I::I64Shl);
+        self.local_get(p_lo);
+        self.ins(I::I64Const(44));
+        self.local_get(top);
+        self.ins(I::I64Add);
+        self.ins(I::I64ShrU);
+        self.ins(I::I64Or);
+        self.local_set(p_hi);
+
+        self.local_get(p_lo);
+        self.local_get(sh);
+        self.ins(I::I64Shl);
+        self.local_set(p_lo);
+
+        // Place c's 53-bit significand with its leading 1-bit at bit 124 too
+        // (c_hi = c_sig << 8, c_lo = 0).
+        let c_hi = c_sig;
+        self.local_get(c_sig);
+        self.ins(I::I64Const(8));
+        self.ins(I::I64Shl);
+        self.local_set(c_hi);
+
+        // Order (p, c) into (x, y) so |x| >= |y|. Since c_lo == 0,
+        // |p| < |c| iff p_exp < c_exp || (p_exp == c_exp && p_hi < c_hi).
+        let swap = self.scratch(ValType::I32);
+        self.local_get(p_exp);
+        self.local_get(c_exp);
+        self.ins(I::I64LtS);
+        self.local_get(p_exp);
+        self.local_get(c_exp);
+        self.ins(I::I64Eq);
+        self.local_get(p_hi);
+        self.local_get(c_hi);
+        self.ins(I::I64LtU);
+        self.ins(I::I32And);
+        self.ins(I::I32Or);
+        self.local_set(swap);
+
+        let [x_sign, y_sign, x_exp, y_exp, x_hi, y_hi, x_lo, y_lo] =
+            self.scratches(ValType::I64);
+        for (x, y, pv, cv) in [
+            (x_sign, y_sign, p_sign, c_sign),
+            (x_exp, y_exp, p_exp, c_exp),
+            (x_hi, y_hi, p_hi, c_hi),
+        ] {
+            self.local_get(cv);
+            self.local_get(pv);
+            self.local_get(swap);
+            self.ins(I::Select);
+            self.local_set(x);
+
+            self.local_get(pv);
+            self.local_get(cv);
+            self.local_get(swap);
+            self.ins(I::Select);
+            self.local_set(y);
+        }
+        self.ins(I::I64Const(0));
+        self.local_get(p_lo);
+        self.local_get(swap);
+        self.ins(I::Select);
+        self.local_set(x_lo);
+
+        self.local_get(p_lo);
+        self.ins(I::I64Const(0));
+        self.local_get(swap);
+        self.ins(I::Select);
+        self.local_set(y_lo);
+
+        // Align y to x's exponent, folding shifted-out bits into bit 0 of y_lo.
+        let d = self.scratch(ValType::I64);
+        self.local_get(x_exp);
+        self.local_get(y_exp);
+        self.ins(I::I64Sub);
+        self.local_set(d);
+        self.shr128_sticky(y_lo, y_hi, d);
+
+        // Add (if x_sign == y_sign) or subtract (if x_sign != y_sign).
+        let same_sign = self.scratch(ValType::I32);
+        let [add_lo, res_lo, res_hi] = self.scratches(ValType::I64);
+        self.local_get(x_sign);
+        self.local_get(y_sign);
+        self.ins(I::I64Eq);
+        self.local_set(same_sign);
+
+        self.local_get(x_lo);
+        self.local_get(y_lo);
+        self.ins(I::I64Add);
+        self.local_tee(add_lo);
+        self.local_get(x_lo);
+        self.local_get(y_lo);
+        self.ins(I::I64Sub);
+        self.local_get(same_sign);
+        self.ins(I::Select);
+        self.local_set(res_lo);
+
+        // add_hi = x_hi + y_hi + (add_lo <u x_lo)
+        self.local_get(x_hi);
+        self.local_get(y_hi);
+        self.ins(I::I64Add);
+        self.local_get(add_lo);
+        self.local_get(x_lo);
+        self.ins(I::I64LtU);
+        self.ins(I::I64ExtendI32U);
+        self.ins(I::I64Add);
+        // sub_hi = x_hi - y_hi - (x_lo <u y_lo)
+        self.local_get(x_hi);
+        self.local_get(y_hi);
+        self.ins(I::I64Sub);
+        self.local_get(x_lo);
+        self.local_get(y_lo);
+        self.ins(I::I64LtU);
+        self.ins(I::I64ExtendI32U);
+        self.ins(I::I64Sub);
+        self.local_get(same_sign);
+        self.ins(I::Select);
+        self.local_set(res_hi);
+
+        // Exact cancellation `x - x` yields +0.0 under round-to-nearest-even.
+        self.local_get(res_lo);
+        self.local_get(res_hi);
+        self.ins(I::I64Or);
+        self.ins(I::I64Eqz);
+        self.ins(I::If(BlockType::Result(ValType::F64)));
+        self.ins(I::F64Const(Ieee64::new(0)));
+        self.ins(I::Else);
+
+        // Normalize (res_lo, res_hi) so its MSB is at bit 124 (lz == 3).
+        let [lz, res_exp, lsh, sub_sh, exp_base, sig53, bits] = self.scratches(ValType::I64);
+        self.local_get(res_hi);
+        self.ins(I::I64Clz);
+        self.local_get(res_lo);
+        self.ins(I::I64Clz);
+        self.ins(I::I64Const(64));
+        self.ins(I::I64Add);
+        self.local_get(res_hi);
+        self.ins(I::I64Const(0));
+        self.ins(I::I64Ne);
+        self.ins(I::Select);
+        self.local_set(lz);
+
+        self.local_get(x_exp);
+        self.ins(I::I64Const(3));
+        self.ins(I::I64Add);
+        self.local_get(lz);
+        self.ins(I::I64Sub);
+        self.local_set(res_exp);
+
+        // If lz == 2 (addition carried into bit 125), shift right by 1 with sticky.
+        self.local_get(lz);
+        self.ins(I::I64Const(2));
+        self.ins(I::I64Eq);
+        self.ins(I::I64ExtendI32U);
+        self.local_set(d);
+        self.shr128_sticky(res_lo, res_hi, d);
+
+        // If lz > 3 (cancellation), shift left by lz - 3.
+        self.local_get(lz);
+        self.ins(I::I64Const(3));
+        self.ins(I::I64Sub);
+        self.max0(lsh);
+        self.local_set(lsh);
+        self.shl128(res_lo, res_hi, lsh);
+
+        // Denormalize if res_exp <= 0: shift right by 1 - res_exp with sticky.
+        self.ins(I::I64Const(1));
+        self.local_get(res_exp);
+        self.ins(I::I64Sub);
+        self.max0(sub_sh);
+        self.local_set(sub_sh);
+        self.shr128_sticky(res_lo, res_hi, sub_sh);
+
+        self.local_get(res_exp);
+        self.ins(I::I64Const(1));
+        self.ins(I::I64Sub);
+        self.max0(exp_base);
+        self.local_set(exp_base);
+
+        // Extract 53-bit significand (bits 8..=60 of res_hi), guard bit (bit 7),
+        // and sticky bit (bits 0..=6 of res_hi or any bit of res_lo).
+        self.local_get(res_hi);
+        self.ins(I::I64Const(8));
+        self.ins(I::I64ShrU);
+        self.local_set(sig53);
+
+        self.local_get(exp_base);
+        self.ins(I::I64Const(52));
+        self.ins(I::I64Shl);
+        self.local_get(sig53);
+        self.ins(I::I64Add);
+        // + (guard & (sticky | (sig53 & 1)))
+        self.local_get(res_hi);
+        self.ins(I::I64Const(7));
+        self.ins(I::I64ShrU);
+        self.ins(I::I64Const(1));
+        self.ins(I::I64And);
+        self.local_get(res_hi);
+        self.ins(I::I64Const(0x7f));
+        self.ins(I::I64And);
+        self.local_get(res_lo);
+        self.ins(I::I64Or);
+        self.ins(I::I64Const(0));
+        self.ins(I::I64Ne);
+        self.ins(I::I64ExtendI32U);
+        self.local_get(sig53);
+        self.ins(I::I64Const(1));
+        self.ins(I::I64And);
+        self.ins(I::I64Or);
+        self.ins(I::I64And);
+        self.ins(I::I64Add);
+        self.local_set(bits);
+
+        // Overflow to +Inf (0x7ff0_0000_0000_0000).
+        self.ins(I::I64Const(0x7ff0_0000_0000_0000));
+        self.local_get(bits);
+        self.local_get(res_exp);
+        self.ins(I::I64Const(2047));
+        self.ins(I::I64GeS);
+        self.local_get(bits);
+        self.ins(I::I64Const(0x7ff0_0000_0000_0000));
+        self.ins(I::I64GeU);
+        self.ins(I::I32Or);
+        self.ins(I::Select);
+        self.local_get(x_sign);
+        self.ins(I::I64Or);
+        self.ins(I::F64ReinterpretI64);
+
+        self.ins(I::End);
+        self.ins(I::End);
+        self.ins(I::End);
+        self.free_scratches(mark);
+    }
+
+    /// Push `1` (`i32`) if the `f64` bit pattern in `bits` is `±0`, `±Inf`, or `NaN`.
+    fn is_special_f64(&mut self, bits: Local) {
+        self.local_get(bits);
+        self.ins(I::I64Const(0x7fff_ffff_ffff_ffff));
+        self.ins(I::I64And);
+        self.ins(I::I64Const(1));
+        self.ins(I::I64Sub);
+        self.ins(I::I64Const(0x7fef_ffff_ffff_ffff));
+        self.ins(I::I64GeU);
+    }
+
+    /// Unpack a finite non-zero `f64` bit pattern into `(sign, exp, sig)` locals,
+    /// where `sign` is `bits & (1 << 63)`, `sig` is normalized in `[2^52, 2^53)`,
+    /// and `exp` is the biased exponent (`1023` for `1.0`).
+    fn unpack_f64(&mut self, bits: Local) -> (Local, Local, Local) {
+        let [sign, exp, sig, is_norm, sh] = self.scratches(ValType::I64);
+        self.local_get(bits);
+        self.ins(I::I64Const(i64::MIN)); // 0x8000_0000_0000_0000
+        self.ins(I::I64And);
+        self.local_set(sign);
+
+        self.local_get(bits);
+        self.ins(I::I64Const(52));
+        self.ins(I::I64ShrU);
+        self.ins(I::I64Const(0x7ff));
+        self.ins(I::I64And);
+        self.local_tee(exp);
+        self.ins(I::I64Const(0));
+        self.ins(I::I64Ne);
+        self.ins(I::I64ExtendI32U);
+        self.local_set(is_norm);
+
+        self.local_get(bits);
+        self.ins(I::I64Const((1 << 52) - 1));
+        self.ins(I::I64And);
+        self.local_get(is_norm);
+        self.ins(I::I64Const(52));
+        self.ins(I::I64Shl);
+        self.ins(I::I64Or);
+        self.local_tee(sig);
+        self.ins(I::I64Clz);
+        self.ins(I::I64Const(11));
+        self.ins(I::I64Sub);
+        self.local_set(sh);
+
+        self.local_get(sig);
+        self.local_get(sh);
+        self.ins(I::I64Shl);
+        self.local_set(sig);
+
+        self.local_get(exp);
+        self.ins(I::I64Const(1));
+        self.ins(I::I64Add);
+        self.local_get(is_norm);
+        self.ins(I::I64Sub);
+        self.local_get(sh);
+        self.ins(I::I64Sub);
+        self.local_set(exp);
+
+        (sign, exp, sig)
+    }
+
+    /// Shift `(lo, hi)` right in place by `d >= 0` bits, OR-ing any shifted-out
+    /// bits into bit 0 of `lo`. Assumes the MSB of `(lo, hi)` is at most bit 125.
+    fn shr128_sticky(&mut self, lo: Local, hi: Local, d: Local) {
+        let [sh, inv] = self.scratches(ValType::I64);
+        let [ge64, nz] = self.scratches(ValType::I32);
+
+        // Clamp d to at most 127.
+        self.local_get(d);
+        self.ins(I::I64Const(127));
+        self.local_get(d);
+        self.ins(I::I64Const(127));
+        self.ins(I::I64LtS);
+        self.ins(I::Select);
+        self.local_tee(sh);
+        self.ins(I::I64Const(64));
+        self.ins(I::I64GeU);
+        self.local_set(ge64);
+
+        // Step 1: if sh >= 64, shift right by 64 with sticky.
+        self.local_get(hi);
+        self.local_get(lo);
+        self.ins(I::I64Const(0));
+        self.ins(I::I64Ne);
+        self.ins(I::I64ExtendI32U);
+        self.ins(I::I64Or);
+        self.local_get(lo);
+        self.local_get(ge64);
+        self.ins(I::Select);
+        self.local_set(lo);
+
+        self.ins(I::I64Const(0));
+        self.local_get(hi);
+        self.local_get(ge64);
+        self.ins(I::Select);
+        self.local_set(hi);
+
+        // Step 2: shift right by (sh & 63) in 0..=63 with sticky.
+        self.local_get(sh);
+        self.ins(I::I64Const(63));
+        self.ins(I::I64And);
+        self.local_tee(sh);
+        self.ins(I::I64Const(0));
+        self.ins(I::I64Ne);
+        self.local_set(nz);
+
+        self.ins(I::I64Const(64));
+        self.local_get(sh);
+        self.ins(I::I64Sub);
+        self.local_set(inv);
+
+        self.local_get(lo);
+        self.local_get(sh);
+        self.ins(I::I64ShrU);
+        self.local_get(hi);
+        self.local_get(inv);
+        self.ins(I::I64Shl);
+        self.ins(I::I64Or);
+        self.local_get(lo);
+        self.local_get(inv);
+        self.ins(I::I64Shl);
+        self.ins(I::I64Const(0));
+        self.ins(I::I64Ne);
+        self.ins(I::I64ExtendI32U);
+        self.ins(I::I64Or);
+        self.local_get(lo);
+        self.local_get(nz);
+        self.ins(I::Select);
+        self.local_set(lo);
+
+        self.local_get(hi);
+        self.local_get(sh);
+        self.ins(I::I64ShrU);
+        self.local_get(hi);
+        self.local_get(nz);
+        self.ins(I::Select);
+        self.local_set(hi);
+    }
+
+    /// Shift `(lo, hi)` left in place by `d` in `0..=127` bits.
+    fn shl128(&mut self, lo: Local, hi: Local, d: Local) {
+        let [sh, inv] = self.scratches(ValType::I64);
+        let [ge64, nz] = self.scratches(ValType::I32);
+
+        self.local_get(d);
+        self.ins(I::I64Const(64));
+        self.ins(I::I64GeU);
+        self.local_set(ge64);
+
+        // Step 1: if d >= 64, shift left by 64.
+        self.local_get(lo);
+        self.local_get(hi);
+        self.local_get(ge64);
+        self.ins(I::Select);
+        self.local_set(hi);
+
+        self.ins(I::I64Const(0));
+        self.local_get(lo);
+        self.local_get(ge64);
+        self.ins(I::Select);
+        self.local_set(lo);
+
+        // Step 2: shift left by (d & 63) in 0..=63.
+        self.local_get(d);
+        self.ins(I::I64Const(63));
+        self.ins(I::I64And);
+        self.local_tee(sh);
+        self.ins(I::I64Const(0));
+        self.ins(I::I64Ne);
+        self.local_set(nz);
+
+        self.ins(I::I64Const(64));
+        self.local_get(sh);
+        self.ins(I::I64Sub);
+        self.local_set(inv);
+
+        self.local_get(hi);
+        self.local_get(sh);
+        self.ins(I::I64Shl);
+        self.local_get(lo);
+        self.local_get(inv);
+        self.ins(I::I64ShrU);
+        self.ins(I::I64Or);
+        self.local_get(hi);
+        self.local_get(nz);
+        self.ins(I::Select);
+        self.local_set(hi);
+
+        self.local_get(lo);
+        self.local_get(sh);
+        self.ins(I::I64Shl);
+        self.local_get(lo);
+        self.local_get(nz);
+        self.ins(I::Select);
+        self.local_set(lo);
     }
 }

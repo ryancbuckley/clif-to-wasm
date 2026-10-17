@@ -308,6 +308,207 @@ block0(v0: f32, v1: f32, v2: f32):
 }
 
 #[test]
+fn fma_f64_matches_mul_add() {
+    let (mut store, inst) = instance(
+        "
+function %fma(f64, f64, f64) -> f64 {
+block0(v0: f64, v1: f64, v2: f64):
+    v3 = fma v0, v1, v2
+    return v3
+}
+",
+    );
+    let fma = func::<(f64, f64, f64), f64>(&mut store, &inst, "fma");
+    let mut rng = Rng(0xf64a);
+    let check = |store: &mut Store<()>, a: f64, b: f64, c: f64| {
+        let got = fma.call(&mut *store, (a, b, c)).unwrap();
+        let want = a.mul_add(b, c);
+        assert!(
+            got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan()),
+            "fma({a:e} ({:#x}), {b:e} ({:#x}), {c:e} ({:#x})) = {got:e} ({:#x}), want {want:e} ({:#x})",
+            a.to_bits(),
+            b.to_bits(),
+            c.to_bits(),
+            got.to_bits(),
+            want.to_bits(),
+        );
+    };
+
+    // Special values: ±0, subnormals, ±1, ±MAX, ±MIN_POSITIVE, ±Inf, NaNs.
+    let specials = [
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+        2.0,
+        -2.0,
+        0.5,
+        -0.5,
+        f64::MIN_POSITIVE,
+        -f64::MIN_POSITIVE,
+        f64::from_bits(1),
+        f64::from_bits(0x8000_0000_0000_0001),
+        f64::from_bits(0x000f_ffff_ffff_ffff),
+        f64::from_bits(0x800f_ffff_ffff_ffff),
+        f64::MAX,
+        f64::MIN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+        f64::from_bits(0x7ff0_0000_0000_0001), // sNaN
+        1e200,
+        -1e200,
+        1e-200,
+        -1e-200,
+    ];
+    for &a in &specials {
+        for &b in &specials {
+            for &c in &specials {
+                check(&mut store, a, b, c);
+            }
+        }
+    }
+
+    for _ in 0..200_000 {
+        let a = f64::from_bits(rng.next());
+        let b = f64::from_bits(rng.next());
+        let c = f64::from_bits(rng.next());
+        check(&mut store, a, b, c);
+        // Cancellation: c near -(a * b).
+        let a = (rng.next() as u32 % 2_000_000) as f64 / 1024.0 - 900.0;
+        let b = (rng.next() as u32 % 2_000_000) as f64 / 1024.0 - 900.0;
+        let near = -(a * b);
+        let c = f64::from_bits(near.to_bits().wrapping_add(rng.next() % 5).wrapping_sub(2));
+        check(&mut store, a, b, c);
+        //Exact cancellation (a * b + -(a * b)) when product is exact.
+        check(&mut store, a, b, near);
+        // Subnormal products and sums.
+        let sa = f64::from_bits((rng.next() & 0x001f_ffff_ffff_ffff) | (rng.next() & (1 << 63)));
+        let sb = f64::from_bits((0x3cb0_0000_0000_0000) | (rng.next() & 0x001f_ffff_ffff_ffff));
+        let sc = f64::from_bits((rng.next() & 0x001f_ffff_ffff_ffff) | (rng.next() & (1 << 63)));
+        check(&mut store, sa, sb, sc);
+    }
+
+    // Halfway / tie-to-even cases: (1 + 2^-52) * (1 - 2^-52) = 1 - 2^-104.
+    // Adding c = 1.0 + k * 2^-52 exercises exact midpoints and 1-bit-past-midpoint.
+    let a = 1.0 + f64::EPSILON;
+    let b = 1.0 - f64::EPSILON;
+    for k in -16..=16 {
+        let c = (k as f64) * f64::EPSILON;
+        check(&mut store, a, b, c);
+        check(&mut store, -a, b, -c);
+        check(&mut store, a, b, 1.0 + c);
+        check(&mut store, a, b, -1.0 + c);
+    }
+
+    // Cancellation where p_hi == c_hi and only p_lo is non-zero:
+    // (1 + 2^-52)^2 - (1 + 2^-51) = 2^-104.
+    let a = 1.0 + f64::EPSILON;
+    let c = -(1.0 + 2.0 * f64::EPSILON);
+    check(&mut store, a, a, c);
+    assert_eq!(fma.call(&mut store, (a, a, c)).unwrap(), 2f64.powi(-104));
+
+    // Product overflows f64::MAX, but + c brings it back into finite range:
+    // 1.5 * f64::MAX - f64::MAX = 0.5 * f64::MAX.
+    check(&mut store, f64::MAX, 1.5, -f64::MAX);
+    assert_eq!(
+        fma.call(&mut store, (f64::MAX, 1.5, -f64::MAX)).unwrap(),
+        0.5 * f64::MAX
+    );
+
+    // Finite product that would overflow f64.mul to +Inf, plus -Inf, must be -Inf (not NaN).
+    check(&mut store, 1e200, 1e200, f64::NEG_INFINITY);
+    assert_eq!(
+        fma.call(&mut store, (1e200, 1e200, f64::NEG_INFINITY)).unwrap(),
+        f64::NEG_INFINITY
+    );
+    check(&mut store, -1e200, 1e200, f64::INFINITY);
+    assert_eq!(
+        fma.call(&mut store, (-1e200, 1e200, f64::INFINITY)).unwrap(),
+        f64::INFINITY
+    );
+
+    // Signed zero rules:
+    // 1) Underflowing negative product + (+0.0) must preserve -0.0.
+    check(&mut store, -1e-300, 1e-300, 0.0);
+    assert_eq!(
+        fma.call(&mut store, (-1e-300, 1e-300, 0.0)).unwrap().to_bits(),
+        (-0.0f64).to_bits()
+    );
+    // 2) Non-zero difference of finite non-zero operands that underflows below 2^-1075
+    //    must preserve the sign of the mathematical difference (-0.0 vs +0.0).
+    let tiny_a = 2f64.powi(-537);
+    let tiny_b = 2f64.powi(-537) * (1.0 - f64::EPSILON);
+    let min_sub = f64::from_bits(1); // 2^-1074
+    check(&mut store, tiny_a, tiny_b, -min_sub);
+    assert_eq!(
+        fma.call(&mut store, (tiny_a, tiny_b, -min_sub)).unwrap().to_bits(),
+        (-0.0f64).to_bits()
+    );
+    check(&mut store, -tiny_a, tiny_b, min_sub);
+    assert_eq!(
+        fma.call(&mut store, (-tiny_a, tiny_b, min_sub)).unwrap().to_bits(),
+        0.0f64.to_bits()
+    );
+
+    // The double-rounding trap for f64: c has an odd LSB, and a * b is
+    // 0.5 * ulp(c) * (1 - 2^-104). Rounding a * b first gives 0.5 * ulp(c),
+    // which ties to even (c + ulp(c)), whereas single rounding stays at c.
+    let c = 1.0 + f64::EPSILON;
+    let da = 2f64.powi(-26) * (1.0 + f64::EPSILON);
+    let db = 2f64.powi(-27) * (1.0 - f64::EPSILON);
+    for (da, c) in [(da, c), (-da, -c)] {
+        check(&mut store, da, db, c);
+        assert_eq!(fma.call(&mut store, (da, db, c)).unwrap().to_bits(), c.to_bits());
+    }
+
+    // Subnormal-to-normal rounding carry: largest subnormal + 0.5 * min_subnormal
+    // ties to even -> f64::MIN_POSITIVE (0x0010_0000_0000_0000).
+    let max_sub = f64::from_bits(0x000f_ffff_ffff_ffff);
+    check(&mut store, min_sub, 0.5, max_sub);
+    assert_eq!(
+        fma.call(&mut store, (min_sub, 0.5, max_sub)).unwrap().to_bits(),
+        f64::MIN_POSITIVE.to_bits()
+    );
+
+    // Overflow threshold around f64::MAX:
+    // f64::MAX + 0.5 * ulp(f64::MAX) rounds to +Inf (since f64::MAX has odd LSB),
+    // while f64::MAX + 0.5 * ulp(f64::MAX) * (1 - 2^-52) stays f64::MAX.
+    let half_ulp_max = 2f64.powi(1023 - 53);
+    check(&mut store, half_ulp_max, 1.0, f64::MAX);
+    assert_eq!(
+        fma.call(&mut store, (half_ulp_max, 1.0, f64::MAX)).unwrap(),
+        f64::INFINITY
+    );
+    check(&mut store, half_ulp_max, 1.0 - f64::EPSILON, f64::MAX);
+    assert_eq!(
+        fma.call(&mut store, (half_ulp_max, 1.0 - f64::EPSILON, f64::MAX)).unwrap(),
+        f64::MAX
+    );
+
+    // Every exponent shift delta d in 0..=140 across shr128_sticky and shl128 boundaries.
+    for d in 0..=140 {
+        let p_scale = 2f64.powi(200);
+        let c_scale = 2f64.powi(200 - d);
+        for (sa, sc) in [(1.0, 1.0), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0)] {
+            check(
+                &mut store,
+                sa * p_scale * (1.0 + f64::EPSILON),
+                1.0 + 3.0 * f64::EPSILON,
+                sc * c_scale * (1.0 + 7.0 * f64::EPSILON),
+            );
+            // Also with |c| > |a * b| so p is the shifted operand.
+            check(
+                &mut store,
+                sa * c_scale * (1.0 + f64::EPSILON),
+                1.0 + 3.0 * f64::EPSILON,
+                sc * p_scale * (1.0 + 7.0 * f64::EPSILON),
+            );
+        }
+    }
+}
+
+#[test]
 fn fma_f16_matches_exact_arithmetic() {
     let (mut store, inst) = instance(
         "

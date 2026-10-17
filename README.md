@@ -146,6 +146,10 @@ results:
   `fneg`, `fabs` and `fcopysign` are bit operations.
 - `fma` on `f32` and `f16` (scalar and `f32` vector lanes) computes the sum
   in `f64` rounded to odd, then rounds once to the result type.
+- `fma` on `f64` (scalar and `f64x2` vector lanes) unpacks finite non-zero
+  operands into 53-bit integer significands, computes the exact 106-bit
+  product in a 128-bit `(lo, hi)` pair, aligns and adds/subtracts the third
+  operand with a sticky bit, and rounds once to nearest-even.
 
 Vectors of 128 bits (`i8x16`, `i16x8`, `i32x4`, `i64x2`, `f32x4`, `f64x2`)
 map to `v128` (`src/lower_simd.rs`); so do narrower ones (`i32x2`, `i8x8`,
@@ -172,8 +176,7 @@ instruction. These have no direct wasm counterpart and are emulated:
 Not yet supported (functions using these return `Error::Unsupported`):
 
 - `f128` arithmetic and conversions (matching Cranelift's x64/aarch64/riscv64
-  backends), and `fma` on `f64` (scalar or `f64x2`), which would need a wider
-  type to round through.
+  backends).
 - `i128` atomics, and `umul_overflow`/`smul_overflow`/`umulhi`/`smulhi` on
   `i128`.
 - Big-endian vector loads and stores, and arithmetic on `f16` lanes.

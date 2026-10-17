@@ -48,6 +48,12 @@ impl Emitter<'_> {
                 })?;
                 self.ins(I::F32DemoteF64);
             }
+            (Opcode::Fma, _) if ty == types::F64 => {
+                self.operand()?;
+                self.operand()?;
+                self.operand()?;
+                self.fma_f64_exact();
+            }
 
             // Integer arithmetic.
             (Opcode::Iadd | Opcode::Isub | Opcode::Imul, _) => {
