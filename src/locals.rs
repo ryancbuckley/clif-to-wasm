@@ -44,18 +44,40 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use wasm_encoder::ValType;
 
-pub(crate) const NO_LOCAL: u32 = u32::MAX;
+/// Index of a WebAssembly local variable within a function (parameters
+/// `0..num_params` followed by declared locals).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub(crate) struct Local(pub u32);
+
+impl Local {
+    pub const NONE: Self = Self(u32::MAX);
+}
+
+impl Default for Local {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
 
 /// How many existing locals a value may be checked against for a
 /// non-overlapping slot, beyond its move partners and the free list.
 const SCAN_LIMIT: usize = 32;
 
-/// A half-open interval `[lo, hi)` of instruction positions.
-type Segment = (u32, u32);
+/// A program point in the linearized RPO instruction sequence (block starts,
+/// root instructions, and block ends).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+struct Pos(u32);
+
+/// Per-value visitation stamp in [`Scratch`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+struct Stamp(u32);
+
+/// A half-open interval `[lo, hi)` of program positions.
+type Segment = (Pos, Pos);
 
 pub(crate) struct Locals {
-    /// The local holding each value, or `NO_LOCAL`.
-    pub local_of: SecondaryMap<Value, u32>,
+    /// The local holding each value, or [`Local::NONE`].
+    pub local_of: SecondaryMap<Value, Local>,
     /// Types of the declared locals, starting after the parameters.
     pub decls: Vec<ValType>,
     pub num_params: u32,
@@ -75,7 +97,7 @@ impl Locals {
     /// target either (they are all defined at the same terminator).
     pub fn move_needed(&self, arg: Value, param: Value) -> bool {
         let la = self.local_of[arg];
-        la == NO_LOCAL || la != self.local_of[param]
+        la == Local::NONE || la != self.local_of[param]
     }
 }
 
@@ -88,7 +110,7 @@ pub(crate) fn allocate(
     let ranges = compute_live_ranges(func, info, trees);
     let entry_params = func.dfg.block_params(info.rpo[0]);
     let num_params = entry_params.len() as u32;
-    let mut local_of = SecondaryMap::with_default(NO_LOCAL);
+    let mut local_of = SecondaryMap::with_default(Local::NONE);
     let moves = if coalesce { &ranges.moves[..] } else { &[] };
     let partners = Buckets::new(
         func.dfg.num_values(),
@@ -105,18 +127,18 @@ pub(crate) fn allocate(
     for (v, segs) in ranges.iter() {
         let ty = wasm_type(func.dfg.value_type(v))?;
         let (lo, hi) = (segs[0].0, segs.last().unwrap().1);
-        let fits = |slots: &[Slot], l: u32| {
-            let s = &slots[l as usize];
+        let fits = |slots: &[Slot], l: Local| {
+            let s = &slots[l.0 as usize];
             s.ty == ty && !overlaps(&s.segs, segs)
         };
 
-        let chosen = if local_of[v] != NO_LOCAL {
+        let chosen = if local_of[v] != Local::NONE {
             local_of[v]
         } else if let Some(l) = partners
             .get(v)
             .iter()
             .map(|&w| local_of[w])
-            .find(|&l| l != NO_LOCAL && fits(&slots, l))
+            .find(|&l| l != Local::NONE && fits(&slots, l))
         {
             l
         } else {
@@ -130,7 +152,7 @@ pub(crate) fn allocate(
                 .unwrap_or_else(|| new_slot(&mut slots, &mut classes, ty))
         };
 
-        let slot = &mut slots[chosen as usize];
+        let slot = &mut slots[chosen.0 as usize];
         merge_into(&mut slot.segs, segs);
         slot.end = slot.end.max(hi);
         let end = slot.end;
@@ -178,26 +200,26 @@ fn needs_local(func: &Function, info: &FuncInfo, trees: &ExprTrees, v: Value) ->
 
 /// Per-block scratch state for building one value's segments.
 struct Scratch {
-    stamp: SecondaryMap<Block, u32>,
-    live_in: SecondaryMap<Block, u32>,
-    lo: SecondaryMap<Block, u32>,
-    hi: SecondaryMap<Block, u32>,
+    stamp: SecondaryMap<Block, Stamp>,
+    live_in: SecondaryMap<Block, Stamp>,
+    lo: SecondaryMap<Block, Pos>,
+    hi: SecondaryMap<Block, Pos>,
     term_def: SecondaryMap<Block, bool>,
     touched: Vec<Block>,
 }
 
 impl Scratch {
-    fn touch(&mut self, b: Block, cur: u32) {
+    fn touch(&mut self, b: Block, cur: Stamp) {
         if self.stamp[b] != cur {
             self.stamp[b] = cur;
-            self.lo[b] = u32::MAX;
-            self.hi[b] = 0;
+            self.lo[b] = Pos(u32::MAX);
+            self.hi[b] = Pos(0);
             self.term_def[b] = false;
             self.touched.push(b);
         }
     }
 
-    fn add(&mut self, b: Block, cur: u32, p: u32) {
+    fn add(&mut self, b: Block, cur: Stamp, p: Pos) {
         self.touch(b, cur);
         self.lo[b] = self.lo[b].min(p);
         self.hi[b] = self.hi[b].max(p);
@@ -206,27 +228,27 @@ impl Scratch {
 
 fn compute_live_ranges(func: &Function, info: &FuncInfo, trees: &ExprTrees) -> LiveRanges {
     let entry = info.rpo[0];
-    let mut pos: SecondaryMap<Inst, u32> = SecondaryMap::new();
-    let mut start: SecondaryMap<Block, u32> = SecondaryMap::new();
-    let mut end: SecondaryMap<Block, u32> = SecondaryMap::new();
-    let mut p = 0;
+    let mut pos: SecondaryMap<Inst, Pos> = SecondaryMap::new();
+    let mut start: SecondaryMap<Block, Pos> = SecondaryMap::new();
+    let mut end: SecondaryMap<Block, Pos> = SecondaryMap::new();
+    let mut p = 0u32;
     for &b in &info.rpo {
-        start[b] = p;
+        start[b] = Pos(p);
         p += 1;
         for inst in func.layout.block_insts(b) {
             if trees.is_root(inst) {
-                pos[inst] = p;
+                pos[inst] = Pos(p);
                 p += 1;
             }
         }
-        end[b] = p;
+        end[b] = Pos(p);
         p += 1;
     }
     let term_pos = |b: Block| pos[func.layout.last_inst(b).unwrap()];
 
     // Collect uses of each value that needs a local, and block-argument moves.
     let is_local = |v: Value| needs_local(func, info, trees, v);
-    let mut use_list: Vec<(Value, Block, u32)> = Vec::new();
+    let mut use_list: Vec<(Value, Block, Pos)> = Vec::new();
     let mut moves: Vec<(Value, Value)> = Vec::new();
     let mut ops: Vec<Operand> = Vec::new();
     for &b in &info.rpo {
@@ -270,7 +292,7 @@ fn compute_live_ranges(func: &Function, info: &FuncInfo, trees: &ExprTrees) -> L
         if v_uses.is_empty() {
             continue;
         }
-        let cur = vi as u32 + 1;
+        let cur = Stamp(vi as u32 + 1);
         scratch.touched.clear();
         let def_block = match func.dfg.value_def(v) {
             ValueDef::Result(d, _) => {
@@ -405,33 +427,33 @@ struct Slot {
     ty: ValType,
     segs: Vec<Segment>,
     /// The end of the last segment.
-    end: u32,
+    end: Pos,
 }
 
 /// The locals of one wasm type.
 struct Class {
     ty: ValType,
-    all: Vec<u32>,
-    /// (end, local) min-heap. Entries whose end is stale are skipped.
-    ends: BinaryHeap<Reverse<(u32, u32)>>,
+    all: Vec<Local>,
+    /// `(end, local)` min-heap. Entries whose end is stale are skipped.
+    ends: BinaryHeap<Reverse<(Pos, Local)>>,
     /// Locals that the heap showed to end at or before some earlier start.
-    free: Vec<u32>,
+    free: Vec<Local>,
 }
 
 impl Class {
     /// A local whose segments all end at or before `lo`.
-    fn take_free(&mut self, slots: &[Slot], lo: u32) -> Option<u32> {
+    fn take_free(&mut self, slots: &[Slot], lo: Pos) -> Option<Local> {
         while let Some(&Reverse((end, l))) = self.ends.peek() {
             if end > lo {
                 break;
             }
             self.ends.pop();
-            if slots[l as usize].end == end {
+            if slots[l.0 as usize].end == end {
                 self.free.push(l);
             }
         }
         while let Some(l) = self.free.pop() {
-            if slots[l as usize].end <= lo {
+            if slots[l.0 as usize].end <= lo {
                 return Some(l);
             }
         }
@@ -455,12 +477,12 @@ fn class_of(classes: &mut Vec<Class>, ty: ValType) -> &mut Class {
     &mut classes[i]
 }
 
-fn new_slot(slots: &mut Vec<Slot>, classes: &mut Vec<Class>, ty: ValType) -> u32 {
-    let l = slots.len() as u32;
+fn new_slot(slots: &mut Vec<Slot>, classes: &mut Vec<Class>, ty: ValType) -> Local {
+    let l = Local(slots.len() as u32);
     slots.push(Slot {
         ty,
         segs: Vec::new(),
-        end: 0,
+        end: Pos(0),
     });
     class_of(classes, ty).all.push(l);
     l

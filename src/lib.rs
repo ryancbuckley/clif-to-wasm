@@ -45,7 +45,9 @@ mod lower_simd;
 pub mod module;
 mod structure;
 
-pub use module::ModuleBuilder;
+pub use module::{
+    Export, FuncIndex, GlobalIndex, MemoryIndex, ModuleBuilder, TableIndex, TagIndex, TypeIndex,
+};
 
 /// Errors that can occur during compilation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,23 +96,24 @@ pub struct ModuleLayout {
     /// pointer. IR addresses of the other width are converted.
     pub memory64: bool,
     /// Which linear memory loads and stores access. A module can have
-    /// several (the multi-memory feature); with one memory this is 0.
-    pub memory_index: u32,
+    /// several (the multi-memory feature); with one memory this is
+    /// `MemoryIndex(0)`.
+    pub memory_index: MemoryIndex,
     /// Which table `call_indirect` looks functions up in. Wasm has no raw
     /// function pointers: a function "address" is an index into a table of
-    /// function references. With one table this is `Some(0)`. With `None`,
-    /// functions that use `call_indirect` are rejected.
-    pub table_index: Option<u32>,
+    /// function references. With one table this is `Some(TableIndex(0))`. With
+    /// `None`, functions that use `call_indirect` are rejected.
+    pub table_index: Option<TableIndex>,
     /// A mutable global holding the shadow stack pointer. Stack slots must
     /// live in linear memory, since wasm has no addressable stack; functions
     /// that use them move this pointer down on entry and back on exit. The
     /// stack grows downwards and the pointer is assumed to be 16-byte
     /// aligned. With `None`, functions that need stack slots are rejected.
-    pub stack_pointer_global: Option<u32>,
+    pub stack_pointer_global: Option<GlobalIndex>,
     /// A mutable `i64` global standing in for Cranelift's pinned register
     /// (`get_pinned_reg`/`set_pinned_reg`). With `None`, functions that use
     /// it are rejected.
-    pub pinned_reg_global: Option<u32>,
+    pub pinned_reg_global: Option<GlobalIndex>,
 }
 
 impl ModuleLayout {
@@ -213,17 +216,17 @@ pub enum SymbolValue {
     /// A link-time constant address.
     Const(u64),
     /// An address held in a wasm global.
-    Global(u32),
+    Global(GlobalIndex),
 }
 
 /// The module environment: resolves references from a function to entities
 /// in the surrounding wasm module.
 pub trait Env {
     /// The wasm function index of a direct callee.
-    fn func_index(&mut self, name: Name<'_>) -> Result<u32>;
+    fn func_index(&mut self, name: Name<'_>) -> Result<FuncIndex>;
 
     /// The wasm type index of a signature, for `call_indirect`.
-    fn type_index(&mut self, sig: &Signature) -> Result<u32> {
+    fn type_index(&mut self, sig: &Signature) -> Result<TypeIndex> {
         let _ = sig;
         Err(Error::Env("call_indirect requires Env::type_index".into()))
     }
@@ -248,7 +251,7 @@ pub trait Env {
     /// callee's calling convention: two pointer-sized integers (`i64`, or
     /// `i32` if the handlers' payload values are `i32`). Exceptions are
     /// thrown by the embedder's runtime with wasm `throw`.
-    fn exception_tag(&mut self, tag: ir::ExceptionTag) -> Result<u32> {
+    fn exception_tag(&mut self, tag: ir::ExceptionTag) -> Result<TagIndex> {
         Err(Error::Env(format!(
             "exception tag {tag} requires Env::exception_tag"
         )))
@@ -320,12 +323,13 @@ pub(crate) fn fixed_type(ty: ir::Type) -> ir::Type {
 
 /// The wasm signature of a Cranelift signature.
 ///
-/// An `i128` parameter or return value becomes two `i64`s, low half first.
+/// An `i128` or `f128` parameter or return value becomes two `i64`s, low half
+/// first.
 pub fn wasm_signature(sig: &Signature) -> Result<(Vec<ValType>, Vec<ValType>)> {
     let lower = |ps: &[ir::AbiParam]| -> Result<Vec<ValType>> {
         let mut out = Vec::with_capacity(ps.len());
         for p in ps {
-            if p.value_type == ir::types::I128 {
+            if matches!(p.value_type, ir::types::I128 | ir::types::F128) {
                 out.extend([ValType::I64, ValType::I64]);
             } else {
                 out.push(wasm_type(p.value_type)?);

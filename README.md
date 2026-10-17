@@ -16,7 +16,7 @@ not need. The backend works directly on the IR instead.
 
 | Pass | File | What it does | Switch |
 |------|------|--------------|--------|
-| Prepare & Legalize | `src/legalize_i128.rs` | Scans once for value aliases and `i128`; when present, clones the function, resolves aliases, and rewrites `i128` values into `(lo, hi)` pairs of `i64` (signatures, block params, calls) before anything else runs | |
+| Prepare & Legalize | `src/legalize_i128.rs` | Scans once for value aliases and `i128`/`f128`; when present, clones the function, resolves aliases, and rewrites 128-bit scalar values into `(lo, hi)` pairs of `i64` (signatures, block params, calls) before anything else runs | |
 | Analysis | `src/analysis.rs` | RPO, deduplicated CFG edges, dominators, loop headers, merge nodes, reducibility, and single-pass backwards value/instruction liveness + use counts | |
 | Expression trees | `src/expr_trees.rs` | Greedy backwards tree building: a single-use def in the same block is folded into its user unless that would reorder side effects. The check is O(1) using Cranelift-style side-effect colors. Constants are rematerialized at every use. `operands()` here defines evaluation order for every later pass | `stack_values` |
 | Locals | `src/locals.rs` | Builds per-block live-range segments for values that need a local, collects block-argument moves, and performs greedy coloring per wasm type. A value first tries its move partner's local (argument ↔ parameter), so most block-argument moves disappear | `coalesce` |
@@ -59,11 +59,11 @@ accept only pure trees, so an unconditional effect never becomes conditional.
 ## Usage
 
 ```rust
-use cranelift_wasm_backend::{compile_function, Config, Env, Name, Result};
+use cranelift_wasm_backend::{compile_function, Config, Env, FuncIndex, Name, Result};
 
 struct MyEnv;
 impl Env for MyEnv {
-    fn func_index(&mut self, name: Name<'_>) -> Result<u32> {
+    fn func_index(&mut self, name: Name<'_>) -> Result<FuncIndex> {
         // Map a callee to its wasm function index.
         todo!()
     }
@@ -114,15 +114,20 @@ read-modify-writes that wasm has (`add`, `sub`, `and`, `or`, `xor`,
 `xchg`). `nand`, `umin`/`umax`/`smin`/`smax` and big-endian
 read-modify-writes become a compare-exchange loop.
 
-`i128` is supported by legalizing it into pairs of `i64`
-(`src/legalize_i128.rs`). At the wasm level an `i128` parameter or result is
-two `i64`s, low half first. Arithmetic, bitwise ops, shifts and rotates,
-comparisons, `select`, extensions and truncations, `clz`/`ctz`/`popcnt`/
-`cls`, `bswap`/`bitrev`, loads and stores, calls, block parameters, add and
-subtract with an overflow flag, and bitcasts to and from 128-bit vectors
-expand into `i64` code. Division and remainder become a 128-iteration
-shift-subtract loop, and conversions from `i128` to floats are correctly
-rounded (round to odd, then convert).
+`i128` and `f128` are supported by legalizing them into pairs of `i64`
+(`src/legalize_i128.rs`). At the wasm level an `i128` or `f128` parameter or
+result is two `i64`s, low half first. For `i128`, arithmetic, bitwise ops,
+shifts and rotates, comparisons, `select`, extensions and truncations,
+`clz`/`ctz`/`popcnt`/`cls`, `bswap`/`bitrev`, loads and stores, calls, block
+parameters, add and subtract with an overflow flag, and bitcasts to and from
+128-bit vectors expand into `i64` code; division and remainder become a
+128-iteration shift-subtract loop, and conversions from `i128` to floats are
+correctly rounded (round to odd, then convert). For `f128`, constants
+(`f128const`), loads, stores, calls, block parameters, `select`, bitwise ops,
+`fneg`/`fabs`/`fcopysign`, and bitcasts to and from `i128` and 128-bit vectors
+are supported — the same surface that Cranelift's own `x64`, `aarch64`, and
+`riscv64` backends implement (relying on compiler-rt libcalls for IEEE 754
+`binary128` arithmetic).
 
 Exceptions use wasm's exception handling. A `try_call` becomes a call
 inside a `try_table` whose `catch` clauses branch to one block per handler;
@@ -166,12 +171,13 @@ instruction. These have no direct wasm counterpart and are emulated:
 
 Not yet supported (functions using these return `Error::Unsupported`):
 
-- `f128`, and `fma` on `f64` (scalar or `f64x2`), which would need a wider
+- `f128` arithmetic and conversions (matching Cranelift's x64/aarch64/riscv64
+  backends), and `fma` on `f64` (scalar or `f64x2`), which would need a wider
   type to round through.
 - `i128` atomics, and `umul_overflow`/`smul_overflow`/`umulhi`/`smulhi` on
   `i128`.
 - Big-endian vector loads and stores, and arithmetic on `f16` lanes.
-- `try_call` with `i128` arguments, results or payloads; dynamic stack
+- `try_call` with `i128`/`f128` arguments, results or payloads; dynamic stack
   slots; `get_return_address`.
 
 ## Testing

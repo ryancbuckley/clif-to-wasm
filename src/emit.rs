@@ -23,14 +23,22 @@
 
 use crate::analysis::{FuncInfo, is_remat};
 use crate::expr_trees::{ExprTrees, Operand, operands};
-use crate::locals::{Locals, NO_LOCAL};
-use crate::{CompiledFunction, Config, Env, Name, Result, unsupported, wasm_signature};
+use crate::locals::{Local, Locals};
+use crate::{
+    CompiledFunction, Config, Env, FuncIndex, GlobalIndex, Name, Result, TableIndex, TypeIndex,
+    unsupported, wasm_signature,
+};
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::{
     Endianness, FuncRef, Function, Inst, InstructionData as D, MemFlags, Opcode, SigRef, StackSlot,
     Type, Value, ValueDef, types,
 };
 use wasm_encoder::{BlockType, Encode, Instruction as I, MemArg, ValType};
+
+/// Saved position on the emitter's active scratch-local stack, returned by
+/// [`Emitter::scratch_mark`] and passed to [`Emitter::free_scratches`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScratchMark(usize);
 
 pub(crate) struct Emitter<'a> {
     pub func: &'a Function,
@@ -40,7 +48,7 @@ pub(crate) struct Emitter<'a> {
     pub trees: &'a ExprTrees,
     pub locals: Locals,
     /// Shadow-stack frame: `(frame_pointer_local, frame_size)`.
-    frame: Option<(u32, u32)>,
+    frame: Option<(Local, u32)>,
     slot_offset: SecondaryMap<StackSlot, u32>,
     body: Body,
     /// Locals created during emission (scratch locals, frame pointer, etc.).
@@ -130,15 +138,15 @@ impl<'a> Emitter<'a> {
             let size = size.next_multiple_of(16);
             let fp = self.new_local(config.module.ptr_ty());
             self.frame = Some((fp, size));
-            self.ins(I::GlobalGet(sp));
+            self.global_get(sp);
             self.ptr_const(size as i64);
             self.ins(if config.module.memory64 {
                 I::I64Sub
             } else {
                 I::I32Sub
             });
-            self.ins(I::LocalTee(fp));
-            self.ins(I::GlobalSet(sp));
+            self.local_tee(fp);
+            self.global_set(sp);
         }
 
         // Callers may pass arbitrary bits in the upper bits of narrow parameters.
@@ -150,10 +158,11 @@ impl<'a> Emitter<'a> {
                 _ => continue,
             };
             if self.info.is_live(p) {
-                self.ins(I::LocalGet(i as u32));
+                let l = Local(i as u32);
+                self.local_get(l);
                 self.ins(I::I32Const(bits));
                 self.ins(I::I32And);
-                self.ins(I::LocalSet(i as u32));
+                self.local_set(l);
             }
         }
         Ok(())
@@ -161,17 +170,35 @@ impl<'a> Emitter<'a> {
 
     pub fn epilogue(&mut self) {
         if let Some((fp, size)) = self.frame {
-            self.ins(I::LocalGet(fp));
+            self.local_get(fp);
             self.ptr_const(size as i64);
             self.ptr_add();
-            self.ins(I::GlobalSet(
-                self.config.module.stack_pointer_global.unwrap(),
-            ));
+            self.global_set(self.config.module.stack_pointer_global.unwrap());
         }
     }
 
     pub fn ins(&mut self, i: I<'_>) {
         self.body.ins(i);
+    }
+
+    pub fn local_get(&mut self, l: Local) {
+        self.ins(I::LocalGet(l.0));
+    }
+
+    pub fn local_set(&mut self, l: Local) {
+        self.ins(I::LocalSet(l.0));
+    }
+
+    pub fn local_tee(&mut self, l: Local) {
+        self.ins(I::LocalTee(l.0));
+    }
+
+    pub fn global_get(&mut self, g: GlobalIndex) {
+        self.ins(I::GlobalGet(g.0));
+    }
+
+    pub fn global_set(&mut self, g: GlobalIndex) {
+        self.ins(I::GlobalSet(g.0));
     }
 
     /// Complete the function body (`unreachable; end`), run-length encode all
@@ -199,30 +226,30 @@ impl<'a> Emitter<'a> {
     // ---- Locals & Scratch Pool ----------------------------------------------
 
     /// Allocate a fresh local that persists for the rest of the function.
-    pub fn new_local(&mut self, ty: ValType) -> u32 {
+    pub fn new_local(&mut self, ty: ValType) -> Local {
         self.extra.fresh(ty)
     }
 
     /// Allocate a temporary scratch local for the current instruction (or
     /// inner scratch scope). Automatically returned to the free pool when the
     /// instruction or scope finishes.
-    pub(crate) fn scratch(&mut self, ty: ValType) -> u32 {
+    pub(crate) fn scratch(&mut self, ty: ValType) -> Local {
         self.extra.scratch(ty)
     }
 
     /// Allocate `N` temporary scratch locals of type `ty`.
-    pub(crate) fn scratches<const N: usize>(&mut self, ty: ValType) -> [u32; N] {
+    pub(crate) fn scratches<const N: usize>(&mut self, ty: ValType) -> [Local; N] {
         std::array::from_fn(|_| self.extra.scratch(ty))
     }
 
     /// Record the current scratch stack depth for an inner helper that may be
     /// called multiple times within one instruction.
-    pub(crate) fn scratch_mark(&self) -> usize {
+    pub(crate) fn scratch_mark(&self) -> ScratchMark {
         self.extra.mark()
     }
 
     /// Reclaim all scratch locals allocated since `mark`.
-    pub(crate) fn free_scratches(&mut self, mark: usize) {
+    pub(crate) fn free_scratches(&mut self, mark: ScratchMark) {
         self.extra.free_since(mark);
     }
 
@@ -232,9 +259,9 @@ impl<'a> Emitter<'a> {
         self.func.dfg.value_type(v)
     }
 
-    pub fn local(&self, v: Value) -> u32 {
+    pub fn local(&self, v: Value) -> Local {
         let l = self.locals.local_of[v];
-        debug_assert_ne!(l, NO_LOCAL, "{v} has no local");
+        debug_assert_ne!(l, Local::NONE, "{v} has no local");
         l
     }
 
@@ -244,7 +271,7 @@ impl<'a> Emitter<'a> {
             ValueDef::Result(d, _) if is_remat(self.func, d) => self.constant(d),
             ValueDef::Result(d, _) if self.trees.is_inlined(d) => self.inst(d),
             _ => {
-                self.ins(I::LocalGet(self.local(v)));
+                self.local_get(self.local(v));
                 Ok(())
             }
         }
@@ -374,7 +401,7 @@ impl<'a> Emitter<'a> {
             } else {
                 0
             },
-            memory_index: self.config.module.memory_index,
+            memory_index: self.config.module.memory_index.0,
         }
     }
 
@@ -400,7 +427,7 @@ impl<'a> Emitter<'a> {
     /// Emit `stack_addr` for `stack_slot` + `offset` with result type `ty`.
     pub(crate) fn stack_addr(&mut self, stack_slot: StackSlot, offset: i32, ty: Type) -> Result<()> {
         let (fp, _) = self.frame.expect("frame for stack slot");
-        self.ins(I::LocalGet(fp));
+        self.local_get(fp);
         let off = self.slot_offset[stack_slot] as i64 + i64::from(offset);
         self.ptr_const(off);
         self.ptr_add();
@@ -410,8 +437,8 @@ impl<'a> Emitter<'a> {
     /// Emit `get_stack_pointer` or `get_frame_pointer` with result type `ty`.
     pub(crate) fn stack_pointer(&mut self, op: Opcode, ty: Type) -> Result<()> {
         match (self.frame, self.config.module.stack_pointer_global) {
-            (Some((fp, _)), _) => self.ins(I::LocalGet(fp)),
-            (None, Some(sp)) => self.ins(I::GlobalGet(sp)),
+            (Some((fp, _)), _) => self.local_get(fp),
+            (None, Some(sp)) => self.global_get(sp),
             (None, None) => return unsupported(format!("{op} without a stack pointer")),
         }
         self.ptr_to(ty)
@@ -436,13 +463,13 @@ impl<'a> Emitter<'a> {
     }
 
     /// Resolve a direct callee `FuncRef` to its wasm function index.
-    pub(crate) fn callee_index(&mut self, func_ref: FuncRef) -> Result<u32> {
+    pub(crate) fn callee_index(&mut self, func_ref: FuncRef) -> Result<FuncIndex> {
         let name = &self.func.dfg.ext_funcs[func_ref].name;
         self.env.func_index(Name::resolve(self.func, name))
     }
 
     /// The type and table indices for an indirect call with signature `sig`.
-    pub(crate) fn indirect_call(&mut self, sig: SigRef) -> Result<(u32, u32)> {
+    pub(crate) fn indirect_call(&mut self, sig: SigRef) -> Result<(TypeIndex, TableIndex)> {
         let Some(table_index) = self.config.module.table_index else {
             return unsupported("call_indirect without ModuleLayout::table_index");
         };
@@ -457,10 +484,10 @@ impl<'a> Emitter<'a> {
         self.inst(inst)?;
         for &r in self.func.dfg.inst_results(inst).iter().rev() {
             let l = self.locals.local_of[r];
-            if l == NO_LOCAL {
+            if l == Local::NONE {
                 self.ins(I::Drop);
             } else {
-                self.ins(I::LocalSet(l));
+                self.local_set(l);
             }
         }
         Ok(())
@@ -537,8 +564,8 @@ impl Body {
 struct ExtraLocals {
     base: u32,
     types: Vec<ValType>,
-    free_scratch: Vec<(ValType, u32)>,
-    active_scratch: Vec<(ValType, u32)>,
+    free_scratch: Vec<(ValType, Local)>,
+    active_scratch: Vec<(ValType, Local)>,
 }
 
 impl ExtraLocals {
@@ -551,12 +578,12 @@ impl ExtraLocals {
         }
     }
 
-    fn fresh(&mut self, ty: ValType) -> u32 {
+    fn fresh(&mut self, ty: ValType) -> Local {
         self.types.push(ty);
-        self.base + self.types.len() as u32 - 1
+        Local(self.base + self.types.len() as u32 - 1)
     }
 
-    fn scratch(&mut self, ty: ValType) -> u32 {
+    fn scratch(&mut self, ty: ValType) -> Local {
         let l = match self.free_scratch.iter().position(|&(t, _)| t == ty) {
             Some(i) => self.free_scratch.swap_remove(i).1,
             None => self.fresh(ty),
@@ -565,12 +592,13 @@ impl ExtraLocals {
         l
     }
 
-    fn mark(&self) -> usize {
-        self.active_scratch.len()
+    fn mark(&self) -> ScratchMark {
+        ScratchMark(self.active_scratch.len())
     }
 
-    fn free_since(&mut self, mark: usize) {
-        self.free_scratch.extend(self.active_scratch.drain(mark..));
+    fn free_since(&mut self, mark: ScratchMark) {
+        self.free_scratch
+            .extend(self.active_scratch.drain(mark.0..));
     }
 
     fn types(&self) -> &[ValType] {

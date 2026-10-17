@@ -13,7 +13,9 @@ fn main() {
     let funcs: Vec<_> = (1..=1000)
         .map(|s| harness::clifgen::generate(s).0)
         .collect();
-    let config = harness::config(|c| c.module.stack_pointer_global = Some(0));
+    let config = harness::config(|c| {
+        c.module.stack_pointer_global = Some(cranelift_wasm_backend::GlobalIndex(0))
+    });
     // Resolve aliases up front, as Cranelift's own pipeline does, so that the
     // timing covers only this backend.
     let funcs: Vec<_> = funcs
@@ -28,8 +30,8 @@ fn main() {
         fn func_index(
             &mut self,
             _: cranelift_wasm_backend::Name<'_>,
-        ) -> cranelift_wasm_backend::Result<u32> {
-            Ok(0)
+        ) -> cranelift_wasm_backend::Result<cranelift_wasm_backend::FuncIndex> {
+            Ok(cranelift_wasm_backend::FuncIndex(0))
         }
     }
     let start = std::time::Instant::now();

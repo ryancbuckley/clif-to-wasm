@@ -1,12 +1,28 @@
-//! Legalization of `i128` into pairs of `i64`.
+//! Legalization of `i128` and `f128` into pairs of `i64`.
 //!
 //! This is an IR-to-IR pass that runs before everything else, so the rest of
-//! the backend never sees `i128`. Every `i128` value becomes a `(lo, hi)`
-//! pair of `i64` values: in signatures (an `i128` parameter or return becomes
-//! two `i64`s, low half first; see [`crate::wasm_signature`]), block
-//! parameters, branch arguments, calls and returns.
+//! the backend never sees `i128` or `f128`. Every 128-bit scalar value becomes
+//! a `(lo, hi)` pair of `i64` values: in signatures (an `i128` or `f128`
+//! parameter or return becomes two `i64`s, low half first; see
+//! [`crate::wasm_signature`]), block parameters, branch arguments, calls and
+//! returns.
 //!
-//! Most operations expand into straight-line `i64` code:
+//! ## Why `f128` is represented as two `i64`s
+//!
+//! Surprisingly, Cranelift's own `x64`, `aarch64`, and `riscv64` backends do
+//! not implement `f128` arithmetic (`fadd.f128`, `fmul.f128`, etc.) either —
+//! only `s390x` has hardware IEEE `binary128` instructions, while other targets
+//! rely on compiler-builtins libcalls (`__addtf3`, `__multf3`, ...) for math
+//! and only need Cranelift to move 128-bit floats around (`f128const`,
+//! `load`/`store`, `bitcast`, `select`, bitwise ops, `fneg`/`fabs`/`fcopysign`,
+//! and function/block arguments). Representing `f128` as a `(lo, hi)` pair of
+//! `i64`s (identical to `riscv64`'s `ty_reg_pair` representation) therefore
+//! supports the exact same `f128` operations as Cranelift's mainstream native
+//! backends while keeping the full 128-bit IEEE `binary128` bit pattern intact.
+//!
+//! ## `i128` operations
+//!
+//! Most `i128` operations expand into straight-line `i64` code:
 //!
 //! - add/sub propagate a carry computed with an unsigned compare;
 //! - multiply is `lo*lo` plus the cross products in the high half, using
@@ -37,9 +53,15 @@ use std::borrow::Cow;
 
 type Pair = (Value, Value);
 
+/// Is `ty` a 128-bit scalar (`i128` or `f128`) legalized into a `(lo, hi)` pair
+/// of `i64` values?
+fn is_pair(ty: Type) -> bool {
+    matches!(ty, I128 | F128)
+}
+
 /// Prepare `func` for the backend pipeline: resolve value aliases and legalize
-/// `i128` into pairs of `i64`. Borrows `func` without cloning when neither is
-/// present.
+/// `i128`/`f128` into pairs of `i64`. Borrows `func` without cloning when
+/// neither is present.
 pub(crate) fn prepare(func: &Function) -> Result<Cow<'_, Function>> {
     let (aliases, wide) = scan(func);
     if !aliases && !wide {
@@ -54,14 +76,14 @@ pub(crate) fn prepare(func: &Function) -> Result<Cow<'_, Function>> {
 }
 
 /// One pass over the function: does it use value aliases, and does it
-/// involve `i128` anywhere (signatures, block parameters or results)?
+/// involve `i128` or `f128` anywhere (signatures, block parameters or results)?
 fn scan(func: &Function) -> (bool, bool) {
     let dfg = &func.dfg;
     let sig_has = |s: &Signature| {
         s.params
             .iter()
             .chain(&s.returns)
-            .any(|p| p.value_type == I128)
+            .any(|p| is_pair(p.value_type))
     };
     let mut aliases = false;
     let mut wide = sig_has(&func.signature) || dfg.signatures.values().any(sig_has);
@@ -69,13 +91,13 @@ fn scan(func: &Function) -> (bool, bool) {
         wide |= dfg
             .block_params(b)
             .iter()
-            .any(|&p| dfg.value_type(p) == I128);
+            .any(|&p| is_pair(dfg.value_type(p)));
         for inst in func.layout.block_insts(b) {
             aliases |= dfg.inst_values(inst).any(|v| dfg.value_is_alias(v));
             wide |= dfg
                 .inst_results(inst)
                 .iter()
-                .any(|&r| dfg.value_type(r) == I128);
+                .any(|&r| is_pair(dfg.value_type(r)));
         }
     }
     (aliases, wide)
@@ -86,7 +108,7 @@ fn legalize_signature(sig: &mut Signature) {
         *ps = ps
             .iter()
             .flat_map(|&p| {
-                if p.value_type == I128 {
+                if is_pair(p.value_type) {
                     vec![AbiParam::new(I64), AbiParam::new(I64)]
                 } else {
                     vec![p]
@@ -115,7 +137,7 @@ fn legalize(func: &mut Function) -> Result<()> {
 
     let cfg = ControlFlowGraph::with_function(func);
     let domtree = DominatorTree::with_function(func, &cfg);
-    // Defs dominate uses, so in reverse postorder every `i128` operand has
+    // Defs dominate uses, so in reverse postorder every 128-bit operand has
     // been replaced by a pair before it is used.
     let rpo: Vec<Block> = domtree.cfg_rpo().copied().collect();
 
@@ -147,7 +169,7 @@ impl Legalizer<'_> {
     fn pair(&self, v: Value) -> Result<Pair> {
         match self.pairs[v] {
             Some(p) => Ok(p),
-            None => unsupported(format!("i128 value {v} used before its definition")),
+            None => unsupported(format!("{} value {v} used before its definition", self.ty(v))),
         }
     }
 
@@ -156,14 +178,14 @@ impl Legalizer<'_> {
         if !dfg
             .block_params(block)
             .iter()
-            .any(|&p| dfg.value_type(p) == I128)
+            .any(|&p| is_pair(dfg.value_type(p)))
         {
             return;
         }
         let old = dfg.detach_block_params(block);
         let old: Vec<Value> = old.as_slice(&dfg.value_lists).to_vec();
         for p in old {
-            if dfg.value_type(p) == I128 {
+            if is_pair(dfg.value_type(p)) {
                 let lo = dfg.append_block_param(block, I64);
                 let hi = dfg.append_block_param(block, I64);
                 self.pairs[p] = Some((lo, hi));
@@ -177,7 +199,7 @@ impl Legalizer<'_> {
     fn expand(&self, vals: &[Value]) -> Result<Vec<Value>> {
         let mut out = Vec::with_capacity(vals.len());
         for &v in vals {
-            if self.ty(v) == I128 {
+            if is_pair(self.ty(v)) {
                 let (lo, hi) = self.pair(v)?;
                 out.extend([lo, hi]);
             } else {
@@ -202,14 +224,14 @@ impl Legalizer<'_> {
     }
 
     /// Map the results of `old` to those of `new`, which has the same
-    /// results except that each `i128` became two `i64`s.
+    /// results except that each 128-bit scalar became two `i64`s.
     fn finish_expanded(&mut self, old: Inst, new: Inst) {
         let olds = self.func.dfg.inst_results(old).to_vec();
         let news = self.func.dfg.inst_results(new).to_vec();
         let mut outs = Vec::new();
         let mut i = 0;
         for r in olds {
-            if self.ty(r) == I128 {
+            if is_pair(self.ty(r)) {
                 outs.push(Out::Pair(news[i], news[i + 1]));
                 i += 2;
             } else {
@@ -226,16 +248,16 @@ impl Legalizer<'_> {
         let op = data.opcode();
         let inst_args = dfg.inst_args(inst);
         let inst_results = dfg.inst_results(inst);
-        let wide_arg = inst_args.iter().any(|&a| dfg.value_type(a) == I128);
-        let wide_res = inst_results.iter().any(|&r| dfg.value_type(r) == I128);
+        let wide_arg = inst_args.iter().any(|&a| is_pair(dfg.value_type(a)));
+        let wide_res = inst_results.iter().any(|&r| is_pair(dfg.value_type(r)));
         let wide_branch_arg = data
             .branch_destination(&dfg.jump_tables, &dfg.exception_tables)
             .iter()
             .any(|c| {
                 c.args(&dfg.value_lists)
-                    .any(|a| a.as_value().is_some_and(|v| dfg.value_type(v) == I128))
+                    .any(|a| a.as_value().is_some_and(|v| is_pair(dfg.value_type(v))))
             });
-        // Splitting a try_call's i128 results or payload would renumber the
+        // Splitting a try_call's 128-bit results or payload would renumber the
         // `ret`/`exn` arguments of its edges; not supported.
         if let Some(et) = data.exception_table() {
             let sig = &dfg.signatures[dfg.exception_tables[et].signature()];
@@ -243,9 +265,9 @@ impl Legalizer<'_> {
                 .params
                 .iter()
                 .chain(&sig.returns)
-                .any(|p| p.value_type == I128);
+                .any(|p| is_pair(p.value_type));
             if wide_sig || wide_arg || wide_branch_arg {
-                return unsupported("i128 in try_call");
+                return unsupported("128-bit scalar in try_call");
             }
         }
         if !wide_arg && !wide_res && !wide_branch_arg {
@@ -254,7 +276,7 @@ impl Legalizer<'_> {
         let ty = inst_results.first().map_or(INVALID, |&r| dfg.value_type(r));
         let args: Vec<Value> = inst_args.to_vec();
 
-        // Operations that keep their non-i128 shape: replace the i128
+        // Operations that keep their non-128-bit shape: replace the i128
         // operand in place.
         match op {
             Opcode::Brif
@@ -287,7 +309,10 @@ impl Legalizer<'_> {
         let p = |i: usize| -> Result<Pair> {
             match arg_pairs[i] {
                 Some(pair) => Ok(pair),
-                None => unsupported(format!("i128 value {} used before its definition", args[i])),
+                None => unsupported(format!(
+                    "{} value {} used before its definition",
+                    arg_tys[i], args[i]
+                )),
             }
         };
 
@@ -342,6 +367,14 @@ impl Legalizer<'_> {
                 // The immediate is zero-extended.
                 let lo = pos.ins().iconst(I64, imm.bits());
                 let hi = pos.ins().iconst(I64, 0);
+                vec![Out::Pair(lo, hi)]
+            }
+            (Opcode::F128const, D::UnaryConst { constant_handle, .. }) => {
+                let data = pos.func.dfg.constants.get(constant_handle).as_slice();
+                let bytes: [u8; 16] = data.try_into().expect("16-byte f128 constant");
+                let bits = u128::from_le_bytes(bytes);
+                let lo = pos.ins().iconst(I64, bits as i64);
+                let hi = pos.ins().iconst(I64, (bits >> 64) as i64);
                 vec![Out::Pair(lo, hi)]
             }
             (Opcode::Iconcat, _) => vec![Out::Pair(args[0], args[1])],
@@ -449,6 +482,27 @@ impl Legalizer<'_> {
                 let lo = pos.ins().bitselect(cl, xl, yl);
                 let hi = pos.ins().bitselect(ch, xh, yh);
                 vec![Out::Pair(lo, hi)]
+            }
+            (Opcode::Fneg, _) if ty == F128 => {
+                let (lo, hi) = p(0)?;
+                let sign = pos.ins().iconst(I64, i64::MIN);
+                let hi = pos.ins().bxor(hi, sign);
+                vec![Out::Pair(lo, hi)]
+            }
+            (Opcode::Fabs, _) if ty == F128 => {
+                let (lo, hi) = p(0)?;
+                let mask = pos.ins().iconst(I64, i64::MAX);
+                let hi = pos.ins().band(hi, mask);
+                vec![Out::Pair(lo, hi)]
+            }
+            (Opcode::Fcopysign, _) if ty == F128 => {
+                let ((xl, xh), (_, yh)) = (p(0)?, p(1)?);
+                let mask = pos.ins().iconst(I64, i64::MAX);
+                let sign = pos.ins().iconst(I64, i64::MIN);
+                let mag = pos.ins().band(xh, mask);
+                let s = pos.ins().band(yh, sign);
+                let hi = pos.ins().bor(mag, s);
+                vec![Out::Pair(xl, hi)]
             }
             (Opcode::Ineg, _) => {
                 let x = p(0)?;
@@ -571,7 +625,7 @@ impl Legalizer<'_> {
             }
 
             // Memory.
-            (Opcode::Load, D::Load { flags, offset, .. }) if ty == I128 => {
+            (Opcode::Load, D::Load { flags, offset, .. }) if is_pair(ty) => {
                 let flags = pos.func.dfg.mem_flags[flags];
                 let (lo_off, hi_off) = half_offsets(flags.endianness(Endianness::Little), offset)?;
                 let lo = pos.ins().load(I64, flags, args[0], lo_off);
@@ -605,17 +659,19 @@ impl Legalizer<'_> {
                 vec![]
             }
 
-            // Bitcasts to and from 128-bit vectors.
+            // Bitcasts between 128-bit scalars (`i128`, `f128`) and 128-bit vectors.
             (Opcode::Bitcast, D::LoadNoOffset { flags, .. }) => {
                 let flags = pos.func.dfg.mem_flags[flags];
-                if flags.endianness(Endianness::Little) == Endianness::Big {
-                    return unsupported("big-endian i128 bitcast");
-                }
                 let aty = arg_tys[0];
-                if aty == I128 && ty == I128 {
+                if flags.endianness(Endianness::Little) == Endianness::Big
+                    && aty.lane_bits() != ty.lane_bits()
+                {
+                    return unsupported(format!("big-endian bitcast {aty} -> {ty}"));
+                }
+                if is_pair(aty) && is_pair(ty) {
                     let (lo, hi) = p(0)?;
                     vec![Out::Pair(lo, hi)]
-                } else if ty == I128 && aty.is_vector() && aty.bits() == 128 {
+                } else if is_pair(ty) && aty.is_vector() && aty.bits() == 128 {
                     let v = if aty == I64X2 {
                         args[0]
                     } else {
@@ -624,7 +680,7 @@ impl Legalizer<'_> {
                     let lo = pos.ins().extractlane(v, 0);
                     let hi = pos.ins().extractlane(v, 1);
                     vec![Out::Pair(lo, hi)]
-                } else if aty == I128 && ty.is_vector() && ty.bits() == 128 {
+                } else if is_pair(aty) && ty.is_vector() && ty.bits() == 128 {
                     let (lo, hi) = p(0)?;
                     let v = pos.ins().scalar_to_vector(I64X2, lo);
                     let v = pos.ins().insertlane(v, hi, 1);
@@ -639,8 +695,10 @@ impl Legalizer<'_> {
                 }
             }
 
-            // Conversions to and from floats.
-            (Opcode::FcvtFromSint | Opcode::FcvtFromUint, _) => {
+            // Conversions to and from floats (`i128` <-> `f32`/`f64`).
+            (Opcode::FcvtFromSint | Opcode::FcvtFromUint, _)
+                if arg_tys[0] == I128 && matches!(ty, F32 | F64) =>
+            {
                 let x = p(0)?;
                 let v = if op == Opcode::FcvtFromUint {
                     u128_to_float(&mut pos, ty, x)
@@ -660,20 +718,23 @@ impl Legalizer<'_> {
                 | Opcode::FcvtToSintSat
                 | Opcode::FcvtToUintSat,
                 _,
-            ) => {
+            ) if ty == I128 && matches!(arg_tys[0], F32 | F64) => {
                 let (lo, hi) = float_to_128(&mut pos, op, args[0]);
                 vec![Out::Pair(lo, hi)]
             }
 
             _ => {
-                return unsupported(format!("i128 in `{}`", pos.func.dfg.display_inst(inst)));
+                return unsupported(format!(
+                    "128-bit scalar in `{}`",
+                    pos.func.dfg.display_inst(inst)
+                ));
             }
         };
         self.finish(inst, &outs);
         Ok(())
     }
 
-    /// Expand the `i128` arguments of a branch's block calls.
+    /// Expand the `i128`/`f128` arguments of a branch's block calls.
     fn branch_args(&mut self, inst: Inst) -> Result<()> {
         let dfg = &self.func.dfg;
         let calls: Vec<BlockCall> = dfg.insts[inst]
@@ -686,7 +747,7 @@ impl Legalizer<'_> {
             let mut args: Vec<BlockArg> = Vec::new();
             for a in call.args(&dfg.value_lists) {
                 match a.as_value() {
-                    Some(v) if dfg.value_type(v) == I128 => {
+                    Some(v) if is_pair(dfg.value_type(v)) => {
                         let (lo, hi) = self.pair(v)?;
                         args.extend([BlockArg::Value(lo), BlockArg::Value(hi)]);
                     }

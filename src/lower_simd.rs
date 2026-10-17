@@ -21,6 +21,7 @@
 //! narrowing operations), loads and stores account for the lane count.
 
 use crate::emit::Emitter;
+use crate::locals::Local;
 use crate::lower_float::FloatCmpOps;
 use crate::{Result, fixed_type, unsupported};
 use cranelift_codegen::ir::condcodes::IntCC;
@@ -322,12 +323,12 @@ impl Emitter<'_> {
                 };
                 let [a, b] = self.scratches(ValType::V128);
                 self.operand()?;
-                self.ins(I::LocalTee(a));
+                self.local_tee(a);
                 self.operand()?;
-                self.ins(I::LocalTee(b));
+                self.local_tee(b);
                 self.ins(I::V128Or);
-                self.ins(I::LocalGet(a));
-                self.ins(I::LocalGet(b));
+                self.local_get(a);
+                self.local_get(b);
                 self.ins(I::V128Xor);
                 self.ins(I::I32Const(1));
                 self.ins(shr);
@@ -344,12 +345,12 @@ impl Emitter<'_> {
                 // no other inputs produce, so turn MIN into MAX.
                 let [a, b] = self.scratches(ValType::V128);
                 self.operand()?;
-                self.ins(I::LocalSet(a));
+                self.local_set(a);
                 self.operand()?;
-                self.ins(I::LocalSet(b));
+                self.local_set(b);
                 for mul in [I::I64x2ExtMulLowI32x4S, I::I64x2ExtMulHighI32x4S] {
-                    self.ins(I::LocalGet(a));
-                    self.ins(I::LocalGet(b));
+                    self.local_get(a);
+                    self.local_get(b);
                     self.ins(mul);
                     self.ins(splat_const(Lane::I64, 1 << 30));
                     self.ins(I::I64x2Add);
@@ -357,8 +358,8 @@ impl Emitter<'_> {
                     self.ins(I::I64x2ShrS);
                 }
                 self.ins(I::I8x16Shuffle(shuffle_bytes(4, |i| 2 * i)));
-                self.ins(I::LocalTee(a));
-                self.ins(I::LocalGet(a));
+                self.local_tee(a);
+                self.local_get(a);
                 self.ins(splat_const(Lane::I32, 0x8000_0000));
                 self.ins(I::I32x4Eq);
                 self.ins(I::V128Xor);
@@ -381,12 +382,12 @@ impl Emitter<'_> {
                     _ => 0,
                 };
                 self.operand()?;
-                self.ins(I::LocalTee(x));
+                self.local_tee(x);
                 self.operand()?;
-                self.ins(I::LocalTee(y));
+                self.local_tee(y);
                 self.ins(I::I8x16Shuffle(shuffle_bytes(b, |i| pick(i, 0))));
-                self.ins(I::LocalGet(x));
-                self.ins(I::LocalGet(y));
+                self.local_get(x);
+                self.local_get(y);
                 self.ins(I::I8x16Shuffle(shuffle_bytes(b, |i| pick(i, 1))));
                 self.ins(lanes!(lane, op; I8 => I::I8x16Add, I16 => I::I16x8Add,
                     I32 => I::I32x4Add, I64 => I::I64x2Add));
@@ -406,8 +407,8 @@ impl Emitter<'_> {
                         self.ins(I::I16x8ExtAddPairwiseI8x16U);
                         self.ins(I::I32x4ExtAddPairwiseI16x8U);
                         let s = self.scratch(ValType::V128);
-                        self.ins(I::LocalTee(s));
-                        self.ins(I::LocalGet(s));
+                        self.local_tee(s);
+                        self.local_get(s);
                         self.ins(I::I32Const(32));
                         self.ins(I::I64x2ShrU);
                         self.ins(I::I64x2Add);
@@ -454,18 +455,18 @@ impl Emitter<'_> {
                 let x = self.scratch(ValType::V128);
                 let n = self.scratch(ValType::I32);
                 self.operand()?;
-                self.ins(I::LocalSet(x));
+                self.local_set(x);
                 let amt = self.operand()?;
                 if dfg.value_type(amt) == types::I64 {
                     self.ins(I::I32WrapI64);
                 }
-                self.ins(I::LocalSet(n));
-                self.ins(I::LocalGet(x));
-                self.ins(I::LocalGet(n));
+                self.local_set(n);
+                self.local_get(x);
+                self.local_get(n);
                 self.ins(first);
-                self.ins(I::LocalGet(x));
+                self.local_get(x);
                 self.ins(I::I32Const((lane.bytes() * 8) as i32));
-                self.ins(I::LocalGet(n));
+                self.local_get(n);
                 self.ins(I::I32Sub);
                 self.ins(second);
                 self.ins(I::V128Or);
@@ -598,8 +599,8 @@ impl Emitter<'_> {
                     // of the v128: move it down and widen the low half.
                     Opcode::SwidenHigh | Opcode::UwidenHigh if n < 16 / src.bytes() => {
                         let s = self.scratch(ValType::V128);
-                        self.ins(I::LocalTee(s));
-                        self.ins(I::LocalGet(s));
+                        self.local_tee(s);
+                        self.local_get(s);
                         self.ins(I::I8x16Shuffle(shuffle_bytes(src.bytes(), |i| i + n / 2)));
                         if op == Opcode::SwidenHigh {
                             Opcode::SwidenLow
@@ -809,8 +810,8 @@ impl Emitter<'_> {
             // The result's lanes are half the size: `full` of them per
             // input.
             let bytes = Lane::of(src)?.bytes() / 2;
-            self.ins(I::LocalTee(s));
-            self.ins(I::LocalGet(s));
+            self.local_tee(s);
+            self.local_get(s);
             self.ins(I::I8x16Shuffle(shuffle_bytes(bytes, |i| {
                 if i < n { i } else { full + i - n }
             })));
@@ -822,11 +823,11 @@ impl Emitter<'_> {
     /// the stack.
     fn per_lane_64(&mut self, from: Lane, to: Lane, convert: I<'static>) {
         let s = self.scratch(ValType::V128);
-        self.ins(I::LocalTee(s));
+        self.local_tee(s);
         self.ins(from.extract_lane(0));
         self.ins(convert.clone());
         self.ins(to.splat());
-        self.ins(I::LocalGet(s));
+        self.local_get(s);
         self.ins(from.extract_lane(1));
         self.ins(convert);
         self.ins(to.replace_lane(1));
@@ -846,12 +847,12 @@ impl Emitter<'_> {
         };
         let [x, y] = self.scratches(ValType::V128);
         self.operand()?;
-        self.ins(I::LocalTee(x));
+        self.local_tee(x);
         self.operand()?;
-        self.ins(I::LocalTee(y));
+        self.local_tee(y);
         self.ins(lo);
-        self.ins(I::LocalGet(x));
-        self.ins(I::LocalGet(y));
+        self.local_get(x);
+        self.local_get(y);
         self.ins(hi);
         Ok(())
     }
@@ -867,35 +868,35 @@ impl Emitter<'_> {
         let sign_shift = (lane.bytes() * 8 - 1) as i32;
         let [a, b, r] = self.scratches(ValType::V128);
         self.operand()?;
-        self.ins(I::LocalSet(a));
+        self.local_set(a);
         self.operand()?;
-        self.ins(I::LocalSet(b));
+        self.local_set(b);
         let adding = matches!(op, Opcode::UaddSat | Opcode::SaddSat);
-        self.ins(I::LocalGet(a));
-        self.ins(I::LocalGet(b));
+        self.local_get(a);
+        self.local_get(b);
         self.ins(if adding { add } else { sub });
-        self.ins(I::LocalSet(r));
+        self.local_set(r);
         match op {
             // A carry out shows as r < a; saturate to all ones.
             Opcode::UaddSat => {
-                self.ins(I::LocalGet(r));
+                self.local_get(r);
                 self.lt_u(lane, r, a);
                 self.ins(I::V128Or);
             }
             // A borrow happens when a < b; saturate to zero.
             Opcode::UsubSat => {
-                self.ins(I::LocalGet(r));
+                self.local_get(r);
                 self.lt_u(lane, a, b);
                 self.ins(I::V128AndNot);
             }
             _ => {
                 // The saturated value: MIN where a < 0, MAX elsewhere.
-                self.ins(I::LocalGet(a));
+                self.local_get(a);
                 self.ins(I::I32Const(sign_shift));
                 self.ins(shr_s.clone());
                 self.ins(splat_const(lane, max));
                 self.ins(I::V128Xor);
-                self.ins(I::LocalGet(r));
+                self.local_get(r);
                 // Overflow, as an all-ones lane mask:
                 //   add: (a ^ r) & (b ^ r) < 0
                 //   sub: (a ^ b) & (a ^ r) < 0
@@ -905,8 +906,8 @@ impl Emitter<'_> {
                     [(a, b), (a, r)]
                 };
                 for (x, y) in pairs {
-                    self.ins(I::LocalGet(x));
-                    self.ins(I::LocalGet(y));
+                    self.local_get(x);
+                    self.local_get(y);
                     self.ins(I::V128Xor);
                 }
                 self.ins(I::V128And);
@@ -919,9 +920,9 @@ impl Emitter<'_> {
     }
 
     /// Push the lane mask of `x < y`, unsigned, for the locals `x` and `y`.
-    fn lt_u(&mut self, lane: Lane, x: u32, y: u32) {
+    fn lt_u(&mut self, lane: Lane, x: Local, y: Local) {
         for l in [x, y] {
-            self.ins(I::LocalGet(l));
+            self.local_get(l);
             if lane == Lane::I64 {
                 // No unsigned 64-bit lane comparison: flip the sign bits.
                 self.ins(splat_const(Lane::I64, 1 << 63));
@@ -941,7 +942,7 @@ impl Emitter<'_> {
         const SIGN: u64 = 1 << 63;
         let mark = self.scratch_mark();
         let s = self.scratch(ValType::V128);
-        self.ins(I::LocalSet(s));
+        self.local_set(s);
         // (bound, replace the lane when `lane cmp bound`, compare unsigned)
         let bounds: &[(u64, I<'static>, bool)] = match op {
             Opcode::Snarrow => &[
@@ -955,8 +956,8 @@ impl Emitter<'_> {
             // s = bitselect(bound, s, s cmp bound); an unsigned comparison
             // flips both sides' sign bits and compares signed.
             self.ins(splat_const(Lane::I64, bound));
-            self.ins(I::LocalGet(s));
-            self.ins(I::LocalGet(s));
+            self.local_get(s);
+            self.local_get(s);
             if unsigned {
                 self.ins(splat_const(Lane::I64, SIGN));
                 self.ins(I::V128Xor);
@@ -967,9 +968,9 @@ impl Emitter<'_> {
             ));
             self.ins(cmp);
             self.ins(I::V128Bitselect);
-            self.ins(I::LocalSet(s));
+            self.local_set(s);
         }
-        self.ins(I::LocalGet(s));
+        self.local_get(s);
         self.free_scratches(mark);
         Ok(())
     }
@@ -980,16 +981,16 @@ impl Emitter<'_> {
         let [a, b] = self.scratches(ValType::V128);
         let [sa, sb] = self.scratches(ValType::I64);
         self.operand()?;
-        self.ins(I::LocalSet(a));
+        self.local_set(a);
         self.operand()?;
-        self.ins(I::LocalSet(b));
+        self.local_set(b);
         for i in 0..2 {
-            self.ins(I::LocalGet(a));
+            self.local_get(a);
             self.ins(I::I64x2ExtractLane(i));
-            self.ins(I::LocalSet(sa));
-            self.ins(I::LocalGet(b));
+            self.local_set(sa);
+            self.local_get(b);
             self.ins(I::I64x2ExtractLane(i));
-            self.ins(I::LocalSet(sb));
+            self.local_set(sb);
             self.mulhi64_of(sa, sb, signed);
             self.ins(if i == 0 {
                 I::I64x2Splat
@@ -1009,16 +1010,16 @@ impl Emitter<'_> {
         };
         let [a, b] = self.scratches(ValType::V128);
         self.operand()?;
-        self.ins(I::LocalTee(a));
+        self.local_tee(a);
         self.operand()?;
-        self.ins(I::LocalTee(b));
+        self.local_tee(b);
         // Stack: a, b. Select a where cmp(a, b), else b.
-        self.ins(I::LocalGet(a));
+        self.local_get(a);
         if unsigned {
             self.ins(splat_const(Lane::I64, 1 << 63));
             self.ins(I::V128Xor);
         }
-        self.ins(I::LocalGet(b));
+        self.local_get(b);
         if unsigned {
             self.ins(splat_const(Lane::I64, 1 << 63));
             self.ins(I::V128Xor);

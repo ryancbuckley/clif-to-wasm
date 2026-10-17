@@ -8,10 +8,11 @@ mod harness;
 use cranelift_codegen::ir::{Function, Signature};
 use cranelift_reader::parse_functions;
 use cranelift_wasm_backend::{
-    CompiledFunction, Config, Env, Error, ModuleBuilder, Name, compile_function, wasm_signature,
+    CompiledFunction, Config, Env, Error, FuncIndex, ModuleBuilder, Name, TableIndex, TypeIndex,
+    compile_function, wasm_signature,
 };
 use std::collections::HashMap;
-use wasm_encoder::{ConstExpr, ExportKind, GlobalType, MemoryType, RefType, TableType, ValType};
+use wasm_encoder::{ConstExpr, GlobalType, MemoryType, RefType, TableType, ValType};
 use wasmtime::{Engine, Instance, Module, Ref, Store};
 
 const HOST: &str = "
@@ -64,7 +65,7 @@ const STACK_TOP: i32 = 65536;
 
 /// Resolves names to function indices and table slots.
 struct Names<'a> {
-    funcs: &'a HashMap<String, u32>,
+    funcs: &'a HashMap<String, FuncIndex>,
     slots: &'a HashMap<String, u64>,
     builder: &'a mut ModuleBuilder,
 }
@@ -77,11 +78,11 @@ fn key(name: Name<'_>) -> String {
 }
 
 impl Env for Names<'_> {
-    fn func_index(&mut self, name: Name<'_>) -> Result<u32, Error> {
+    fn func_index(&mut self, name: Name<'_>) -> Result<FuncIndex, Error> {
         let k = key(name);
         self.funcs.get(&k).copied().ok_or(Error::Env(k))
     }
-    fn type_index(&mut self, sig: &Signature) -> Result<u32, Error> {
+    fn type_index(&mut self, sig: &Signature) -> Result<TypeIndex, Error> {
         let (p, r) = wasm_signature(sig)?;
         Ok(self.builder.type_index(&p, &r))
     }
@@ -101,10 +102,10 @@ fn add_functions(
     builder: &mut ModuleBuilder,
     funcs: &[Function],
     config: &Config,
-    mut names: HashMap<String, u32>,
+    mut names: HashMap<String, FuncIndex>,
     mut slots: HashMap<String, u64>,
-    slot: impl Fn(usize, u32) -> u64,
-) -> Vec<u32> {
+    slot: impl Fn(usize, FuncIndex) -> u64,
+) -> Vec<FuncIndex> {
     let mut indices = Vec::new();
     for (i, f) in funcs.iter().enumerate() {
         let (p, r) = wasm_signature(&f.signature).unwrap();
@@ -134,9 +135,9 @@ fn jit_module_links_into_host() {
     let mem = host.memory(1, false);
     let table = host.function_table();
     let sp = host.global(ValType::I32, ConstExpr::i32_const(STACK_TOP));
-    host.export("memory", ExportKind::Memory, mem);
-    host.export("table", ExportKind::Table, table);
-    host.export("sp", ExportKind::Global, sp);
+    host.export("memory", mem);
+    host.export("table", table);
+    host.export("sp", sp);
     let mut config = Config::default();
     config.module.memory_index = mem;
     config.module.table_index = Some(table);
@@ -148,7 +149,7 @@ fn jit_module_links_into_host() {
         &config,
         HashMap::new(),
         HashMap::new(),
-        |_, idx| idx as u64,
+        |_, idx| idx.0 as u64,
     );
     let host_wasm = host.finish();
     harness::validate(&host_wasm).unwrap();
@@ -209,7 +210,7 @@ fn jit_module_links_into_host() {
     config.module.stack_pointer_global = Some(sp_idx);
     let names = HashMap::from([("double".to_string(), double_idx)]);
     // `double` keeps the slot it has in the host's table.
-    let slots = HashMap::from([("double".to_string(), host_indices[0] as u64)]);
+    let slots = HashMap::from([("double".to_string(), host_indices[0].0 as u64)]);
     let jit_indices = add_functions(&mut jit, &jit_funcs, &config, names, slots, |i, _| {
         base + i as u64
     });
@@ -249,11 +250,11 @@ fn jit_module_links_into_host() {
 struct SlotsOnly;
 
 impl Env for SlotsOnly {
-    fn func_index(&mut self, name: Name<'_>) -> Result<u32, Error> {
+    fn func_index(&mut self, name: Name<'_>) -> Result<FuncIndex, Error> {
         Err(Error::Env(key(name)))
     }
-    fn type_index(&mut self, _: &Signature) -> Result<u32, Error> {
-        Ok(0)
+    fn type_index(&mut self, _: &Signature) -> Result<TypeIndex, Error> {
+        Ok(TypeIndex(0))
     }
     fn func_table_slot(&mut self, _: Name<'_>) -> Result<u64, Error> {
         Ok(7)
@@ -301,7 +302,7 @@ block0:
     // Taking an address only needs the slot, which the Env provides.
     compile_function(&funcs[2], &config, &mut SlotsOnly).unwrap();
 
-    config.module.table_index = Some(0);
+    config.module.table_index = Some(TableIndex(0));
     for f in &funcs {
         compile_function(f, &config, &mut SlotsOnly).unwrap();
     }

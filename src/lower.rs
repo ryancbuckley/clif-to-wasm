@@ -6,6 +6,7 @@
 //! the emitter's free pool when [`Emitter::inst`] completes.
 
 use crate::emit::{Emitter, is64, narrow_bits, w};
+use crate::locals::Local;
 use crate::lower_float::FloatCmpOps;
 use crate::{Name, Result, SymbolValue, unsupported, wasm_type};
 use cranelift_codegen::ir::condcodes::IntCC;
@@ -94,11 +95,11 @@ impl Emitter<'_> {
                         // (c & x) | (~c & y)
                         let c = self.scratch(vt);
                         bits(self)?;
-                        self.ins(I::LocalTee(c));
+                        self.local_tee(c);
                         bits(self)?;
                         self.ins(w!(ity, I32And, I64And));
                         bits(self)?;
-                        self.ins(I::LocalGet(c));
+                        self.local_get(c);
                         self.ins(ones);
                         self.ins(w!(ity, I32Xor, I64Xor));
                         self.ins(w!(ity, I32And, I64And));
@@ -150,18 +151,18 @@ impl Emitter<'_> {
                 self.operand()?;
                 if let Some(bits) = narrow_bits(ty) {
                     let [x, n] = self.scratches(ValType::I32);
-                    self.ins(I::LocalTee(x));
+                    self.local_tee(x);
                     self.shift_amount(ty)?;
-                    self.ins(I::LocalTee(n));
+                    self.local_tee(n);
                     let (first, second) = if op == Opcode::Rotl {
                         (I::I32Shl, I::I32ShrU)
                     } else {
                         (I::I32ShrU, I::I32Shl)
                     };
                     self.ins(first);
-                    self.ins(I::LocalGet(x));
+                    self.local_get(x);
                     self.ins(I::I32Const(bits as i32));
-                    self.ins(I::LocalGet(n));
+                    self.local_get(n);
                     self.ins(I::I32Sub);
                     self.ins(second);
                     self.ins(I::I32Or);
@@ -194,11 +195,11 @@ impl Emitter<'_> {
                     if let Some(bits) = narrow_bits(ty) {
                         // MIN / -1 does not overflow in i32; trap explicitly.
                         let s = self.scratch(ValType::I32);
-                        self.ins(I::LocalTee(s));
+                        self.local_tee(s);
                         self.ins(I::I32Const(1 << (bits - 1)));
                         self.ins(I::I32Eq);
                         self.trap_if();
-                        self.ins(I::LocalGet(s));
+                        self.local_get(s);
                     }
                 } else {
                     self.ins(w!(ty, I32RemS, I64RemS));
@@ -257,7 +258,7 @@ impl Emitter<'_> {
                 self.sext(ty);
                 let vt = wasm_type(ty)?;
                 let [s, m] = self.scratches(vt);
-                self.ins(I::LocalTee(s));
+                self.local_tee(s);
                 if is64(ty) {
                     self.ins(I::I64Const(63));
                     self.ins(I::I64ShrS);
@@ -265,10 +266,10 @@ impl Emitter<'_> {
                     self.ins(I::I32Const(31));
                     self.ins(I::I32ShrS);
                 }
-                self.ins(I::LocalTee(m));
-                self.ins(I::LocalGet(s));
+                self.local_tee(m);
+                self.local_get(s);
                 self.ins(w!(ty, I32Xor, I64Xor));
-                self.ins(I::LocalGet(m));
+                self.local_get(m);
                 self.ins(w!(ty, I32Sub, I64Sub));
                 self.mask(ty);
             }
@@ -280,14 +281,14 @@ impl Emitter<'_> {
                 if signed {
                     self.sext(ty);
                 }
-                self.ins(I::LocalTee(a));
+                self.local_tee(a);
                 self.operand()?;
                 if signed {
                     self.sext(ty);
                 }
-                self.ins(I::LocalTee(b));
-                self.ins(I::LocalGet(a));
-                self.ins(I::LocalGet(b));
+                self.local_tee(b);
+                self.local_get(a);
+                self.local_get(b);
                 self.ins(match op {
                     Opcode::Smin => w!(ty, I32LtS, I64LtS),
                     Opcode::Smax => w!(ty, I32GtS, I64GtS),
@@ -321,11 +322,11 @@ impl Emitter<'_> {
                 self.sext(ty);
                 let vt = wasm_type(ty)?;
                 let s = self.scratch(vt);
-                self.ins(I::LocalTee(s));
+                self.local_tee(s);
                 if is64(ty) {
                     self.ins(I::I64Const(63));
                     self.ins(I::I64ShrS);
-                    self.ins(I::LocalGet(s));
+                    self.local_get(s);
                     self.ins(I::I64Xor);
                     self.ins(I::I64Clz);
                     self.ins(I::I64Const(1));
@@ -333,7 +334,7 @@ impl Emitter<'_> {
                 } else {
                     self.ins(I::I32Const(31));
                     self.ins(I::I32ShrS);
-                    self.ins(I::LocalGet(s));
+                    self.local_get(s);
                     self.ins(I::I32Xor);
                     self.ins(I::I32Clz);
                     self.ins(I::I32Const(
@@ -396,11 +397,11 @@ impl Emitter<'_> {
                 let vt = wasm_type(ty)?;
                 let c = self.scratch(vt);
                 self.operand()?;
-                self.ins(I::LocalTee(c));
+                self.local_tee(c);
                 self.operand()?;
                 self.ins(w!(ty, I32And, I64And));
                 self.operand()?;
-                self.ins(I::LocalGet(c));
+                self.local_get(c);
                 if is64(ty) {
                     self.ins(I::I64Const(-1));
                     self.ins(I::I64Xor);
@@ -415,19 +416,19 @@ impl Emitter<'_> {
                 let vt = wasm_type(ty)?;
                 let [a, r] = self.scratches(vt);
                 self.operand()?;
-                self.ins(I::LocalTee(a));
+                self.local_tee(a);
                 self.operand()?;
                 self.ins(w!(ty, I32Add, I64Add));
-                self.ins(I::LocalTee(r));
+                self.local_tee(r);
                 if let Some(bits) = narrow_bits(ty) {
                     self.ins(I::I32Const(((1u32 << bits) - 1) as i32));
                     self.ins(I::I32GtU);
                 } else {
-                    self.ins(I::LocalGet(a));
+                    self.local_get(a);
                     self.ins(w!(ty, I32LtU, I64LtU));
                 }
                 self.trap_if();
-                self.ins(I::LocalGet(r));
+                self.local_get(r);
             }
             (
                 Opcode::UaddOverflow
@@ -520,9 +521,9 @@ impl Emitter<'_> {
                 if let Some(bits) = narrow_bits(ty) {
                     // Trap if the result does not fit the narrow type.
                     let s = self.scratch(ValType::I32);
-                    self.ins(I::LocalTee(s));
+                    self.local_tee(s);
                     if signed {
-                        self.ins(I::LocalGet(s));
+                        self.local_get(s);
                         self.sext(ty);
                         self.ins(I::I32Ne);
                     } else {
@@ -530,7 +531,7 @@ impl Emitter<'_> {
                         self.ins(I::I32GtU);
                     }
                     self.trap_if();
-                    self.ins(I::LocalGet(s));
+                    self.local_get(s);
                     self.mask(ty);
                 }
             }
@@ -661,7 +662,7 @@ impl Emitter<'_> {
                 match self.env.symbol_value(Name::resolve(func, name))? {
                     SymbolValue::Const(c) => self.iconst(ty, c as i64 + offset),
                     SymbolValue::Global(g) => {
-                        self.ins(I::GlobalGet(g));
+                        self.global_get(g);
                         if offset != 0 {
                             self.iconst(ty, offset);
                             self.ins(w!(ty, I32Add, I64Add));
@@ -680,7 +681,7 @@ impl Emitter<'_> {
                     return unsupported(format!("{op} without ModuleLayout::pinned_reg_global"));
                 };
                 if op == Opcode::GetPinnedReg {
-                    self.ins(I::GlobalGet(g));
+                    self.global_get(g);
                     if ty == types::I32 {
                         self.ins(I::I32WrapI64);
                     }
@@ -689,7 +690,7 @@ impl Emitter<'_> {
                     if aty == types::I32 {
                         self.ins(I::I64ExtendI32U);
                     }
-                    self.ins(I::GlobalSet(g));
+                    self.global_set(g);
                 }
             }
 
@@ -715,13 +716,13 @@ impl Emitter<'_> {
                 if op == Opcode::ReturnCall {
                     self.epilogue();
                     if self.config.engine.tail_calls {
-                        self.ins(I::ReturnCall(idx));
+                        self.ins(I::ReturnCall(idx.0));
                     } else {
-                        self.ins(I::Call(idx));
+                        self.ins(I::Call(idx.0));
                         self.ins(I::Return);
                     }
                 } else {
-                    self.ins(I::Call(idx));
+                    self.ins(I::Call(idx.0));
                 }
             }
             (
@@ -736,6 +737,7 @@ impl Emitter<'_> {
                     self.ins(I::I32WrapI64);
                 }
                 let (type_index, table_index) = self.indirect_call(sig_ref)?;
+                let (type_index, table_index) = (type_index.0, table_index.0);
                 if op == Opcode::ReturnCallIndirect {
                     self.epilogue();
                     if self.config.engine.tail_calls {
@@ -901,10 +903,10 @@ impl Emitter<'_> {
 
     /// Replace the `i32` on the stack by `bound` unless `cmp(value, bound)`
     /// holds; `s` is a scratch local.
-    fn clamp_with(&mut self, s: u32, bound: i32, cmp: I<'static>) {
-        self.ins(I::LocalTee(s));
+    fn clamp_with(&mut self, s: Local, bound: i32, cmp: I<'static>) {
+        self.local_tee(s);
         self.ins(I::I32Const(bound));
-        self.ins(I::LocalGet(s));
+        self.local_get(s);
         self.ins(I::I32Const(bound));
         self.ins(cmp);
         self.ins(I::Select);
@@ -920,12 +922,12 @@ impl Emitter<'_> {
             types::I16 | types::I32 => {
                 let mark = self.scratch_mark();
                 let s = self.scratch(ValType::I32);
-                self.ins(I::LocalTee(s));
+                self.local_tee(s);
                 self.ins(I::I32Const(0x00ff_00ff));
                 self.ins(I::I32And);
                 self.ins(I::I32Const(8));
                 self.ins(I::I32Rotr);
-                self.ins(I::LocalGet(s));
+                self.local_get(s);
                 self.ins(I::I32Const(0xff00_ff00u32 as i32));
                 self.ins(I::I32And);
                 self.ins(I::I32Const(8));
@@ -965,12 +967,12 @@ impl Emitter<'_> {
                 I::I32ShrU,
             )
         };
-        self.ins(I::LocalTee(s));
+        self.local_tee(s);
         self.ins(konst(shift));
         self.ins(shr);
         self.ins(konst(mask as i64));
         self.ins(and.clone());
-        self.ins(I::LocalGet(s));
+        self.local_get(s);
         self.ins(konst(mask as i64));
         self.ins(and);
         self.ins(konst(shift));
@@ -986,35 +988,35 @@ impl Emitter<'_> {
     fn mulhi64(&mut self, signed: bool) -> Result<()> {
         let [a, b] = self.scratches(ValType::I64);
         self.operand()?;
-        self.ins(I::LocalSet(a));
+        self.local_set(a);
         self.operand()?;
-        self.ins(I::LocalSet(b));
+        self.local_set(b);
         self.mulhi64_of(a, b, signed);
         Ok(())
     }
 
     /// Push the high half of the product of the `i64` locals `a` and `b`.
-    pub(crate) fn mulhi64_of(&mut self, a: u32, b: u32, signed: bool) {
+    pub(crate) fn mulhi64_of(&mut self, a: Local, b: Local, signed: bool) {
         let mark = self.scratch_mark();
         let [p1, p2] = self.scratches(ValType::I64);
-        let lo32 = |e: &mut Self, l: u32| {
-            e.ins(I::LocalGet(l));
+        let lo32 = |e: &mut Self, l: Local| {
+            e.local_get(l);
             e.ins(I::I64Const(0xffff_ffff));
             e.ins(I::I64And);
         };
-        let hi32 = |e: &mut Self, l: u32| {
-            e.ins(I::LocalGet(l));
+        let hi32 = |e: &mut Self, l: Local| {
+            e.local_get(l);
             e.ins(I::I64Const(32));
             e.ins(I::I64ShrU);
         };
         lo32(self, a);
         hi32(self, b);
         self.ins(I::I64Mul);
-        self.ins(I::LocalSet(p1));
+        self.local_set(p1);
         hi32(self, a);
         lo32(self, b);
         self.ins(I::I64Mul);
-        self.ins(I::LocalSet(p2));
+        self.local_set(p2);
         // a.hi*b.hi + p1.hi + p2.hi
         hi32(self, a);
         hi32(self, b);
@@ -1039,9 +1041,9 @@ impl Emitter<'_> {
         if signed {
             for (x, y) in [(a, b), (b, a)] {
                 // - (x < 0 ? y : 0)
-                self.ins(I::LocalGet(y));
+                self.local_get(y);
                 self.ins(I::I64Const(0));
-                self.ins(I::LocalGet(x));
+                self.local_get(x);
                 self.ins(I::I64Const(0));
                 self.ins(I::I64LtS);
                 self.ins(I::Select);
@@ -1110,15 +1112,15 @@ impl Emitter<'_> {
             self.ins(combine);
         }
         let r = self.scratch(wvt);
-        self.ins(I::LocalTee(r));
+        self.local_tee(r);
         if narrow {
             self.mask(ty);
         } else {
             self.ins(I::I32WrapI64);
         }
         // The flag: r != extend(truncate(r)).
-        self.ins(I::LocalGet(r));
-        self.ins(I::LocalGet(r));
+        self.local_get(r);
+        self.local_get(r);
         match (narrow, signed) {
             (true, true) => self.sext(ty),
             (true, false) => self.mask(ty),
@@ -1136,22 +1138,22 @@ impl Emitter<'_> {
         let [x, y, r] = self.scratches(ValType::I64);
         let c = self.scratch(ValType::I32);
         self.operand()?;
-        self.ins(I::LocalSet(x));
+        self.local_set(x);
         self.operand()?;
-        self.ins(I::LocalSet(y));
+        self.local_set(y);
         if carry {
             self.operand()?;
             self.ins(I::I32Const(0));
             self.ins(I::I32Ne);
-            self.ins(I::LocalSet(c));
+            self.local_set(c);
         }
-        let get = |e: &mut Self, l: u32| e.ins(I::LocalGet(l));
+        let get = |e: &mut Self, l: Local| e.local_get(l);
         get(self, x);
         get(self, y);
         match kind {
             Opcode::Imul => {
                 self.ins(I::I64Mul);
-                self.ins(I::LocalTee(r));
+                self.local_tee(r);
                 self.mulhi64_of(x, y, signed);
                 // The high half must be the sign extension of the low half.
                 if signed {
@@ -1172,7 +1174,7 @@ impl Emitter<'_> {
                     self.ins(I::I64ExtendI32U);
                     self.ins(combine);
                 }
-                self.ins(I::LocalTee(r));
+                self.local_tee(r);
                 if signed {
                     // Signed overflow: the operands' signs make the true
                     // result's sign differ from r's.

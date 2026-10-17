@@ -20,6 +20,7 @@
 //! for single bytes, where byte order does not matter.
 
 use crate::emit::{Emitter, is64, w};
+use crate::locals::Local;
 use crate::{Result, unsupported};
 use cranelift_codegen::ir::{
     AtomicRmwOp, Inst, InstructionData as D, MemFlags, Opcode, Type, types,
@@ -109,7 +110,7 @@ impl Emitter<'_> {
         MemArg {
             offset: 0,
             align: ty.bytes().trailing_zeros(),
-            memory_index: self.config.module.memory_index,
+            memory_index: self.config.module.memory_index.0,
         }
     }
 
@@ -131,42 +132,42 @@ impl Emitter<'_> {
         let raw = if big { self.scratch(vt) } else { old };
         let m = self.atomic_memarg(ty);
         self.address()?;
-        self.ins(I::LocalSet(p));
+        self.local_set(p);
         self.operand()?;
-        self.ins(I::LocalSet(x));
+        self.local_set(x);
 
         self.ins(I::Loop(BlockType::Empty));
-        self.ins(I::LocalGet(p));
+        self.local_get(p);
         self.ins(atomic_load(ty, m));
         if big {
-            self.ins(I::LocalTee(raw));
+            self.local_tee(raw);
             self.bswap(ty)?;
         }
-        self.ins(I::LocalSet(old));
-        self.ins(I::LocalGet(p));
-        self.ins(I::LocalGet(raw));
+        self.local_set(old);
+        self.local_get(p);
+        self.local_get(raw);
         self.rmw_value(op, ty, old, x);
         if big {
             self.bswap(ty)?;
         }
         self.ins(cmpxchg(ty, m));
-        self.ins(I::LocalGet(raw));
+        self.local_get(raw);
         self.ins(w!(ty, I32Ne, I64Ne));
         self.ins(I::BrIf(0));
         self.ins(I::End);
-        self.ins(I::LocalGet(old));
+        self.local_get(old);
         Ok(())
     }
 
     /// Push `op(old, x)` for the locals `old` and `x`, zero-extended for
     /// narrow types.
-    fn rmw_value(&mut self, op: AtomicRmwOp, ty: Type, old: u32, x: u32) {
+    fn rmw_value(&mut self, op: AtomicRmwOp, ty: Type, old: Local, x: Local) {
         if op == AtomicRmwOp::Xchg {
-            self.ins(I::LocalGet(x));
+            self.local_get(x);
             return;
         }
-        self.ins(I::LocalGet(old));
-        self.ins(I::LocalGet(x));
+        self.local_get(old);
+        self.local_get(x);
         match op {
             AtomicRmwOp::Add => self.ins(w!(ty, I32Add, I64Add)),
             AtomicRmwOp::Sub => self.ins(w!(ty, I32Sub, I64Sub)),
@@ -183,11 +184,11 @@ impl Emitter<'_> {
                 // select(old, x, old cmp x), comparing sign-extended values
                 // for the signed forms.
                 let signed = matches!(op, AtomicRmwOp::Smin | AtomicRmwOp::Smax);
-                self.ins(I::LocalGet(old));
+                self.local_get(old);
                 if signed {
                     self.sext(ty);
                 }
-                self.ins(I::LocalGet(x));
+                self.local_get(x);
                 if signed {
                     self.sext(ty);
                 }

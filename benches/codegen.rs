@@ -182,11 +182,13 @@ fn main() {
         fn func_index(
             &mut self,
             _: cranelift_wasm_backend::Name<'_>,
-        ) -> cranelift_wasm_backend::Result<u32> {
-            Ok(0)
+        ) -> cranelift_wasm_backend::Result<cranelift_wasm_backend::FuncIndex> {
+            Ok(cranelift_wasm_backend::FuncIndex(0))
         }
     }
-    let config = harness::config(|c| c.module.stack_pointer_global = Some(0));
+    let config = harness::config(|c| {
+        c.module.stack_pointer_global = Some(cranelift_wasm_backend::GlobalIndex(0))
+    });
     for (cname, modules) in &corpora {
         let funcs: Vec<Function> = modules
             .iter()

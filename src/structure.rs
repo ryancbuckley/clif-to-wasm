@@ -25,7 +25,7 @@
 use crate::analysis::{FuncInfo, same_call};
 use crate::emit::Emitter;
 use crate::expr_trees::ExprTrees;
-use crate::locals::Locals;
+use crate::locals::{Local, Locals};
 use crate::{CompiledFunction, Config, Env, Result, unsupported, wasm_signature, wasm_type};
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::{
@@ -69,11 +69,11 @@ struct Structurer<'a> {
     labels: Vec<Label>,
     tasks: Vec<Task>,
     /// The label local, when emitting a dispatch loop for an irreducible CFG.
-    dispatch_label: Option<u32>,
+    dispatch_label: Option<Local>,
     /// Locals holding the call results and the exception payload of the
     /// `try_call` ending each block, which its edges pass as `ret0`/`exn0`.
-    try_results: SecondaryMap<Block, Vec<u32>>,
-    try_payload: SecondaryMap<Block, Vec<u32>>,
+    try_results: SecondaryMap<Block, Vec<Local>>,
+    try_payload: SecondaryMap<Block, Vec<Local>>,
 }
 
 pub(crate) fn emit_function(
@@ -123,7 +123,7 @@ impl Structurer<'_> {
                     if payload {
                         for i in (0..self.try_payload[src].len()).rev() {
                             let l = self.try_payload[src][i];
-                            self.e.ins(I::LocalSet(l));
+                            self.e.local_set(l);
                         }
                     }
                     self.branch(src, call)?;
@@ -186,7 +186,7 @@ impl Structurer<'_> {
             self.e.ins(I::Block(BlockType::Empty));
             self.labels.push(Label::Other);
         }
-        self.e.ins(I::LocalGet(label));
+        self.e.local_get(label);
         let targets: Vec<u32> = (0..n as u32).collect();
         self.e.ins(I::BrTable(Cow::Owned(targets), 0));
         for i in 0..n {
@@ -298,9 +298,9 @@ impl Structurer<'_> {
             let mark = self.e.scratch_mark();
             let s = self.e.scratch(ValType::I64);
             let len = targets.len() as i64;
-            self.e.ins(I::LocalTee(s));
+            self.e.local_tee(s);
             self.e.ins(I::I64Const(len));
-            self.e.ins(I::LocalGet(s));
+            self.e.local_get(s);
             self.e.ins(I::I64Const(len));
             self.e.ins(I::I64LtU);
             self.e.ins(I::Select);
@@ -402,7 +402,7 @@ impl Structurer<'_> {
             _ => {
                 let mut s = Signature::new(sig.call_conv);
                 s.returns.extend(payload_ir.iter().map(|&t| AbiParam::new(t)));
-                BlockType::FunctionType(self.e.env.type_index(&s)?)
+                BlockType::FunctionType(self.e.env.type_index(&s)?.0)
             }
         };
 
@@ -412,7 +412,7 @@ impl Structurer<'_> {
             let label = i as u32;
             catches.push(match tag {
                 Some(tag) => Catch::One {
-                    tag: self.e.env.exception_tag(*tag)?,
+                    tag: self.e.env.exception_tag(*tag)?.0,
                     label,
                 },
                 None => Catch::All { label },
@@ -427,8 +427,8 @@ impl Structurer<'_> {
             self.labels.push(Label::Other);
         }
 
-        let result_locals: Vec<u32> = results.iter().map(|&t| self.e.new_local(t)).collect();
-        let payload_locals: Vec<u32> = payload.iter().map(|&t| self.e.new_local(t)).collect();
+        let result_locals: Vec<Local> = results.iter().map(|&t| self.e.new_local(t)).collect();
+        let payload_locals: Vec<Local> = payload.iter().map(|&t| self.e.new_local(t)).collect();
         self.e.ins(I::TryTable(BlockType::Empty, Cow::Owned(catches)));
         self.labels.push(Label::Other);
         let args = dfg.inst_args(term);
@@ -438,7 +438,7 @@ impl Structurer<'_> {
                     self.e.value(a)?;
                 }
                 let idx = self.e.callee_index(func_ref)?;
-                self.e.ins(I::Call(idx));
+                self.e.ins(I::Call(idx.0));
             }
             None => {
                 for &a in &args[1..] {
@@ -450,13 +450,13 @@ impl Structurer<'_> {
                 }
                 let (type_index, table_index) = self.e.indirect_call(sig_ref)?;
                 self.e.ins(I::CallIndirect {
-                    type_index,
-                    table_index,
+                    type_index: type_index.0,
+                    table_index: table_index.0,
                 });
             }
         }
         for &l in result_locals.iter().rev() {
-            self.e.ins(I::LocalSet(l));
+            self.e.local_set(l);
         }
         self.labels.pop();
         self.e.ins(I::End);
@@ -494,22 +494,22 @@ impl Structurer<'_> {
                 BlockArg::Value(a) if self.e.locals.move_needed(a, p) => self.e.value(a)?,
                 BlockArg::Value(_) => continue,
                 BlockArg::TryCallRet(i) => {
-                    self.e.ins(I::LocalGet(self.try_results[src][i as usize]))
+                    self.e.local_get(self.try_results[src][i as usize]);
                 }
                 BlockArg::TryCallExn(i) => {
-                    self.e.ins(I::LocalGet(self.try_payload[src][i as usize]))
+                    self.e.local_get(self.try_payload[src][i as usize]);
                 }
             }
             sets.push(p);
         }
         for &p in sets.iter().rev() {
-            self.e.ins(I::LocalSet(self.e.local(p)));
+            self.e.local_set(self.e.local(p));
         }
 
         let t = call.block(&func.dfg.value_lists);
         if let Some(label) = self.dispatch_label {
-            self.e.ins(I::I32Const(info.rpo_num[t] as i32));
-            self.e.ins(I::LocalSet(label));
+            self.e.ins(I::I32Const(info.rpo_num[t].0 as i32));
+            self.e.local_set(label);
             self.e.ins(I::Br(self.br_depth(Label::Dispatch)));
         } else if info.is_backward(src, t) {
             self.e.ins(I::Br(self.br_depth(Label::Loop(t))));

@@ -15,7 +15,8 @@ use cranelift_interpreter::interpreter::{Interpreter, InterpreterState};
 use cranelift_interpreter::step::ControlFlow;
 use cranelift_reader::{Comparison, ParseOptions, RunCommand, parse_run_command, parse_test};
 use cranelift_wasm_backend::{
-    Config, Env, Error, ModuleBuilder, Name, compile_function, wasm_signature,
+    Config, Env, Error, FuncIndex, ModuleBuilder, Name, TagIndex, TypeIndex, compile_function,
+    wasm_signature,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use wasm_encoder::{ConstExpr, Encode, Instruction, ValType};
@@ -25,24 +26,24 @@ pub const MEMORY_PAGES: u64 = 32;
 pub const STACK_TOP: i32 = MEMORY_PAGES as i32 * 65536;
 
 struct TestEnv<'a> {
-    names: &'a HashMap<String, u32>,
+    names: &'a HashMap<String, FuncIndex>,
     /// Wasm tag index of each Cranelift exception tag number.
-    tags: &'a HashMap<u32, u32>,
+    tags: &'a HashMap<u32, TagIndex>,
     builder: &'a mut ModuleBuilder,
 }
 
 impl Env for TestEnv<'_> {
-    fn func_index(&mut self, name: Name<'_>) -> Result<u32, Error> {
+    fn func_index(&mut self, name: Name<'_>) -> Result<FuncIndex, Error> {
         self.lookup(name)
     }
-    fn type_index(&mut self, sig: &cranelift_codegen::ir::Signature) -> Result<u32, Error> {
+    fn type_index(&mut self, sig: &cranelift_codegen::ir::Signature) -> Result<TypeIndex, Error> {
         let (p, r) = wasm_signature(sig)?;
         Ok(self.builder.type_index(&p, &r))
     }
     fn func_table_slot(&mut self, name: Name<'_>) -> Result<u64, Error> {
-        self.lookup(name).map(u64::from)
+        self.lookup(name).map(|idx| u64::from(idx.0))
     }
-    fn exception_tag(&mut self, tag: ExceptionTag) -> Result<u32, Error> {
+    fn exception_tag(&mut self, tag: ExceptionTag) -> Result<TagIndex, Error> {
         self.tags
             .get(&tag.as_u32())
             .copied()
@@ -51,7 +52,7 @@ impl Env for TestEnv<'_> {
 }
 
 impl TestEnv<'_> {
-    fn lookup(&self, name: Name<'_>) -> Result<u32, Error> {
+    fn lookup(&self, name: Name<'_>) -> Result<FuncIndex, Error> {
         let key = match name {
             Name::TestCase(s) => s.to_string(),
             other => other.to_string(),
@@ -164,7 +165,7 @@ pub fn compile_module(funcs: &[Function], config: &Config) -> (Vec<u8>, Vec<Stri
     }
     let (used_tags, throwers) = exceptions_used(&funcs);
     let payload = [ValType::I64, ValType::I64];
-    let tags: HashMap<u32, u32> = used_tags
+    let tags: HashMap<u32, TagIndex> = used_tags
         .into_iter()
         .map(|n| (n, builder.tag(&payload)))
         .collect();
@@ -175,7 +176,7 @@ pub fn compile_module(funcs: &[Function], config: &Config) -> (Vec<u8>, Vec<Stri
         for i in [
             Instruction::LocalGet(0),
             Instruction::LocalGet(1),
-            Instruction::Throw(tags[n]),
+            Instruction::Throw(tags[n].0),
             Instruction::End,
         ] {
             i.encode(&mut body);
@@ -304,17 +305,27 @@ impl Runner {
         let f = instance
             .get_func(&mut store, name)
             .ok_or_else(|| format!("no export {name}"))?;
-        // An i128 travels as two i64s, low half first.
+        // An i128 or f128 travels as two i64s, low half first.
         let mut wargs = Vec::new();
         for a in args {
             match *a {
                 DataValue::I128(x) => {
                     wargs.extend([Val::I64(x as i64), Val::I64((x >> 64) as i64)])
                 }
+                DataValue::F128(x) => {
+                    let b = x.bits();
+                    wargs.extend([Val::I64(b as i64), Val::I64((b >> 64) as i64)])
+                }
                 _ => wargs.push(to_val(a).ok_or("argument type")?),
             }
         }
-        let width = |t: &Type| if *t == types::I128 { 2 } else { 1 };
+        let width = |t: &Type| {
+            if matches!(*t, types::I128 | types::F128) {
+                2
+            } else {
+                1
+            }
+        };
         let mut results: Vec<Val> = vec![Val::I32(0); returns.iter().map(width).sum::<usize>()];
         let start = std::time::Instant::now();
         let trapped = f.call(&mut store, &wargs, &mut results).is_err();
@@ -325,13 +336,16 @@ impl Runner {
         let mut out = Vec::new();
         let mut i = 0;
         for &ty in returns {
-            if ty == types::I128 {
+            if matches!(ty, types::I128 | types::F128) {
                 let (Val::I64(lo), Val::I64(hi)) = (&results[i], &results[i + 1]) else {
-                    return Err("bad i128 result".into());
+                    return Err(format!("bad {ty} result"));
                 };
-                out.push(DataValue::I128(
-                    (*lo as u64 as i128) | ((*hi as i128) << 64),
-                ));
+                let bits = (*lo as u64 as u128) | ((*hi as u64 as u128) << 64);
+                out.push(if ty == types::I128 {
+                    DataValue::I128(bits as i128)
+                } else {
+                    DataValue::F128(Ieee128::with_bits(bits))
+                });
                 i += 2;
             } else {
                 out.push(from_val(&results[i], ty)?);
@@ -402,6 +416,9 @@ pub fn same_results(a: &[DataValue], b: &[DataValue], types: &[Type]) -> bool {
     }
     a.len() == b.len()
         && a.iter().zip(b).enumerate().all(|(i, (a, b))| match (a, b) {
+            (DataValue::F128(x), DataValue::F128(y)) => {
+                x.bits() == y.bits() || (x.is_nan() && y.is_nan())
+            }
             (DataValue::F32(x), DataValue::F32(y)) => {
                 float_eq(x.bits().into(), y.bits().into(), 32)
             }

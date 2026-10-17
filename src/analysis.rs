@@ -12,13 +12,26 @@ use cranelift_codegen::ir::{
     Block, BlockArg, BlockCall, Function, Inst, InstructionData, Opcode, Value, ValueDef,
 };
 
-pub(crate) const UNREACHABLE: u32 = u32::MAX;
+/// A block's position in reverse postorder (`0..info.rpo.len()`), or
+/// [`RpoIndex::UNREACHABLE`].
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub(crate) struct RpoIndex(pub u32);
+
+impl RpoIndex {
+    pub const UNREACHABLE: Self = Self(u32::MAX);
+}
+
+impl Default for RpoIndex {
+    fn default() -> Self {
+        Self::UNREACHABLE
+    }
+}
 
 pub(crate) struct FuncInfo {
     /// Reachable blocks in reverse postorder.
     pub rpo: Vec<Block>,
-    /// Position of each block in `rpo`, or `UNREACHABLE`.
-    pub rpo_num: SecondaryMap<Block, u32>,
+    /// Position of each block in `rpo`, or [`RpoIndex::UNREACHABLE`].
+    pub rpo_num: SecondaryMap<Block, RpoIndex>,
     /// The distinct outgoing edges of each block's terminator. Two
     /// `BlockCall`s are the same edge when they have the same target and the
     /// same arguments; e.g. `brif v, b1(x), b1(x)` has one edge.
@@ -59,9 +72,9 @@ impl FuncInfo {
         let cfg = ControlFlowGraph::with_function(func);
         let domtree = DominatorTree::with_function(func, &cfg);
         let rpo: Vec<Block> = domtree.cfg_rpo().copied().collect();
-        let mut rpo_num = SecondaryMap::with_default(UNREACHABLE);
+        let mut rpo_num = SecondaryMap::with_default(RpoIndex::UNREACHABLE);
         for (i, &b) in rpo.iter().enumerate() {
-            rpo_num[b] = i as u32;
+            rpo_num[b] = RpoIndex(i as u32);
         }
 
         let pool = &func.dfg.value_lists;
