@@ -228,15 +228,13 @@ cargo run --example runclif  -- tests/clif/control.clif
   global, atomics (wasmtime's `threads` feature), and exception tags. A
   test throws by calling `%throw_tag<N>(i64, i64)`, which the harness
   defines as a wasm `throw` (`tests/clif/exceptions.clif`).
-- Upstream runtests: 13,497 run commands pass and 0 fail; 383 of 395 files
-  are fully supported. The rest use `f128` (4 files), `f64` `fma` (4),
-  `i128` atomics (2) or Cranelift's native unwinder (`throw.clif`). Files
-  that only run under
-  Cranelift's interpreter
-  (`test interpret` without `test run`) are reported separately:
-  `i128-conversion.clif` expects the interpreter's saturating
-  float-to-`i128` conversion where Cranelift's semantics (and this backend)
-  give the exact value or trap.
+- Upstream runtests: 13,729 run commands pass and 0 fail; 393 of 395 files
+  are fully supported. The remaining two are `throw.clif` (which uses
+  Cranelift's native unwinder via `get_return_address`) and
+  `i128-conversion.clif`, an interpreter-only file (`test interpret` without
+  `test run`) that expects the interpreter's saturating float-to-`i128`
+  conversion where Cranelift's semantics (and this backend) give the exact
+  value or trap.
 
 ### Notes
 
