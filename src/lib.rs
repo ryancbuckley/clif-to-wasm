@@ -5,24 +5,27 @@
 //! are built around register allocation, which a stack machine with unlimited
 //! locals does not need. Instead the pipeline is:
 //!
-//! 0. **Legalization** ([`legalize_i128`]): `i128` values become pairs of
-//!    `i64`s, so the later passes only see types wasm has.
+//! 0. **Preparation & Legalization** ([`legalize_i128`]): value aliases are
+//!    resolved and `i128` values become pairs of `i64`s, so the later passes
+//!    only see canonical SSA values of types wasm has.
 //! 1. **Analysis** ([`analysis`]): reachability, reverse postorder, CFG edges,
 //!    dominators, loop headers and merge nodes, value-level dead code
-//!    elimination and use counts.
+//!    elimination and use counts in a single pass.
 //! 2. **Expression trees** ([`expr_trees`]): greedy, backwards, per-block
 //!    tree building, so that values pass on the operand stack instead of
 //!    through locals. A single-use def is folded into its user when doing so
 //!    does not reorder side effects; this is checked in O(1) with
 //!    Cranelift-style side-effect *colors*. Constants are rematerialized at
 //!    every use.
-//! 3. **Local allocation** ([`liveness`], [`locals`]): values that are not
-//!    consumed directly off the operand stack get a wasm local; locals are
-//!    shared between values whose live ranges do not overlap, preferring to
-//!    give block arguments and parameters the same local.
-//! 4. **Structuring and emission** ([`structure`], [`lower`]): control flow is
-//!    rebuilt from the dominator tree following Ramsey's "Beyond Relooper"
-//!    (ICFP 2022). Irreducible control flow falls back to a dispatch loop.
+//! 3. **Local allocation** ([`locals`]): values that are not consumed directly
+//!    off the operand stack get a wasm local; locals are shared between values
+//!    whose live ranges do not overlap, preferring to give block arguments and
+//!    parameters the same local.
+//! 4. **Structuring and emission** ([`structure`], [`emit`], [`lower`]):
+//!    control flow is rebuilt from the dominator tree following Ramsey's
+//!    "Beyond Relooper" (ICFP 2022), while instructions are lowered and
+//!    peephole-encoded into the function body. Irreducible control flow falls
+//!    back to a dispatch loop.
 //!
 //! Anything more aggressive (cross-block local sinking, value-carrying blocks,
 //! local reordering for LEB size) is left to `wasm-opt`.
@@ -32,10 +35,8 @@ use wasm_encoder::ValType;
 
 mod analysis;
 mod emit;
-mod encode;
 mod expr_trees;
 mod legalize_i128;
-mod liveness;
 mod locals;
 mod lower;
 mod lower_atomic;
@@ -341,46 +342,9 @@ pub fn compile_function(
     config: &Config,
     env: &mut dyn Env,
 ) -> Result<CompiledFunction> {
-    // The passes assume alias-free IR without `i128`. Both fixes need a
-    // mutable copy, so only make one when needed.
-    let rewritten;
-    let (aliases, wide) = scan(func);
-    let func = if aliases || wide {
-        let mut f = func.clone();
-        f.dfg.resolve_all_aliases();
-        if wide {
-            legalize_i128::legalize(&mut f)?;
-        }
-        rewritten = f;
-        &rewritten
-    } else {
-        func
-    };
-    let info = analysis::FuncInfo::compute(func)?;
-    let trees = expr_trees::build(func, &info, config.opts.stack_values);
-    let ranges = liveness::compute(func, &info, &trees);
-    let locals = locals::allocate(func, &info, &ranges, config.opts.coalesce)?;
-    structure::emit_function(func, config, env, &info, &trees, locals)
-}
-
-/// One pass over the function: does it use value aliases, and does it
-/// involve `i128` anywhere (signatures, block parameters or results)?
-fn scan(func: &ir::Function) -> (bool, bool) {
-    let dfg = &func.dfg;
-    let mut aliases = false;
-    let mut wide = legalize_i128::signatures_need(func);
-    for b in func.layout.blocks() {
-        wide |= dfg
-            .block_params(b)
-            .iter()
-            .any(|&p| dfg.value_type(p) == ir::types::I128);
-        for inst in func.layout.block_insts(b) {
-            aliases |= dfg.inst_values(inst).any(|v| dfg.value_is_alias(v));
-            wide |= dfg
-                .inst_results(inst)
-                .iter()
-                .any(|&r| dfg.value_type(r) == ir::types::I128);
-        }
-    }
-    (aliases, wide)
+    let func = legalize_i128::prepare(func)?;
+    let info = analysis::FuncInfo::compute(&func)?;
+    let trees = expr_trees::build(&func, &info, config.opts.stack_values);
+    let locals = locals::allocate(&func, &info, &trees, config.opts.coalesce)?;
+    structure::emit_function(&func, config, env, &info, &trees, locals)
 }

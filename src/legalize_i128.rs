@@ -33,20 +33,52 @@ use cranelift_codegen::ir::{
     AbiParam, Block, BlockArg, BlockCall, Endianness, Function, Inst, InstBuilder,
     InstructionData as D, Opcode, Signature, TrapCode, Type, Value, types::*,
 };
+use std::borrow::Cow;
 
 type Pair = (Value, Value);
 
-/// Do the function's own or its callees' signatures mention `i128`? Values
-/// of type `i128` are checked separately, in the same pass as aliases (see
-/// `scan` in `lib.rs`).
-pub(crate) fn signatures_need(func: &Function) -> bool {
+/// Prepare `func` for the backend pipeline: resolve value aliases and legalize
+/// `i128` into pairs of `i64`. Borrows `func` without cloning when neither is
+/// present.
+pub(crate) fn prepare(func: &Function) -> Result<Cow<'_, Function>> {
+    let (aliases, wide) = scan(func);
+    if !aliases && !wide {
+        return Ok(Cow::Borrowed(func));
+    }
+    let mut f = func.clone();
+    f.dfg.resolve_all_aliases();
+    if wide {
+        legalize(&mut f)?;
+    }
+    Ok(Cow::Owned(f))
+}
+
+/// One pass over the function: does it use value aliases, and does it
+/// involve `i128` anywhere (signatures, block parameters or results)?
+fn scan(func: &Function) -> (bool, bool) {
+    let dfg = &func.dfg;
     let sig_has = |s: &Signature| {
         s.params
             .iter()
             .chain(&s.returns)
             .any(|p| p.value_type == I128)
     };
-    sig_has(&func.signature) || func.dfg.signatures.values().any(sig_has)
+    let mut aliases = false;
+    let mut wide = sig_has(&func.signature) || dfg.signatures.values().any(sig_has);
+    for b in func.layout.blocks() {
+        wide |= dfg
+            .block_params(b)
+            .iter()
+            .any(|&p| dfg.value_type(p) == I128);
+        for inst in func.layout.block_insts(b) {
+            aliases |= dfg.inst_values(inst).any(|v| dfg.value_is_alias(v));
+            wide |= dfg
+                .inst_results(inst)
+                .iter()
+                .any(|&r| dfg.value_type(r) == I128);
+        }
+    }
+    (aliases, wide)
 }
 
 fn legalize_signature(sig: &mut Signature) {
@@ -75,7 +107,7 @@ enum Out {
 
 /// The function must be alias-free; aliases are created for replaced
 /// scalar results and must be resolved afterwards.
-pub(crate) fn legalize(func: &mut Function) -> Result<()> {
+fn legalize(func: &mut Function) -> Result<()> {
     legalize_signature(&mut func.signature);
     for sig in func.dfg.signatures.values_mut() {
         legalize_signature(sig);
@@ -192,10 +224,10 @@ impl Legalizer<'_> {
         let dfg = &self.func.dfg;
         let data = dfg.insts[inst];
         let op = data.opcode();
-        let args: Vec<Value> = dfg.inst_args(inst).to_vec();
-        let results: Vec<Value> = dfg.inst_results(inst).to_vec();
-        let wide_arg = args.iter().any(|&a| dfg.value_type(a) == I128);
-        let wide_res = results.iter().any(|&r| dfg.value_type(r) == I128);
+        let inst_args = dfg.inst_args(inst);
+        let inst_results = dfg.inst_results(inst);
+        let wide_arg = inst_args.iter().any(|&a| dfg.value_type(a) == I128);
+        let wide_res = inst_results.iter().any(|&r| dfg.value_type(r) == I128);
         let wide_branch_arg = data
             .branch_destination(&dfg.jump_tables, &dfg.exception_tables)
             .iter()
@@ -205,7 +237,7 @@ impl Legalizer<'_> {
             });
         // Splitting a try_call's i128 results or payload would renumber the
         // `ret`/`exn` arguments of its edges; not supported.
-        if let Some(et) = dfg.insts[inst].exception_table() {
+        if let Some(et) = data.exception_table() {
             let sig = &dfg.signatures[dfg.exception_tables[et].signature()];
             let wide_sig = sig
                 .params
@@ -219,7 +251,8 @@ impl Legalizer<'_> {
         if !wide_arg && !wide_res && !wide_branch_arg {
             return Ok(());
         }
-        let ty = results.first().map_or(INVALID, |&r| dfg.value_type(r));
+        let ty = inst_results.first().map_or(INVALID, |&r| dfg.value_type(r));
+        let args: Vec<Value> = inst_args.to_vec();
 
         // Operations that keep their non-i128 shape: replace the i128
         // operand in place.
@@ -250,16 +283,63 @@ impl Legalizer<'_> {
         }
 
         let arg_pairs: Vec<Option<Pair>> = args.iter().map(|&a| self.pairs[a]).collect();
+        let arg_tys: Vec<Type> = args.iter().map(|&a| self.ty(a)).collect();
         let p = |i: usize| -> Result<Pair> {
             match arg_pairs[i] {
                 Some(pair) => Ok(pair),
                 None => unsupported(format!("i128 value {} used before its definition", args[i])),
             }
         };
+
+        // Calls, returns, and division/remainder manage their own cursor or results.
+        match (op, data) {
+            (Opcode::Udiv | Opcode::Sdiv | Opcode::Urem | Opcode::Srem, _) => {
+                let (x, d) = (p(0)?, p(1)?);
+                let signed = matches!(op, Opcode::Sdiv | Opcode::Srem);
+                let rem = matches!(op, Opcode::Urem | Opcode::Srem);
+                let (lo, hi) = self.divmod(inst, signed, rem, x, d);
+                self.finish(inst, &[Out::Pair(lo, hi)]);
+                return Ok(());
+            }
+            (Opcode::Return, _) => {
+                let vals = self.expand(&args)?;
+                let mut pos = FuncCursor::new(self.func).at_inst(inst);
+                pos.ins().return_(&vals);
+                pos.remove_inst();
+                return Ok(());
+            }
+            (Opcode::Call | Opcode::ReturnCall, D::Call { func_ref, .. }) => {
+                let vals = self.expand(&args)?;
+                let mut pos = FuncCursor::new(self.func).at_inst(inst);
+                let new = if op == Opcode::Call {
+                    pos.ins().call(func_ref, &vals)
+                } else {
+                    pos.ins().return_call(func_ref, &vals)
+                };
+                self.finish_expanded(inst, new);
+                return Ok(());
+            }
+            (
+                Opcode::CallIndirect | Opcode::ReturnCallIndirect,
+                D::CallIndirect { sig_ref, .. },
+            ) => {
+                let vals = self.expand(&args[1..])?;
+                let mut pos = FuncCursor::new(self.func).at_inst(inst);
+                let new = if op == Opcode::CallIndirect {
+                    pos.ins().call_indirect(sig_ref, args[0], &vals)
+                } else {
+                    pos.ins().return_call_indirect(sig_ref, args[0], &vals)
+                };
+                self.finish_expanded(inst, new);
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        let mut pos = FuncCursor::new(self.func).at_inst(inst);
         let outs: Vec<Out> = match (op, data) {
             (Opcode::Iconst, D::UnaryImm { imm, .. }) => {
                 // The immediate is zero-extended.
-                let mut pos = FuncCursor::new(self.func).at_inst(inst);
                 let lo = pos.ins().iconst(I64, imm.bits());
                 let hi = pos.ins().iconst(I64, 0);
                 vec![Out::Pair(lo, hi)]
@@ -271,8 +351,7 @@ impl Legalizer<'_> {
             }
             (Opcode::Uextend | Opcode::Sextend, _) => {
                 let x = args[0];
-                let xty = self.ty(x);
-                let mut pos = FuncCursor::new(self.func).at_inst(inst);
+                let xty = arg_tys[0];
                 let lo = if xty == I64 {
                     x
                 } else if op == Opcode::Uextend {
@@ -292,16 +371,12 @@ impl Legalizer<'_> {
                 let v = if ty == I64 {
                     lo
                 } else {
-                    FuncCursor::new(self.func)
-                        .at_inst(inst)
-                        .ins()
-                        .ireduce(ty, lo)
+                    pos.ins().ireduce(ty, lo)
                 };
                 vec![Out::Value(v)]
             }
             (Opcode::Iadd | Opcode::Isub | Opcode::Imul, _) => {
                 let (a, b) = (p(0)?, p(1)?);
-                let mut pos = FuncCursor::new(self.func).at_inst(inst);
                 let (lo, hi) = match op {
                     Opcode::Iadd => add(&mut pos, a, b),
                     Opcode::Isub => sub(&mut pos, a, b),
@@ -338,7 +413,6 @@ impl Legalizer<'_> {
                         | Opcode::SsubOverflowBin
                 );
                 let c_in = args.get(2).copied();
-                let mut pos = FuncCursor::new(self.func).at_inst(inst);
                 let (lo, c) = match (add, c_in) {
                     (true, None) => pos.ins().uadd_overflow(al, bl),
                     (true, Some(c)) => pos.ins().uadd_overflow_cin(al, bl, c),
@@ -355,7 +429,6 @@ impl Legalizer<'_> {
             }
             (Opcode::Band | Opcode::Bor | Opcode::Bxor, _) => {
                 let ((al, ah), (bl, bh)) = (p(0)?, p(1)?);
-                let mut pos = FuncCursor::new(self.func).at_inst(inst);
                 let f = |pos: &mut FuncCursor, x, y| match op {
                     Opcode::Band => pos.ins().band(x, y),
                     Opcode::Bor => pos.ins().bor(x, y),
@@ -367,27 +440,23 @@ impl Legalizer<'_> {
             }
             (Opcode::Bnot, _) => {
                 let (l, h) = p(0)?;
-                let mut pos = FuncCursor::new(self.func).at_inst(inst);
                 let lo = pos.ins().bnot(l);
                 let hi = pos.ins().bnot(h);
                 vec![Out::Pair(lo, hi)]
             }
             (Opcode::Bitselect, _) => {
                 let ((cl, ch), (xl, xh), (yl, yh)) = (p(0)?, p(1)?, p(2)?);
-                let mut pos = FuncCursor::new(self.func).at_inst(inst);
                 let lo = pos.ins().bitselect(cl, xl, yl);
                 let hi = pos.ins().bitselect(ch, xh, yh);
                 vec![Out::Pair(lo, hi)]
             }
             (Opcode::Ineg, _) => {
                 let x = p(0)?;
-                let mut pos = FuncCursor::new(self.func).at_inst(inst);
                 let (lo, hi) = neg(&mut pos, x);
                 vec![Out::Pair(lo, hi)]
             }
             (Opcode::Iabs, _) => {
                 let x = p(0)?;
-                let mut pos = FuncCursor::new(self.func).at_inst(inst);
                 let n = neg(&mut pos, x);
                 let is_neg = pos.ins().icmp_imm_s(IntCC::SignedLessThan, x.1, 0);
                 let (lo, hi) = select(&mut pos, is_neg, n, x);
@@ -401,36 +470,32 @@ impl Legalizer<'_> {
                     Opcode::Umin => IntCC::UnsignedLessThan,
                     _ => IntCC::UnsignedGreaterThan,
                 };
-                let mut pos = FuncCursor::new(self.func).at_inst(inst);
                 let c = icmp(&mut pos, cc, a, b);
                 let (lo, hi) = select(&mut pos, c, a, b);
                 vec![Out::Pair(lo, hi)]
             }
             (Opcode::Select | Opcode::SelectSpectreGuard, _) => {
-                let c = if self.ty(args[0]) == I128 {
+                let c = if arg_tys[0] == I128 {
                     let (l, h) = p(0)?;
-                    FuncCursor::new(self.func).at_inst(inst).ins().bor(l, h)
+                    pos.ins().bor(l, h)
                 } else {
                     args[0]
                 };
                 let (x, y) = (p(1)?, p(2)?);
-                let mut pos = FuncCursor::new(self.func).at_inst(inst);
                 let (lo, hi) = select(&mut pos, c, x, y);
                 vec![Out::Pair(lo, hi)]
             }
             (Opcode::Icmp, D::IntCompare { cond, .. }) => {
                 let (a, b) = (p(0)?, p(1)?);
-                let mut pos = FuncCursor::new(self.func).at_inst(inst);
                 vec![Out::Value(icmp(&mut pos, cond, a, b))]
             }
             (Opcode::Bmask, _) => {
-                let x = if self.ty(args[0]) == I128 {
+                let x = if arg_tys[0] == I128 {
                     let (l, h) = p(0)?;
-                    FuncCursor::new(self.func).at_inst(inst).ins().bor(l, h)
+                    pos.ins().bor(l, h)
                 } else {
                     args[0]
                 };
-                let mut pos = FuncCursor::new(self.func).at_inst(inst);
                 if ty == I128 {
                     let m = pos.ins().bmask(I64, x);
                     vec![Out::Pair(m, m)]
@@ -440,9 +505,7 @@ impl Legalizer<'_> {
             }
             (Opcode::Ishl | Opcode::Ushr | Opcode::Sshr | Opcode::Rotl | Opcode::Rotr, _) => {
                 let x = p(0)?;
-                let amt = args[1];
-                let amt = if self.ty(amt) == I128 { p(1)?.0 } else { amt };
-                let mut pos = FuncCursor::new(self.func).at_inst(inst);
+                let amt = if arg_tys[1] == I128 { p(1)?.0 } else { args[1] };
                 let amt = to_i64(&mut pos, amt);
                 let (lo, hi) = match op {
                     Opcode::Ishl | Opcode::Ushr | Opcode::Sshr => shift(&mut pos, op, x, amt),
@@ -464,7 +527,6 @@ impl Legalizer<'_> {
             }
             (Opcode::Clz | Opcode::Ctz | Opcode::Popcnt | Opcode::Cls, _) => {
                 let (l, h) = p(0)?;
-                let mut pos = FuncCursor::new(self.func).at_inst(inst);
                 let n = match op {
                     Opcode::Clz => clz(&mut pos, (l, h)),
                     Opcode::Ctz => {
@@ -493,7 +555,6 @@ impl Legalizer<'_> {
             }
             (Opcode::Bswap | Opcode::Bitrev, _) => {
                 let (l, h) = p(0)?;
-                let mut pos = FuncCursor::new(self.func).at_inst(inst);
                 let (lo, hi) = if op == Opcode::Bswap {
                     (pos.ins().bswap(h), pos.ins().bswap(l))
                 } else {
@@ -503,7 +564,6 @@ impl Legalizer<'_> {
             }
             (Opcode::UaddOverflowTrap, D::IntAddTrap { code, .. }) => {
                 let (a, b) = (p(0)?, p(1)?);
-                let mut pos = FuncCursor::new(self.func).at_inst(inst);
                 let r = add(&mut pos, a, b);
                 let overflow = icmp(&mut pos, IntCC::UnsignedLessThan, r, a);
                 pos.ins().trapnz(overflow, code);
@@ -512,9 +572,8 @@ impl Legalizer<'_> {
 
             // Memory.
             (Opcode::Load, D::Load { flags, offset, .. }) if ty == I128 => {
-                let flags = self.func.dfg.mem_flags[flags];
+                let flags = pos.func.dfg.mem_flags[flags];
                 let (lo_off, hi_off) = half_offsets(flags.endianness(Endianness::Little), offset)?;
-                let mut pos = FuncCursor::new(self.func).at_inst(inst);
                 let lo = pos.ins().load(I64, flags, args[0], lo_off);
                 let hi = pos.ins().load(I64, flags, args[0], hi_off);
                 vec![Out::Pair(lo, hi)]
@@ -525,8 +584,7 @@ impl Legalizer<'_> {
             ) => {
                 let (lo, hi) = p(0)?;
                 let addr = args[1];
-                let flags = self.func.dfg.mem_flags[flags];
-                let mut pos = FuncCursor::new(self.func).at_inst(inst);
+                let flags = pos.func.dfg.mem_flags[flags];
                 match op {
                     Opcode::Store => {
                         let (lo_off, hi_off) =
@@ -549,12 +607,11 @@ impl Legalizer<'_> {
 
             // Bitcasts to and from 128-bit vectors.
             (Opcode::Bitcast, D::LoadNoOffset { flags, .. }) => {
-                let flags = self.func.dfg.mem_flags[flags];
+                let flags = pos.func.dfg.mem_flags[flags];
                 if flags.endianness(Endianness::Little) == Endianness::Big {
                     return unsupported("big-endian i128 bitcast");
                 }
-                let aty = self.ty(args[0]);
-                let mut pos = FuncCursor::new(self.func).at_inst(inst);
+                let aty = arg_tys[0];
                 if aty == I128 && ty == I128 {
                     let (lo, hi) = p(0)?;
                     vec![Out::Pair(lo, hi)]
@@ -582,19 +639,9 @@ impl Legalizer<'_> {
                 }
             }
 
-            // Division.
-            (Opcode::Udiv | Opcode::Sdiv | Opcode::Urem | Opcode::Srem, _) => {
-                let (x, d) = (p(0)?, p(1)?);
-                let signed = matches!(op, Opcode::Sdiv | Opcode::Srem);
-                let rem = matches!(op, Opcode::Urem | Opcode::Srem);
-                let (lo, hi) = self.divmod(inst, signed, rem, x, d);
-                vec![Out::Pair(lo, hi)]
-            }
-
             // Conversions to and from floats.
             (Opcode::FcvtFromSint | Opcode::FcvtFromUint, _) => {
                 let x = p(0)?;
-                let mut pos = FuncCursor::new(self.func).at_inst(inst);
                 let v = if op == Opcode::FcvtFromUint {
                     u128_to_float(&mut pos, ty, x)
                 } else {
@@ -614,49 +661,12 @@ impl Legalizer<'_> {
                 | Opcode::FcvtToUintSat,
                 _,
             ) => {
-                let mut pos = FuncCursor::new(self.func).at_inst(inst);
                 let (lo, hi) = float_to_128(&mut pos, op, args[0]);
                 vec![Out::Pair(lo, hi)]
             }
 
-            // Calls and returns.
-            (Opcode::Return, _) => {
-                let vals = self.expand(&args)?;
-                FuncCursor::new(self.func)
-                    .at_inst(inst)
-                    .ins()
-                    .return_(&vals);
-                FuncCursor::new(self.func).at_inst(inst).remove_inst();
-                return Ok(());
-            }
-            (Opcode::Call | Opcode::ReturnCall, D::Call { func_ref, .. }) => {
-                let vals = self.expand(&args)?;
-                let mut pos = FuncCursor::new(self.func).at_inst(inst);
-                let new = if op == Opcode::Call {
-                    pos.ins().call(func_ref, &vals)
-                } else {
-                    pos.ins().return_call(func_ref, &vals)
-                };
-                self.finish_expanded(inst, new);
-                return Ok(());
-            }
-            (
-                Opcode::CallIndirect | Opcode::ReturnCallIndirect,
-                D::CallIndirect { sig_ref, .. },
-            ) => {
-                let vals = self.expand(&args[1..])?;
-                let mut pos = FuncCursor::new(self.func).at_inst(inst);
-                let new = if op == Opcode::CallIndirect {
-                    pos.ins().call_indirect(sig_ref, args[0], &vals)
-                } else {
-                    pos.ins().return_call_indirect(sig_ref, args[0], &vals)
-                };
-                self.finish_expanded(inst, new);
-                return Ok(());
-            }
-
             _ => {
-                return unsupported(format!("i128 in `{}`", self.func.dfg.display_inst(inst)));
+                return unsupported(format!("i128 in `{}`", pos.func.dfg.display_inst(inst)));
             }
         };
         self.finish(inst, &outs);

@@ -11,9 +11,6 @@ mod harness;
 
 use cranelift_codegen::data_value::DataValue;
 use cranelift_codegen::ir::Type;
-use cranelift_interpreter::environment::FunctionStore;
-use cranelift_interpreter::interpreter::{Interpreter, InterpreterState};
-use cranelift_interpreter::step::ControlFlow;
 use cranelift_wasm_backend::{Config, Optimizations};
 use harness::clifgen::{Rng, arg, generate, generate_i128, generate_simd};
 
@@ -84,24 +81,12 @@ fn differential() {
             let mut rng = Rng(seed ^ 0xdead_beef);
             for _ in 0..4 {
                 let args: Vec<DataValue> = params.iter().map(|&t| arg(&mut rng, t)).collect();
-
-                let mut store = FunctionStore::default();
-                store.add("%f".into(), &func);
-                let state = InterpreterState::default().with_function_store(store);
-                let mut interp = Interpreter::new(state).with_fuel(Some(1_000_000));
-                let call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    interp.call_by_name("%f", &args).map(|cf| match cf {
-                        ControlFlow::Return(vals) => Some(vals.to_vec()),
-                        ControlFlow::Trap(_) => None,
-                        other => panic!("seed {seed}: interpreter: {other:?}"),
-                    })
-                }));
-                let expected = match call {
-                    Ok(Ok(e)) => e,
-                    Ok(Err(e)) => panic!("seed {seed} {kind:?}: interpreter error: {e}\n{func}"),
+                let expected = match harness::interpret(std::slice::from_ref(&func), "f", &args) {
+                    Some(Ok(e)) => e,
+                    Some(Err(e)) => panic!("seed {seed} {kind:?}: interpreter error: {e}\n{func}"),
                     // The interpreter does not implement every vector
                     // operation on every type; such cases are inconclusive.
-                    Err(_) => {
+                    None => {
                         skipped += 1;
                         break;
                     }

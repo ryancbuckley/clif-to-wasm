@@ -1,51 +1,36 @@
-//! Emission state shared by structuring and lowering, and value emission.
+//! Instruction, value, operand, local and stack-frame emission.
 //!
-//! `i8` and `i16` values are represented as zero-extended `i32`s. Operations
-//! that can set bits above the type's width mask their result; operations
-//! that depend on the sign bit sign-extend their inputs first.
+//! [`Emitter`] encapsulates the low-level mechanics of producing a WebAssembly
+//! function body:
+//!
+//! - **Function prologue and epilogue**: lays out stack slots in a shadow
+//!   stack frame in linear memory (via `ModuleLayout::stack_pointer_global`)
+//!   and masks narrow (`i8`/`i16`) entry parameters.
+//! - **Operand stack cursor**: [`Emitter::inst`] loads the operands of an
+//!   instruction in the exact order defined by [`crate::expr_trees::operands`],
+//!   and lowering pulls them one by one with [`Emitter::operand`].
+//! - **Scoped scratch locals**: temporary locals requested with
+//!   [`Emitter::scratch`] or [`Emitter::scratches`] are tracked on a LIFO
+//!   stack and automatically returned to a free pool when [`Emitter::inst`]
+//!   (or an inner scratch scope) completes.
+//! - **Narrow-integer representation**: `i8` and `i16` values are stored
+//!   zero-extended in `i32`s. Operations that can set bits above the type's
+//!   width call [`Emitter::mask`]; operations that depend on the sign bit call
+//!   [`Emitter::sext`] on their inputs first.
+//! - **Byte encoding**: encodes instructions into the function's byte stream,
+//!   fusing adjacent `local.set x; local.get x` into `local.tee x` when
+//!   `Optimizations::use_tee` is enabled.
 
 use crate::analysis::{FuncInfo, is_remat};
-use crate::encode::{Body, ExtraLocals};
 use crate::expr_trees::{ExprTrees, Operand, operands};
 use crate::locals::{Locals, NO_LOCAL};
-use crate::{Config, Env, Result, unsupported};
+use crate::{CompiledFunction, Config, Env, Name, Result, unsupported, wasm_signature};
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::{
-    Endianness, Function, Inst, InstructionData as D, StackSlot, Type, Value, ValueDef, types,
+    Endianness, FuncRef, Function, Inst, InstructionData as D, MemFlags, Opcode, SigRef, StackSlot,
+    Type, Value, ValueDef, types,
 };
-use wasm_encoder::{BlockType, Instruction as I, MemArg, ValType};
-
-/// An entry on the wasm label stack, used to compute branch depths.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Label {
-    If,
-    Loop(cranelift_codegen::ir::Block),
-    BlockFollowedBy(cranelift_codegen::ir::Block),
-    Dispatch,
-    Other,
-}
-
-/// Pending structured-emission work; see `structure.rs`.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum Task {
-    /// Emit a dominator subtree.
-    Tree(cranelift_codegen::ir::Block),
-    /// Move block arguments and transfer control along an edge.
-    Branch {
-        src: cranelift_codegen::ir::Block,
-        call: cranelift_codegen::ir::BlockCall,
-    },
-    Else,
-    /// Close the innermost label.
-    End,
-    /// Like `Branch`, along an exception edge of a `try_call` whose wasm
-    /// label left the payload on the stack (if `payload`).
-    Catch {
-        src: cranelift_codegen::ir::Block,
-        call: cranelift_codegen::ir::BlockCall,
-        payload: bool,
-    },
-}
+use wasm_encoder::{BlockType, Encode, Instruction as I, MemArg, ValType};
 
 pub(crate) struct Emitter<'a> {
     pub func: &'a Function,
@@ -54,22 +39,14 @@ pub(crate) struct Emitter<'a> {
     pub info: &'a FuncInfo,
     pub trees: &'a ExprTrees,
     pub locals: Locals,
-    pub labels: Vec<Label>,
-    pub tasks: Vec<Task>,
-    /// Shadow-stack frame: (frame pointer local, frame size).
-    pub frame: Option<(u32, u32)>,
-    pub slot_offset: SecondaryMap<StackSlot, u32>,
-    /// The label local, when emitting a dispatch loop.
-    pub dispatch_label: Option<u32>,
-    /// Locals holding the call results and the exception payload of the
-    /// `try_call` ending each block, which its edges pass as `ret0`/`exn0`.
-    pub try_results: SecondaryMap<cranelift_codegen::ir::Block, Vec<u32>>,
-    pub try_payload: SecondaryMap<cranelift_codegen::ir::Block, Vec<u32>>,
+    /// Shadow-stack frame: `(frame_pointer_local, frame_size)`.
+    frame: Option<(u32, u32)>,
+    slot_offset: SecondaryMap<StackSlot, u32>,
     body: Body,
-    /// Locals created during emission (scratch, frame pointer, label).
+    /// Locals created during emission (scratch locals, frame pointer, etc.).
     extra: ExtraLocals,
     /// Operands of the instructions being lowered, outermost first, and a
-    /// (next, end) cursor into it for each of those instructions.
+    /// `(next, end)` cursor into it for each active instruction.
     operand_stack: Vec<Value>,
     cursors: Vec<(usize, usize)>,
     ops_tmp: Vec<Operand>,
@@ -100,6 +77,8 @@ macro_rules! w {
 pub(crate) use w;
 
 impl<'a> Emitter<'a> {
+    /// Create an emitter for `func` and emit the function prologue (shadow
+    /// stack allocation and narrow parameter masking).
     pub fn new(
         func: &'a Function,
         config: &'a Config,
@@ -107,27 +86,87 @@ impl<'a> Emitter<'a> {
         info: &'a FuncInfo,
         trees: &'a ExprTrees,
         locals: Locals,
-    ) -> Self {
+    ) -> Result<Self> {
         let base = locals.next_index();
-        Emitter {
+        let mut e = Emitter {
             func,
             config,
             env,
             info,
             trees,
             locals,
-            labels: Vec::new(),
-            tasks: Vec::new(),
             frame: None,
             slot_offset: SecondaryMap::new(),
-            dispatch_label: None,
-            try_results: SecondaryMap::new(),
-            try_payload: SecondaryMap::new(),
             body: Body::new(config.opts.use_tee),
             extra: ExtraLocals::new(base),
             operand_stack: Vec::new(),
             cursors: Vec::new(),
             ops_tmp: Vec::new(),
+        };
+        e.emit_prologue()?;
+        Ok(e)
+    }
+
+    fn emit_prologue(&mut self) -> Result<()> {
+        let func = self.func;
+        let config = self.config;
+        if !func.dynamic_stack_slots.is_empty() {
+            return unsupported("dynamic stack slots");
+        }
+        if !func.sized_stack_slots.is_empty() {
+            let Some(sp) = config.module.stack_pointer_global else {
+                return unsupported("stack slots without ModuleLayout::stack_pointer_global");
+            };
+            let mut size: u32 = 0;
+            for (slot, data) in func.sized_stack_slots.iter() {
+                if data.align_shift > 4 {
+                    return unsupported("stack slot alignment above 16");
+                }
+                let align = 1u32 << data.align_shift;
+                size = size.next_multiple_of(align);
+                self.slot_offset[slot] = size;
+                size += data.size;
+            }
+            let size = size.next_multiple_of(16);
+            let fp = self.new_local(config.module.ptr_ty());
+            self.frame = Some((fp, size));
+            self.ins(I::GlobalGet(sp));
+            self.ptr_const(size as i64);
+            self.ins(if config.module.memory64 {
+                I::I64Sub
+            } else {
+                I::I32Sub
+            });
+            self.ins(I::LocalTee(fp));
+            self.ins(I::GlobalSet(sp));
+        }
+
+        // Callers may pass arbitrary bits in the upper bits of narrow parameters.
+        let entry = self.info.rpo[0];
+        for (i, &p) in func.dfg.block_params(entry).iter().enumerate() {
+            let bits = match func.dfg.value_type(p) {
+                types::I8 => 0xff,
+                types::I16 => 0xffff,
+                _ => continue,
+            };
+            if self.info.is_live(p) {
+                self.ins(I::LocalGet(i as u32));
+                self.ins(I::I32Const(bits));
+                self.ins(I::I32And);
+                self.ins(I::LocalSet(i as u32));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn epilogue(&mut self) {
+        if let Some((fp, size)) = self.frame {
+            self.ins(I::LocalGet(fp));
+            self.ptr_const(size as i64);
+            self.ptr_add();
+            self.ins(I::GlobalSet(
+                self.config.module.stack_pointer_global.unwrap(),
+            ));
         }
     }
 
@@ -135,33 +174,59 @@ impl<'a> Emitter<'a> {
         self.body.ins(i);
     }
 
-    pub fn finish(self) -> (Vec<u8>, Locals, Vec<ValType>) {
-        let extra = self.extra.types().to_vec();
-        (self.body.finish(), self.locals, extra)
+    /// Complete the function body (`unreachable; end`), run-length encode all
+    /// declared and extra locals, and return the [`CompiledFunction`].
+    pub fn finish(mut self) -> Result<CompiledFunction> {
+        let (params, results) = wasm_signature(&self.func.signature)?;
+        self.ins(I::Unreachable);
+        self.ins(I::End);
+        let body = self.body.finish();
+        let mut decls: Vec<(u32, ValType)> = Vec::new();
+        for &ty in self.locals.decls.iter().chain(self.extra.types()) {
+            match decls.last_mut() {
+                Some((n, t)) if *t == ty => *n += 1,
+                _ => decls.push((1, ty)),
+            }
+        }
+        Ok(CompiledFunction {
+            params,
+            results,
+            locals: decls,
+            body,
+        })
     }
 
+    // ---- Locals & Scratch Pool ----------------------------------------------
+
+    /// Allocate a fresh local that persists for the rest of the function.
     pub fn new_local(&mut self, ty: ValType) -> u32 {
         self.extra.fresh(ty)
     }
 
+    /// Allocate a temporary scratch local for the current instruction (or
+    /// inner scratch scope). Automatically returned to the free pool when the
+    /// instruction or scope finishes.
     pub(crate) fn scratch(&mut self, ty: ValType) -> u32 {
         self.extra.scratch(ty)
     }
 
-    pub(crate) fn release(&mut self, ty: ValType, l: u32) {
-        self.extra.release(ty, l);
+    /// Allocate `N` temporary scratch locals of type `ty`.
+    pub(crate) fn scratches<const N: usize>(&mut self, ty: ValType) -> [u32; N] {
+        std::array::from_fn(|_| self.extra.scratch(ty))
     }
 
-    pub fn br_depth(&self, label: Label) -> u32 {
-        let i = self
-            .labels
-            .iter()
-            .rposition(|&l| l == label)
-            .expect("branch target in scope");
-        (self.labels.len() - 1 - i) as u32
+    /// Record the current scratch stack depth for an inner helper that may be
+    /// called multiple times within one instruction.
+    pub(crate) fn scratch_mark(&self) -> usize {
+        self.extra.mark()
     }
 
-    // ---- Values ---------------------------------------------------------
+    /// Reclaim all scratch locals allocated since `mark`.
+    pub(crate) fn free_scratches(&mut self, mark: usize) {
+        self.extra.free_since(mark);
+    }
+
+    // ---- Values & Operands --------------------------------------------------
 
     pub(crate) fn ty(&self, v: Value) -> Type {
         self.func.dfg.value_type(v)
@@ -173,11 +238,11 @@ impl<'a> Emitter<'a> {
         l
     }
 
-    /// Push the value `v`.
+    /// Push the value `v` onto the wasm operand stack.
     pub fn value(&mut self, v: Value) -> Result<()> {
         match self.func.dfg.value_def(v) {
             ValueDef::Result(d, _) if is_remat(self.func, d) => self.constant(d),
-            ValueDef::Result(d, _) if self.trees.inlined[d] => self.inst(d),
+            ValueDef::Result(d, _) if self.trees.is_inlined(d) => self.inst(d),
             _ => {
                 self.ins(I::LocalGet(self.local(v)));
                 Ok(())
@@ -271,8 +336,7 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// Push the next operand, an address, converted to the wasm address
-    /// type.
+    /// Push the next operand, an address, converted to the wasm address type.
     pub(crate) fn address(&mut self) -> Result<()> {
         let v = self.operand()?;
         match (self.ty(v), self.config.module.memory64) {
@@ -301,12 +365,7 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
-    pub(crate) fn memarg(
-        &mut self,
-        offset: u64,
-        flags: cranelift_codegen::ir::MemFlags,
-        size: u32,
-    ) -> MemArg {
+    pub(crate) fn memarg(&mut self, offset: u64, flags: MemFlags, size: u32) -> MemArg {
         let data = self.func.dfg.mem_flags[flags];
         MemArg {
             offset,
@@ -321,7 +380,7 @@ impl<'a> Emitter<'a> {
 
     /// Does an access with these flags use big-endian byte order? Wasm
     /// memory is little-endian, so such accesses reverse their bytes.
-    pub(crate) fn big_endian(&self, flags: cranelift_codegen::ir::MemFlags) -> bool {
+    pub(crate) fn big_endian(&self, flags: MemFlags) -> bool {
         self.func.dfg.mem_flags[flags].explicit_endianness() == Some(Endianness::Big)
     }
 
@@ -338,49 +397,24 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    pub fn epilogue(&mut self) {
-        if let Some((fp, size)) = self.frame {
-            self.ins(I::LocalGet(fp));
-            self.ptr_const(size as i64);
-            self.ptr_add();
-            self.ins(I::GlobalSet(
-                self.config.module.stack_pointer_global.unwrap(),
-            ));
-        }
+    /// Emit `stack_addr` for `stack_slot` + `offset` with result type `ty`.
+    pub(crate) fn stack_addr(&mut self, stack_slot: StackSlot, offset: i32, ty: Type) -> Result<()> {
+        let (fp, _) = self.frame.expect("frame for stack slot");
+        self.ins(I::LocalGet(fp));
+        let off = self.slot_offset[stack_slot] as i64 + i64::from(offset);
+        self.ptr_const(off);
+        self.ptr_add();
+        self.ptr_to(ty)
     }
 
-    // ---- Instructions -----------------------------------------------------
-
-    /// Emit a root instruction and store or drop its results.
-    pub fn root(&mut self, inst: Inst) -> Result<()> {
-        self.inst(inst)?;
-        for &r in self.func.dfg.inst_results(inst).iter().rev() {
-            let l = self.locals.local_of[r];
-            if l == NO_LOCAL {
-                self.ins(I::Drop);
-            } else {
-                self.ins(I::LocalSet(l));
-            }
+    /// Emit `get_stack_pointer` or `get_frame_pointer` with result type `ty`.
+    pub(crate) fn stack_pointer(&mut self, op: Opcode, ty: Type) -> Result<()> {
+        match (self.frame, self.config.module.stack_pointer_global) {
+            (Some((fp, _)), _) => self.ins(I::LocalGet(fp)),
+            (None, Some(sp)) => self.ins(I::GlobalGet(sp)),
+            (None, None) => return unsupported(format!("{op} without a stack pointer")),
         }
-        Ok(())
-    }
-
-    /// Emit an instruction, leaving its results on the stack.
-    ///
-    /// Lowering takes the operands one by one with [`Self::operand`], so they
-    /// are pushed in exactly the order tree building assumed.
-    pub fn inst(&mut self, inst: Inst) -> Result<()> {
-        let start = self.operand_stack.len();
-        let mut ops = std::mem::take(&mut self.ops_tmp);
-        operands(self.func, self.info, inst, &mut ops);
-        self.operand_stack.extend(ops.iter().map(|o| o.value));
-        self.ops_tmp = ops;
-        self.cursors.push((start, self.operand_stack.len()));
-        self.lower(inst)?;
-        let (next, end) = self.cursors.pop().unwrap();
-        assert_eq!(next, end, "lowering of {inst} skipped operands");
-        self.operand_stack.truncate(start);
-        Ok(())
+        self.ptr_to(ty)
     }
 
     /// Convert a pointer-typed value on the stack to `ty`.
@@ -399,5 +433,147 @@ impl<'a> Emitter<'a> {
         self.ins(I::If(BlockType::Empty));
         self.ins(I::Unreachable);
         self.ins(I::End);
+    }
+
+    /// Resolve a direct callee `FuncRef` to its wasm function index.
+    pub(crate) fn callee_index(&mut self, func_ref: FuncRef) -> Result<u32> {
+        let name = &self.func.dfg.ext_funcs[func_ref].name;
+        self.env.func_index(Name::resolve(self.func, name))
+    }
+
+    /// The type and table indices for an indirect call with signature `sig`.
+    pub(crate) fn indirect_call(&mut self, sig: SigRef) -> Result<(u32, u32)> {
+        let Some(table_index) = self.config.module.table_index else {
+            return unsupported("call_indirect without ModuleLayout::table_index");
+        };
+        let type_index = self.env.type_index(&self.func.dfg.signatures[sig])?;
+        Ok((type_index, table_index))
+    }
+
+    // ---- Instructions -------------------------------------------------------
+
+    /// Emit a root instruction and store or drop its results.
+    pub fn root(&mut self, inst: Inst) -> Result<()> {
+        self.inst(inst)?;
+        for &r in self.func.dfg.inst_results(inst).iter().rev() {
+            let l = self.locals.local_of[r];
+            if l == NO_LOCAL {
+                self.ins(I::Drop);
+            } else {
+                self.ins(I::LocalSet(l));
+            }
+        }
+        Ok(())
+    }
+
+    /// Emit an instruction, leaving its results on the stack.
+    ///
+    /// Lowering takes the operands one by one with [`Self::operand`], so they
+    /// are pushed in exactly the order tree building assumed. Scratch locals
+    /// allocated during lowering are automatically reclaimed on exit.
+    pub fn inst(&mut self, inst: Inst) -> Result<()> {
+        let start = self.operand_stack.len();
+        let mut ops = std::mem::take(&mut self.ops_tmp);
+        operands(self.func, self.info, inst, &mut ops);
+        self.operand_stack.extend(ops.iter().map(|o| o.value));
+        self.ops_tmp = ops;
+        self.cursors.push((start, self.operand_stack.len()));
+        let scratch_mark = self.extra.mark();
+        let res = self.lower(inst);
+        self.extra.free_since(scratch_mark);
+        res?;
+        let (next, end) = self.cursors.pop().unwrap();
+        assert_eq!(next, end, "lowering of {inst} skipped operands");
+        self.operand_stack.truncate(start);
+        Ok(())
+    }
+}
+
+// ---- Byte encoding & Extra locals -------------------------------------------
+
+/// The encoded instructions of one function body, with a peephole that fuses
+/// `local.set x; local.get x` into `local.tee x`.
+struct Body {
+    bytes: Vec<u8>,
+    pending_set: Option<u32>,
+    use_tee: bool,
+}
+
+impl Body {
+    fn new(use_tee: bool) -> Self {
+        Body {
+            bytes: Vec::new(),
+            pending_set: None,
+            use_tee,
+        }
+    }
+
+    fn ins(&mut self, i: I<'_>) {
+        if let Some(l) = self.pending_set.take() {
+            if self.use_tee && matches!(i, I::LocalGet(g) if g == l) {
+                I::LocalTee(l).encode(&mut self.bytes);
+                return;
+            }
+            I::LocalSet(l).encode(&mut self.bytes);
+        }
+        if let I::LocalSet(l) = i {
+            self.pending_set = Some(l);
+            return;
+        }
+        i.encode(&mut self.bytes);
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        if let Some(l) = self.pending_set.take() {
+            I::LocalSet(l).encode(&mut self.bytes);
+        }
+        self.bytes
+    }
+}
+
+/// Locals created during emission, after the ones assigned to SSA values:
+/// scoped scratch locals used inside instruction lowerings, and function-wide
+/// locals such as the frame pointer or dispatch label.
+struct ExtraLocals {
+    base: u32,
+    types: Vec<ValType>,
+    free_scratch: Vec<(ValType, u32)>,
+    active_scratch: Vec<(ValType, u32)>,
+}
+
+impl ExtraLocals {
+    fn new(base: u32) -> Self {
+        ExtraLocals {
+            base,
+            types: Vec::new(),
+            free_scratch: Vec::new(),
+            active_scratch: Vec::new(),
+        }
+    }
+
+    fn fresh(&mut self, ty: ValType) -> u32 {
+        self.types.push(ty);
+        self.base + self.types.len() as u32 - 1
+    }
+
+    fn scratch(&mut self, ty: ValType) -> u32 {
+        let l = match self.free_scratch.iter().position(|&(t, _)| t == ty) {
+            Some(i) => self.free_scratch.swap_remove(i).1,
+            None => self.fresh(ty),
+        };
+        self.active_scratch.push((ty, l));
+        l
+    }
+
+    fn mark(&self) -> usize {
+        self.active_scratch.len()
+    }
+
+    fn free_since(&mut self, mark: usize) {
+        self.free_scratch.extend(self.active_scratch.drain(mark..));
+    }
+
+    fn types(&self) -> &[ValType] {
+        &self.types
     }
 }

@@ -21,8 +21,9 @@
 //! narrowing operations), loads and stores account for the lane count.
 
 use crate::emit::Emitter;
+use crate::lower_float::FloatCmpOps;
 use crate::{Result, fixed_type, unsupported};
-use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{Inst, InstructionData as D, Opcode, Type, types};
 use wasm_encoder::{Instruction as I, MemArg, ValType};
 
@@ -42,7 +43,13 @@ impl Lane {
         if !ty.is_vector() || !(16..=128).contains(&ty.bits()) {
             return unsupported(format!("vector type {ty}"));
         }
-        Ok(match ty.lane_type() {
+        Self::from_scalar(ty.lane_type()).ok_or_else(|| {
+            crate::Error::Unsupported(format!("vector type {ty}"))
+        })
+    }
+
+    fn from_scalar(ty: Type) -> Option<Lane> {
+        Some(match ty {
             types::I8 => Lane::I8,
             // f16 lanes can be moved around like i16 lanes; arithmetic
             // on them is rejected below as on any integer lane.
@@ -51,7 +58,7 @@ impl Lane {
             types::I64 => Lane::I64,
             types::F32 => Lane::F32,
             types::F64 => Lane::F64,
-            _ => return unsupported(format!("vector type {ty}")),
+            _ => return None,
         })
     }
 
@@ -70,6 +77,41 @@ impl Lane {
             Lane::F32 => Lane::I32,
             Lane::F64 => Lane::I64,
             l => l,
+        }
+    }
+
+    fn splat(self) -> I<'static> {
+        match self {
+            Lane::I8 => I::I8x16Splat,
+            Lane::I16 => I::I16x8Splat,
+            Lane::I32 => I::I32x4Splat,
+            Lane::I64 => I::I64x2Splat,
+            Lane::F32 => I::F32x4Splat,
+            Lane::F64 => I::F64x2Splat,
+        }
+    }
+
+    /// Extract lane `idx`, zero-extending narrow integer lanes to match the
+    /// scalar representation of `i8`/`i16`.
+    fn extract_lane(self, idx: u8) -> I<'static> {
+        match self {
+            Lane::I8 => I::I8x16ExtractLaneU(idx),
+            Lane::I16 => I::I16x8ExtractLaneU(idx),
+            Lane::I32 => I::I32x4ExtractLane(idx),
+            Lane::I64 => I::I64x2ExtractLane(idx),
+            Lane::F32 => I::F32x4ExtractLane(idx),
+            Lane::F64 => I::F64x2ExtractLane(idx),
+        }
+    }
+
+    fn replace_lane(self, idx: u8) -> I<'static> {
+        match self {
+            Lane::I8 => I::I8x16ReplaceLane(idx),
+            Lane::I16 => I::I16x8ReplaceLane(idx),
+            Lane::I32 => I::I32x4ReplaceLane(idx),
+            Lane::I64 => I::I64x2ReplaceLane(idx),
+            Lane::F32 => I::F32x4ReplaceLane(idx),
+            Lane::F64 => I::F64x2ReplaceLane(idx),
         }
     }
 }
@@ -162,32 +204,21 @@ impl Emitter<'_> {
             // Lanes.
             (Opcode::Splat, _) => {
                 self.operand()?;
-                self.ins(lanes!(lane, op;
-                    I8 => I::I8x16Splat, I16 => I::I16x8Splat, I32 => I::I32x4Splat,
-                    I64 => I::I64x2Splat, F32 => I::F32x4Splat, F64 => I::F64x2Splat));
+                self.ins(lane.splat());
             }
             (Opcode::ScalarToVector, _) => {
                 self.ins(I::V128Const(0));
                 self.operand()?;
-                self.replace_lane(lane, 0);
+                self.ins(lane.replace_lane(0));
             }
             (Opcode::Extractlane, D::BinaryImm8 { imm, .. }) => {
                 self.operand()?;
-                // Narrow lanes are extracted zero-extended, the scalar
-                // representation of `i8`/`i16`.
-                self.ins(match lane {
-                    Lane::I8 => I::I8x16ExtractLaneU(imm),
-                    Lane::I16 => I::I16x8ExtractLaneU(imm),
-                    Lane::I32 => I::I32x4ExtractLane(imm),
-                    Lane::I64 => I::I64x2ExtractLane(imm),
-                    Lane::F32 => I::F32x4ExtractLane(imm),
-                    Lane::F64 => I::F64x2ExtractLane(imm),
-                });
+                self.ins(lane.extract_lane(imm));
             }
             (Opcode::Insertlane, D::TernaryImm8 { imm, .. }) => {
                 self.operand()?;
                 self.operand()?;
-                self.replace_lane(lane, imm);
+                self.ins(lane.replace_lane(imm));
             }
             (Opcode::Shuffle, D::Shuffle { imm, .. }) => {
                 self.operand()?;
@@ -289,8 +320,7 @@ impl Emitter<'_> {
                 } else {
                     (I::I64x2ShrU, I::I64x2Sub)
                 };
-                let a = self.scratch(ValType::V128);
-                let b = self.scratch(ValType::V128);
+                let [a, b] = self.scratches(ValType::V128);
                 self.operand()?;
                 self.ins(I::LocalTee(a));
                 self.operand()?;
@@ -302,8 +332,6 @@ impl Emitter<'_> {
                 self.ins(I::I32Const(1));
                 self.ins(shr);
                 self.ins(sub);
-                self.release(ValType::V128, a);
-                self.release(ValType::V128, b);
             }
             (Opcode::AvgRound, _) => {
                 self.operand()?;
@@ -314,8 +342,7 @@ impl Emitter<'_> {
                 // (a * b + 2^30) >> 31 on 64-bit products, then the low
                 // halves. Only MIN * MIN overflows; it wraps to MIN, which
                 // no other inputs produce, so turn MIN into MAX.
-                let a = self.scratch(ValType::V128);
-                let b = self.scratch(ValType::V128);
+                let [a, b] = self.scratches(ValType::V128);
                 self.operand()?;
                 self.ins(I::LocalSet(a));
                 self.operand()?;
@@ -335,8 +362,6 @@ impl Emitter<'_> {
                 self.ins(splat_const(Lane::I32, 0x8000_0000));
                 self.ins(I::I32x4Eq);
                 self.ins(I::V128Xor);
-                self.release(ValType::V128, a);
-                self.release(ValType::V128, b);
             }
             (Opcode::SqmulRoundSat, _) => {
                 self.operand()?;
@@ -347,8 +372,7 @@ impl Emitter<'_> {
                 // [x0+x1, x2+x3, ..., y0+y1, ...]: add the even lanes of
                 // x then y to the odd ones. Lane `full + k` of the shuffle's
                 // input is lane `k` of y.
-                let x = self.scratch(ValType::V128);
-                let y = self.scratch(ValType::V128);
+                let [x, y] = self.scratches(ValType::V128);
                 let b = lane.bytes();
                 let half = count / 2;
                 let pick = move |i: u32, odd: u32| match i {
@@ -366,8 +390,6 @@ impl Emitter<'_> {
                 self.ins(I::I8x16Shuffle(shuffle_bytes(b, |i| pick(i, 1))));
                 self.ins(lanes!(lane, op; I8 => I::I8x16Add, I16 => I::I16x8Add,
                     I32 => I::I32x4Add, I64 => I::I64x2Add));
-                self.release(ValType::V128, x);
-                self.release(ValType::V128, y);
             }
             (Opcode::Popcnt, _) => {
                 self.operand()?;
@@ -391,7 +413,6 @@ impl Emitter<'_> {
                         self.ins(I::I64x2Add);
                         self.ins(splat_const(Lane::I64, 0xffff_ffff));
                         self.ins(I::V128And);
-                        self.release(ValType::V128, s);
                     }
                     _ => return unsupported(format!("{op} on {vty}")),
                 }
@@ -448,8 +469,6 @@ impl Emitter<'_> {
                 self.ins(I::I32Sub);
                 self.ins(second);
                 self.ins(I::V128Or);
-                self.release(ValType::V128, x);
-                self.release(ValType::I32, n);
             }
 
             // Bitwise.
@@ -484,7 +503,9 @@ impl Emitter<'_> {
             // Comparisons and reductions.
             (Opcode::Icmp, D::IntCompare { cond, .. }) => self.vector_icmp(lane, cond)?,
             (Opcode::Fcmp, D::FloatCompare { cond, .. }) => {
-                self.vector_fcmp(Lane::of(aty)?, cond)?
+                let ops = lanes!(Lane::of(aty)?, op;
+                    F32 => FloatCmpOps::F32X4, F64 => FloatCmpOps::F64X2);
+                self.emit_fcmp(cond, ops)?;
             }
             (Opcode::VanyTrue, _) => {
                 self.operand()?;
@@ -580,7 +601,6 @@ impl Emitter<'_> {
                         self.ins(I::LocalTee(s));
                         self.ins(I::LocalGet(s));
                         self.ins(I::I8x16Shuffle(shuffle_bytes(src.bytes(), |i| i + n / 2)));
-                        self.release(ValType::V128, s);
                         if op == Opcode::SwidenHigh {
                             Opcode::SwidenLow
                         } else {
@@ -618,24 +638,13 @@ impl Emitter<'_> {
             ) => {
                 self.operand()?;
                 self.operand()?;
-                let f64 = match lane {
-                    Lane::F32 => false,
-                    Lane::F64 => true,
-                    _ => return unsupported(format!("{op} on {vty}")),
-                };
-                self.ins(match (op, f64) {
-                    (Opcode::Fadd, false) => I::F32x4Add,
-                    (Opcode::Fadd, true) => I::F64x2Add,
-                    (Opcode::Fsub, false) => I::F32x4Sub,
-                    (Opcode::Fsub, true) => I::F64x2Sub,
-                    (Opcode::Fmul, false) => I::F32x4Mul,
-                    (Opcode::Fmul, true) => I::F64x2Mul,
-                    (Opcode::Fdiv, false) => I::F32x4Div,
-                    (Opcode::Fdiv, true) => I::F64x2Div,
-                    (Opcode::Fmin, false) => I::F32x4Min,
-                    (Opcode::Fmin, true) => I::F64x2Min,
-                    (Opcode::Fmax, false) => I::F32x4Max,
-                    _ => I::F64x2Max,
+                self.ins(match op {
+                    Opcode::Fadd => lanes!(lane, op; F32 => I::F32x4Add, F64 => I::F64x2Add),
+                    Opcode::Fsub => lanes!(lane, op; F32 => I::F32x4Sub, F64 => I::F64x2Sub),
+                    Opcode::Fmul => lanes!(lane, op; F32 => I::F32x4Mul, F64 => I::F64x2Mul),
+                    Opcode::Fdiv => lanes!(lane, op; F32 => I::F32x4Div, F64 => I::F64x2Div),
+                    Opcode::Fmin => lanes!(lane, op; F32 => I::F32x4Min, F64 => I::F64x2Min),
+                    _ => lanes!(lane, op; F32 => I::F32x4Max, F64 => I::F64x2Max),
                 });
             }
             (
@@ -649,26 +658,14 @@ impl Emitter<'_> {
                 _,
             ) => {
                 self.operand()?;
-                let f64 = match lane {
-                    Lane::F32 => false,
-                    Lane::F64 => true,
-                    _ => return unsupported(format!("{op} on {vty}")),
-                };
-                self.ins(match (op, f64) {
-                    (Opcode::Fneg, false) => I::F32x4Neg,
-                    (Opcode::Fneg, true) => I::F64x2Neg,
-                    (Opcode::Fabs, false) => I::F32x4Abs,
-                    (Opcode::Fabs, true) => I::F64x2Abs,
-                    (Opcode::Sqrt, false) => I::F32x4Sqrt,
-                    (Opcode::Sqrt, true) => I::F64x2Sqrt,
-                    (Opcode::Ceil, false) => I::F32x4Ceil,
-                    (Opcode::Ceil, true) => I::F64x2Ceil,
-                    (Opcode::Floor, false) => I::F32x4Floor,
-                    (Opcode::Floor, true) => I::F64x2Floor,
-                    (Opcode::Trunc, false) => I::F32x4Trunc,
-                    (Opcode::Trunc, true) => I::F64x2Trunc,
-                    (Opcode::Nearest, false) => I::F32x4Nearest,
-                    _ => I::F64x2Nearest,
+                self.ins(match op {
+                    Opcode::Fneg => lanes!(lane, op; F32 => I::F32x4Neg, F64 => I::F64x2Neg),
+                    Opcode::Fabs => lanes!(lane, op; F32 => I::F32x4Abs, F64 => I::F64x2Abs),
+                    Opcode::Sqrt => lanes!(lane, op; F32 => I::F32x4Sqrt, F64 => I::F64x2Sqrt),
+                    Opcode::Ceil => lanes!(lane, op; F32 => I::F32x4Ceil, F64 => I::F64x2Ceil),
+                    Opcode::Floor => lanes!(lane, op; F32 => I::F32x4Floor, F64 => I::F64x2Floor),
+                    Opcode::Trunc => lanes!(lane, op; F32 => I::F32x4Trunc, F64 => I::F64x2Trunc),
+                    _ => lanes!(lane, op; F32 => I::F32x4Nearest, F64 => I::F64x2Nearest),
                 });
             }
             (Opcode::Fma, _) if lane == Lane::F32 => self.fma_f32_lanes(vty)?,
@@ -676,11 +673,10 @@ impl Emitter<'_> {
                 // (x & ~sign) | (y & sign) == bitselect(x, y, ~sign).
                 self.operand()?;
                 self.operand()?;
-                let magnitude = match lane {
-                    Lane::F32 => splat_const(Lane::I32, 0x7fff_ffff),
-                    Lane::F64 => splat_const(Lane::I64, 0x7fff_ffff_ffff_ffff),
-                    _ => return unsupported(format!("{op} on {vty}")),
-                };
+                let magnitude = lanes!(lane, op;
+                    F32 => splat_const(Lane::I32, 0x7fff_ffff),
+                    F64 => splat_const(Lane::I64, 0x7fff_ffff_ffff_ffff),
+                );
                 self.ins(magnitude);
                 self.ins(I::V128Bitselect);
             }
@@ -738,22 +734,14 @@ impl Emitter<'_> {
                         Lane::of(aty)?;
                     }
                     // A scalar is lane 0 of a vector of its width.
-                    (true, false) => self.ins(match ty {
-                        types::I64 => I::I64x2ExtractLane(0),
-                        types::F64 => I::F64x2ExtractLane(0),
-                        types::I32 => I::I32x4ExtractLane(0),
-                        types::F32 => I::F32x4ExtractLane(0),
-                        types::I16 | types::F16 => I::I16x8ExtractLaneU(0),
+                    (true, false) => match Lane::from_scalar(ty) {
+                        Some(l) if l != Lane::I8 => self.ins(l.extract_lane(0)),
                         _ => return unsupported(format!("bitcast {aty} -> {ty}")),
-                    }),
-                    (false, _) => self.ins(match aty {
-                        types::I64 => I::I64x2Splat,
-                        types::F64 => I::F64x2Splat,
-                        types::I32 => I::I32x4Splat,
-                        types::F32 => I::F32x4Splat,
-                        types::I16 | types::F16 => I::I16x8Splat,
+                    },
+                    (false, _) => match Lane::from_scalar(aty) {
+                        Some(l) if l != Lane::I8 => self.ins(l.splat()),
                         _ => return unsupported(format!("bitcast {aty} -> {ty}")),
-                    }),
+                    },
                 }
             }
 
@@ -826,7 +814,6 @@ impl Emitter<'_> {
             self.ins(I::I8x16Shuffle(shuffle_bytes(bytes, |i| {
                 if i < n { i } else { full + i - n }
             })));
-            self.release(ValType::V128, s);
         }
         Ok(())
     }
@@ -835,34 +822,14 @@ impl Emitter<'_> {
     /// the stack.
     fn per_lane_64(&mut self, from: Lane, to: Lane, convert: I<'static>) {
         let s = self.scratch(ValType::V128);
-        let extract = |i| match from {
-            Lane::I64 => I::I64x2ExtractLane(i),
-            _ => I::F64x2ExtractLane(i),
-        };
         self.ins(I::LocalTee(s));
-        self.ins(extract(0));
+        self.ins(from.extract_lane(0));
         self.ins(convert.clone());
-        self.ins(if to == Lane::F64 {
-            I::F64x2Splat
-        } else {
-            I::I64x2Splat
-        });
+        self.ins(to.splat());
         self.ins(I::LocalGet(s));
-        self.ins(extract(1));
+        self.ins(from.extract_lane(1));
         self.ins(convert);
-        self.replace_lane(to, 1);
-        self.release(ValType::V128, s);
-    }
-
-    fn replace_lane(&mut self, lane: Lane, idx: u8) {
-        self.ins(match lane {
-            Lane::I8 => I::I8x16ReplaceLane(idx),
-            Lane::I16 => I::I16x8ReplaceLane(idx),
-            Lane::I32 => I::I32x4ReplaceLane(idx),
-            Lane::I64 => I::I64x2ReplaceLane(idx),
-            Lane::F32 => I::F32x4ReplaceLane(idx),
-            Lane::F64 => I::F64x2ReplaceLane(idx),
-        });
+        self.ins(to.replace_lane(1));
     }
 
     /// Push both operands and leave the double-width products of their low
@@ -877,8 +844,7 @@ impl Emitter<'_> {
             (Lane::I32, true) => (I::I64x2ExtMulLowI32x4S, I::I64x2ExtMulHighI32x4S),
             _ => return unsupported(format!("widening multiply of {lane:?} lanes")),
         };
-        let x = self.scratch(ValType::V128);
-        let y = self.scratch(ValType::V128);
+        let [x, y] = self.scratches(ValType::V128);
         self.operand()?;
         self.ins(I::LocalTee(x));
         self.operand()?;
@@ -887,8 +853,6 @@ impl Emitter<'_> {
         self.ins(I::LocalGet(x));
         self.ins(I::LocalGet(y));
         self.ins(hi);
-        self.release(ValType::V128, x);
-        self.release(ValType::V128, y);
         Ok(())
     }
 
@@ -901,7 +865,7 @@ impl Emitter<'_> {
             _ => (I::I64x2Add, I::I64x2Sub, I::I64x2ShrS, i64::MAX as u64),
         };
         let sign_shift = (lane.bytes() * 8 - 1) as i32;
-        let [a, b, r] = [(); 3].map(|_| self.scratch(ValType::V128));
+        let [a, b, r] = self.scratches(ValType::V128);
         self.operand()?;
         self.ins(I::LocalSet(a));
         self.operand()?;
@@ -951,9 +915,6 @@ impl Emitter<'_> {
                 self.ins(I::V128Bitselect);
             }
         }
-        for l in [a, b, r] {
-            self.release(ValType::V128, l);
-        }
         Ok(())
     }
 
@@ -978,6 +939,7 @@ impl Emitter<'_> {
     /// narrowing `op`.
     fn clamp_i64x2(&mut self, op: Opcode) -> Result<()> {
         const SIGN: u64 = 1 << 63;
+        let mark = self.scratch_mark();
         let s = self.scratch(ValType::V128);
         self.ins(I::LocalSet(s));
         // (bound, replace the lane when `lane cmp bound`, compare unsigned)
@@ -1008,17 +970,15 @@ impl Emitter<'_> {
             self.ins(I::LocalSet(s));
         }
         self.ins(I::LocalGet(s));
-        self.release(ValType::V128, s);
+        self.free_scratches(mark);
         Ok(())
     }
 
     /// `umulhi`/`smulhi` on `i64x2`, one lane at a time with the scalar
     /// algorithm.
     fn mulhi_i64x2(&mut self, signed: bool) -> Result<()> {
-        let a = self.scratch(ValType::V128);
-        let b = self.scratch(ValType::V128);
-        let sa = self.scratch(ValType::I64);
-        let sb = self.scratch(ValType::I64);
+        let [a, b] = self.scratches(ValType::V128);
+        let [sa, sb] = self.scratches(ValType::I64);
         self.operand()?;
         self.ins(I::LocalSet(a));
         self.operand()?;
@@ -1037,10 +997,6 @@ impl Emitter<'_> {
                 I::I64x2ReplaceLane(1)
             });
         }
-        self.release(ValType::V128, a);
-        self.release(ValType::V128, b);
-        self.release(ValType::I64, sa);
-        self.release(ValType::I64, sb);
         Ok(())
     }
 
@@ -1051,8 +1007,7 @@ impl Emitter<'_> {
         } else {
             I::I64x2GtS
         };
-        let a = self.scratch(ValType::V128);
-        let b = self.scratch(ValType::V128);
+        let [a, b] = self.scratches(ValType::V128);
         self.operand()?;
         self.ins(I::LocalTee(a));
         self.operand()?;
@@ -1070,8 +1025,6 @@ impl Emitter<'_> {
         }
         self.ins(cmp);
         self.ins(I::V128Bitselect);
-        self.release(ValType::V128, a);
-        self.release(ValType::V128, b);
         Ok(())
     }
 
@@ -1150,83 +1103,6 @@ impl Emitter<'_> {
             _ => return unsupported(format!("icmp on {lane:?} lanes")),
         };
         self.ins(i);
-        Ok(())
-    }
-
-    fn vector_fcmp(&mut self, lane: Lane, cond: FloatCC) -> Result<()> {
-        use FloatCC::*;
-        let f64 = match lane {
-            Lane::F32 => false,
-            Lane::F64 => true,
-            _ => return unsupported(format!("fcmp on {lane:?} lanes")),
-        };
-        let pick = |a: I<'static>, b: I<'static>| if f64 { b } else { a };
-        let eq = pick(I::F32x4Eq, I::F64x2Eq);
-        let ne = pick(I::F32x4Ne, I::F64x2Ne);
-        let lt = pick(I::F32x4Lt, I::F64x2Lt);
-        let le = pick(I::F32x4Le, I::F64x2Le);
-        let gt = pick(I::F32x4Gt, I::F64x2Gt);
-        let ge = pick(I::F32x4Ge, I::F64x2Ge);
-        // Unordered-or-X is the negation of the ordered inverse.
-        let simple = match cond {
-            Equal => Some((eq.clone(), false)),
-            NotEqual => Some((ne.clone(), false)),
-            LessThan => Some((lt.clone(), false)),
-            LessThanOrEqual => Some((le.clone(), false)),
-            GreaterThan => Some((gt.clone(), false)),
-            GreaterThanOrEqual => Some((ge.clone(), false)),
-            UnorderedOrLessThan => Some((ge.clone(), true)),
-            UnorderedOrLessThanOrEqual => Some((gt.clone(), true)),
-            UnorderedOrGreaterThan => Some((le.clone(), true)),
-            UnorderedOrGreaterThanOrEqual => Some((lt.clone(), true)),
-            _ => None,
-        };
-        if let Some((i, negate)) = simple {
-            self.operand()?;
-            self.operand()?;
-            self.ins(i);
-            if negate {
-                self.ins(I::V128Not);
-            }
-            return Ok(());
-        }
-        let a = self.scratch(ValType::V128);
-        let b = self.scratch(ValType::V128);
-        match cond {
-            Ordered | Unordered => {
-                let (cmp, comb) = if cond == Ordered {
-                    (eq, I::V128And)
-                } else {
-                    (ne, I::V128Or)
-                };
-                self.operand()?;
-                self.ins(I::LocalTee(a));
-                self.ins(I::LocalGet(a));
-                self.ins(cmp.clone());
-                self.operand()?;
-                self.ins(I::LocalTee(b));
-                self.ins(I::LocalGet(b));
-                self.ins(cmp);
-                self.ins(comb);
-            }
-            OrderedNotEqual | UnorderedOrEqual => {
-                self.operand()?;
-                self.ins(I::LocalTee(a));
-                self.operand()?;
-                self.ins(I::LocalTee(b));
-                self.ins(lt);
-                self.ins(I::LocalGet(a));
-                self.ins(I::LocalGet(b));
-                self.ins(gt);
-                self.ins(I::V128Or);
-                if cond == UnorderedOrEqual {
-                    self.ins(I::V128Not);
-                }
-            }
-            _ => unreachable!(),
-        }
-        self.release(ValType::V128, a);
-        self.release(ValType::V128, b);
         Ok(())
     }
 }

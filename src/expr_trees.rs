@@ -28,16 +28,17 @@
 //!
 //! # Algorithm
 //!
-//! Each block is walked backwards. Every live instruction that has not been
-//! folded into a later one is a *root*. For each root, its operands are
-//! visited in reverse emission order (the operand stack is LIFO), depth-first,
-//! and an operand's defining instruction is folded into the tree when:
+//! Each block is walked backwards. Every live instruction that is not a
+//! rematerialized constant starts as a *root* (`root_of[i] = Some(i)`). For
+//! each root, its operands are visited in reverse emission order (the operand
+//! stack is LIFO), depth-first, and an operand's defining instruction `d` is
+//! folded into the tree (`root_of[d] = Some(root)`) when:
 //!
-//! - it is in the same block, has exactly one result and that result has
-//!   exactly one use;
-//! - it is not a rematerialized constant (those are emitted at every use
+//! - `d` is in the same block, has a single result, and that result has a
+//!   single use;
+//! - `d` is not a rematerialized constant (those are emitted at every use
 //!   anyway); and
-//! - if it has a side effect (including trapping and reading memory), the
+//! - if `d` has a side effect (including trapping and reading memory), the
 //!   move does not reorder it with another side effect.
 //!
 //! The last check is O(1). `color[i]` is the number of effectful instructions
@@ -61,21 +62,27 @@ use cranelift_codegen::ir::{Function, Inst, Opcode, Value, ValueDef};
 const MAX_TREE_DEPTH: u32 = 100;
 
 pub(crate) struct ExprTrees {
-    /// The result of this instruction is consumed directly from the stack by
-    /// its only user, so the instruction is emitted as part of that user's
-    /// tree.
-    pub inlined: SecondaryMap<Inst, bool>,
-    /// For inlined instructions: the root of the tree containing it.
-    pub root_of: SecondaryMap<Inst, Option<Inst>>,
+    /// For every emitted instruction (roots and inlined nodes): the root of
+    /// the expression tree containing it. A root maps to `Some(itself)`;
+    /// dead instructions and rematerialized constants map to `None`.
+    root_of: SecondaryMap<Inst, Option<Inst>>,
 }
 
 impl ExprTrees {
-    pub fn is_root(&self, info: &FuncInfo, func: &Function, inst: Inst) -> bool {
-        info.live_inst[inst] && !self.inlined[inst] && !is_remat(func, inst)
+    /// Is `inst` the root of an emitted expression tree?
+    pub fn is_root(&self, inst: Inst) -> bool {
+        self.root_of[inst] == Some(inst)
     }
 
-    pub fn root(&self, inst: Inst) -> Inst {
-        self.root_of[inst].unwrap_or(inst)
+    /// Is `inst` folded into another instruction's expression tree?
+    pub fn is_inlined(&self, inst: Inst) -> bool {
+        self.root_of[inst].is_some_and(|r| r != inst)
+    }
+
+    /// The root of the tree containing `inst`, or `None` if `inst` is dead or
+    /// rematerialized.
+    pub fn root(&self, inst: Inst) -> Option<Inst> {
+        self.root_of[inst]
     }
 }
 
@@ -162,10 +169,9 @@ pub(crate) fn operands(func: &Function, info: &FuncInfo, inst: Inst, out: &mut V
 }
 
 /// Build the expression trees of every reachable block. With `enabled` off,
-/// every live instruction is its own root.
+/// every live non-constant instruction remains its own root.
 pub(crate) fn build(func: &Function, info: &FuncInfo, enabled: bool) -> ExprTrees {
     let mut s = ExprTrees {
-        inlined: SecondaryMap::new(),
         root_of: SecondaryMap::new(),
     };
     let mut color: SecondaryMap<Inst, u32> = SecondaryMap::new();
@@ -180,15 +186,19 @@ pub(crate) fn build(func: &Function, info: &FuncInfo, enabled: bool) -> ExprTree
             if !info.live_inst[inst] || is_remat(func, inst) {
                 continue;
             }
+            s.root_of[inst] = Some(inst);
             color[inst] = c;
             if has_lowering_side_effect(func, inst) {
                 effectful[inst] = true;
                 c += 1;
             }
         }
+        if !enabled {
+            continue;
+        }
 
         for root in func.layout.block_insts(block).rev() {
-            if !enabled || !s.is_root(info, func, root) {
+            if !s.is_root(root) {
                 continue;
             }
             let mut moved = 0;
@@ -200,21 +210,19 @@ pub(crate) fn build(func: &Function, info: &FuncInfo, enabled: bool) -> ExprTree
                     continue;
                 };
                 if info.use_count[v] != 1
+                    || !s.is_root(d)
                     || func.dfg.inst_results(d).len() != 1
                     || func.layout.inst_block(d) != Some(block)
-                    || is_remat(func, d)
                     || depth > MAX_TREE_DEPTH
                 {
                     continue;
                 }
-                debug_assert!(!s.inlined[d]);
                 if effectful[d] {
                     if !allow_effects || color[root] - color[d] - 1 != moved {
                         continue;
                     }
                     moved += 1;
                 }
-                s.inlined[d] = true;
                 s.root_of[d] = Some(root);
                 operands(func, info, d, &mut ops);
                 worklist.extend(

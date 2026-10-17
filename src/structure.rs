@@ -22,17 +22,59 @@
 //! If the CFG is irreducible, the whole function is instead emitted as a
 //! loop around a `br_table` that dispatches on a label local.
 
-use crate::analysis::FuncInfo;
-use crate::emit::{Emitter, Label, Task};
+use crate::analysis::{FuncInfo, same_call};
+use crate::emit::Emitter;
 use crate::expr_trees::ExprTrees;
 use crate::locals::Locals;
-use crate::{CompiledFunction, Config, Env, Name, Result, unsupported, wasm_signature, wasm_type};
+use crate::{CompiledFunction, Config, Env, Result, unsupported, wasm_signature, wasm_type};
+use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::{
     AbiParam, Block, BlockArg, BlockCall, ExceptionTableItem, ExceptionTag, Function, Inst,
     InstructionData, Opcode, Signature, types,
 };
 use std::borrow::Cow;
 use wasm_encoder::{BlockType, Catch, Instruction as I, ValType};
+
+/// An entry on the wasm label stack, used to compute branch depths.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Label {
+    If,
+    Loop(Block),
+    BlockFollowedBy(Block),
+    Dispatch,
+    Other,
+}
+
+/// Pending structured-emission work.
+#[derive(Clone, Copy, Debug)]
+enum Task {
+    /// Emit a dominator subtree.
+    Tree(Block),
+    /// Move block arguments and transfer control along an edge.
+    Branch { src: Block, call: BlockCall },
+    Else,
+    /// Close the innermost label.
+    End,
+    /// Like `Branch`, along an exception edge of a `try_call` whose wasm
+    /// label left the payload on the stack (if `payload`).
+    Catch {
+        src: Block,
+        call: BlockCall,
+        payload: bool,
+    },
+}
+
+struct Structurer<'a> {
+    e: Emitter<'a>,
+    labels: Vec<Label>,
+    tasks: Vec<Task>,
+    /// The label local, when emitting a dispatch loop for an irreducible CFG.
+    dispatch_label: Option<u32>,
+    /// Locals holding the call results and the exception payload of the
+    /// `try_call` ending each block, which its edges pass as `ret0`/`exn0`.
+    try_results: SecondaryMap<Block, Vec<u32>>,
+    try_payload: SecondaryMap<Block, Vec<u32>>,
+}
 
 pub(crate) fn emit_function(
     func: &Function,
@@ -42,83 +84,35 @@ pub(crate) fn emit_function(
     trees: &ExprTrees,
     locals: Locals,
 ) -> Result<CompiledFunction> {
-    let (params, results) = wasm_signature(&func.signature)?;
-    let mut e = Emitter::new(func, config, env, info, trees, locals);
-
-    if !func.dynamic_stack_slots.is_empty() {
-        return unsupported("dynamic stack slots");
-    }
-    if !func.sized_stack_slots.is_empty() {
-        let Some(sp) = config.module.stack_pointer_global else {
-            return unsupported("stack slots without ModuleLayout::stack_pointer_global");
-        };
-        let mut size: u32 = 0;
-        for (slot, data) in func.sized_stack_slots.iter() {
-            if data.align_shift > 4 {
-                return unsupported("stack slot alignment above 16");
-            }
-            let align = 1u32 << data.align_shift;
-            size = size.next_multiple_of(align);
-            e.slot_offset[slot] = size;
-            size += data.size;
-        }
-        let size = size.next_multiple_of(16);
-        let fp = e.new_local(config.module.ptr_ty());
-        e.frame = Some((fp, size));
-        e.ins(I::GlobalGet(sp));
-        if config.module.memory64 {
-            e.ins(I::I64Const(size as i64));
-            e.ins(I::I64Sub);
-        } else {
-            e.ins(I::I32Const(size as i32));
-            e.ins(I::I32Sub);
-        }
-        e.ins(I::LocalTee(fp));
-        e.ins(I::GlobalSet(sp));
-    }
-
-    // Callers may pass garbage in the upper bits of narrow parameters.
+    let e = Emitter::new(func, config, env, info, trees, locals)?;
+    let mut s = Structurer {
+        e,
+        labels: Vec::new(),
+        tasks: Vec::new(),
+        dispatch_label: None,
+        try_results: SecondaryMap::new(),
+        try_payload: SecondaryMap::new(),
+    };
     let entry = info.rpo[0];
-    for (i, &p) in func.dfg.block_params(entry).iter().enumerate() {
-        let bits = match func.dfg.value_type(p) {
-            types::I8 => 0xff,
-            types::I16 => 0xffff,
-            _ => continue,
-        };
-        if info.live_val[p] {
-            e.ins(I::LocalGet(i as u32));
-            e.ins(I::I32Const(bits));
-            e.ins(I::I32And);
-            e.ins(I::LocalSet(i as u32));
-        }
-    }
-
     if info.reducible {
-        e.tasks.push(Task::Tree(entry));
-        e.run_tasks()?;
+        s.tasks.push(Task::Tree(entry));
+        s.run_tasks()?;
     } else {
-        e.dispatch()?;
+        s.dispatch()?;
     }
-    e.ins(I::Unreachable);
-    e.ins(I::End);
-
-    let (body, locals, extra) = e.finish();
-    let mut decls: Vec<(u32, ValType)> = Vec::new();
-    for ty in locals.decls.iter().chain(extra.iter()) {
-        match decls.last_mut() {
-            Some((n, t)) if t == ty => *n += 1,
-            _ => decls.push((1, *ty)),
-        }
-    }
-    Ok(CompiledFunction {
-        params,
-        results,
-        locals: decls,
-        body,
-    })
+    s.e.finish()
 }
 
-impl Emitter<'_> {
+impl Structurer<'_> {
+    fn br_depth(&self, label: Label) -> u32 {
+        let i = self
+            .labels
+            .iter()
+            .rposition(|&l| l == label)
+            .expect("branch target in scope");
+        (self.labels.len() - 1 - i) as u32
+    }
+
     /// Run tasks until the stack is empty.
     fn run_tasks(&mut self) -> Result<()> {
         while let Some(task) = self.tasks.pop() {
@@ -127,16 +121,17 @@ impl Emitter<'_> {
                 Task::Branch { src, call } => self.branch(src, call)?,
                 Task::Catch { src, call, payload } => {
                     if payload {
-                        for &l in self.try_payload[src].clone().iter().rev() {
-                            self.ins(I::LocalSet(l));
+                        for i in (0..self.try_payload[src].len()).rev() {
+                            let l = self.try_payload[src][i];
+                            self.e.ins(I::LocalSet(l));
                         }
                     }
                     self.branch(src, call)?;
                 }
-                Task::Else => self.ins(I::Else),
+                Task::Else => self.e.ins(I::Else),
                 Task::End => {
                     self.labels.pop();
-                    self.ins(I::End);
+                    self.e.ins(I::End);
                 }
             }
         }
@@ -159,20 +154,20 @@ impl Emitter<'_> {
     /// end
     /// ```
     fn tree(&mut self, x: Block) -> Result<()> {
-        if self.info.loop_header[x] {
-            self.ins(I::Loop(BlockType::Empty));
+        let info = self.e.info;
+        if info.loop_header[x] {
+            self.e.ins(I::Loop(BlockType::Empty));
             self.labels.push(Label::Loop(x));
             self.tasks.push(Task::End);
         }
-        let mut merges: Vec<Block> = self
-            .info
+        let mut merges: Vec<Block> = info
             .domtree
             .children(x)
-            .filter(|&c| self.info.is_merge(c))
+            .filter(|&c| info.is_merge(c))
             .collect();
-        merges.sort_unstable_by_key(|&b| std::cmp::Reverse(self.info.rpo_num[b]));
+        merges.sort_unstable_by_key(|&b| std::cmp::Reverse(info.rpo_num[b]));
         for &y in &merges {
-            self.ins(I::Block(BlockType::Empty));
+            self.e.ins(I::Block(BlockType::Empty));
             self.labels.push(Label::BlockFollowedBy(y));
             self.tasks.push(Task::Tree(y));
             self.tasks.push(Task::End);
@@ -182,37 +177,37 @@ impl Emitter<'_> {
     }
 
     fn dispatch(&mut self) -> Result<()> {
-        let label = self.new_local(ValType::I32);
+        let label = self.e.new_local(ValType::I32);
         self.dispatch_label = Some(label);
-        let n = self.info.rpo.len();
-        self.ins(I::Loop(BlockType::Empty));
+        let n = self.e.info.rpo.len();
+        self.e.ins(I::Loop(BlockType::Empty));
         self.labels.push(Label::Dispatch);
         for _ in 0..n {
-            self.ins(I::Block(BlockType::Empty));
+            self.e.ins(I::Block(BlockType::Empty));
             self.labels.push(Label::Other);
         }
-        self.ins(I::LocalGet(label));
+        self.e.ins(I::LocalGet(label));
         let targets: Vec<u32> = (0..n as u32).collect();
-        self.ins(I::BrTable(Cow::Owned(targets), 0));
+        self.e.ins(I::BrTable(Cow::Owned(targets), 0));
         for i in 0..n {
-            self.ins(I::End);
+            self.e.ins(I::End);
             self.labels.pop();
-            let b = self.info.rpo[i];
+            let b = self.e.info.rpo[i];
             self.block_body(b)?;
             self.terminator(b)?;
             self.run_tasks()?;
         }
         self.labels.pop();
-        self.ins(I::End);
+        self.e.ins(I::End);
         Ok(())
     }
 
     fn block_body(&mut self, b: Block) -> Result<()> {
-        let func = self.func;
+        let func = self.e.func;
         let term = func.layout.last_inst(b).unwrap();
         for inst in func.layout.block_insts(b) {
-            if inst != term && self.trees.is_root(self.info, func, inst) {
-                self.root(inst)?;
+            if inst != term && self.e.trees.is_root(inst) {
+                self.e.root(inst)?;
             }
         }
         Ok(())
@@ -223,8 +218,8 @@ impl Emitter<'_> {
     /// Branch operands are pushed here directly rather than through
     /// `Emitter::inst`; see `expr_trees::operands` for why the order is safe.
     fn terminator(&mut self, b: Block) -> Result<()> {
-        let func = self.func;
-        let info = self.info;
+        let func = self.e.func;
+        let info = self.e.info;
         let term = func.layout.last_inst(b).unwrap();
         let dests = &info.dests[b];
         match func.dfg.insts[term].opcode() {
@@ -234,9 +229,9 @@ impl Emitter<'_> {
             }),
             Opcode::Brif => {
                 let cond = func.dfg.inst_args(term)[0];
-                self.value(cond)?;
+                self.e.value(cond)?;
                 if dests.len() == 1 {
-                    self.ins(I::Drop);
+                    self.e.ins(I::Drop);
                     self.tasks.push(Task::Branch {
                         src: b,
                         call: dests[0],
@@ -245,10 +240,10 @@ impl Emitter<'_> {
                 }
                 let (mut then, mut els) = (dests[0], dests[1]);
                 if func.dfg.value_type(cond) == types::I64 {
-                    self.ins(I::I64Eqz);
+                    self.e.ins(I::I64Eqz);
                     std::mem::swap(&mut then, &mut els);
                 }
-                self.ins(I::If(BlockType::Empty));
+                self.e.ins(I::If(BlockType::Empty));
                 self.labels.push(Label::If);
                 self.tasks.push(Task::End);
                 self.tasks.push(Task::Branch { src: b, call: els });
@@ -257,35 +252,34 @@ impl Emitter<'_> {
             }
             Opcode::BrTable => self.br_table(b, term)?,
             Opcode::TryCall | Opcode::TryCallIndirect => self.try_call(b, term)?,
-            _ => self.root(term)?,
+            _ => self.e.root(term)?,
         }
         Ok(())
     }
 
-    fn br_table(&mut self, b: Block, term: cranelift_codegen::ir::Inst) -> Result<()> {
-        let func = self.func;
+    fn br_table(&mut self, b: Block, term: Inst) -> Result<()> {
+        let func = self.e.func;
         let dfg = &func.dfg;
-        let dests = &self.info.dests[b];
+        let dests = &self.e.info.dests[b];
         let index = dfg.inst_args(term)[0];
         let ity = dfg.value_type(index);
         if dests.len() == 1 {
-            self.value(index)?;
-            self.ins(I::Drop);
+            self.e.value(index)?;
+            self.e.ins(I::Drop);
             self.tasks.push(Task::Branch {
                 src: b,
                 call: dests[0],
             });
             return Ok(());
         }
-        let cranelift_codegen::ir::InstructionData::BranchTable { table, .. } = dfg.insts[term]
-        else {
+        let InstructionData::BranchTable { table, .. } = dfg.insts[term] else {
             unreachable!()
         };
         let jt = &dfg.jump_tables[table];
         let pos = |call: &BlockCall| {
             dests
                 .iter()
-                .position(|d| crate::analysis::same_call(func, d, call))
+                .position(|d| same_call(func, d, call))
                 .unwrap() as u32
         };
         let targets: Vec<u32> = jt.as_slice().iter().map(pos).collect();
@@ -294,24 +288,26 @@ impl Emitter<'_> {
         // The blocks are `[] -> []`, so the index is computed inside them.
         let n = dests.len();
         for _ in 0..n {
-            self.ins(I::Block(BlockType::Empty));
+            self.e.ins(I::Block(BlockType::Empty));
             self.labels.push(Label::Other);
         }
-        self.value(index)?;
+        self.e.value(index)?;
         if ity == types::I64 {
             // Clamp to the table length so that wrapping cannot alias an
             // in-range entry.
-            let s = self.new_local(ValType::I64);
+            let mark = self.e.scratch_mark();
+            let s = self.e.scratch(ValType::I64);
             let len = targets.len() as i64;
-            self.ins(I::LocalTee(s));
-            self.ins(I::I64Const(len));
-            self.ins(I::LocalGet(s));
-            self.ins(I::I64Const(len));
-            self.ins(I::I64LtU);
-            self.ins(I::Select);
-            self.ins(I::I32WrapI64);
+            self.e.ins(I::LocalTee(s));
+            self.e.ins(I::I64Const(len));
+            self.e.ins(I::LocalGet(s));
+            self.e.ins(I::I64Const(len));
+            self.e.ins(I::I64LtU);
+            self.e.ins(I::Select);
+            self.e.ins(I::I32WrapI64);
+            self.e.free_scratches(mark);
         }
-        self.ins(I::BrTable(Cow::Owned(targets), default));
+        self.e.ins(I::BrTable(Cow::Owned(targets), default));
         // After the i-th `end` comes the code for the i-th destination.
         for &call in dests.iter().rev() {
             self.tasks.push(Task::Branch { src: b, call });
@@ -346,7 +342,7 @@ impl Emitter<'_> {
     /// unwinder how to interpret tags, which `Env::exception_tag` resolves
     /// statically here.
     fn try_call(&mut self, b: Block, term: Inst) -> Result<()> {
-        let func = self.func;
+        let func = self.e.func;
         let dfg = &func.dfg;
         let pool = &dfg.value_lists;
         let (func_ref, et) = match dfg.insts[term] {
@@ -386,21 +382,27 @@ impl Emitter<'_> {
             .unwrap_or(types::I64);
         let payload_ir = sig.call_conv.exception_payload_types(ptr).to_vec();
         if !entries.is_empty() && payload_ir.is_empty() {
-            return unsupported(format!("exceptions with calling convention {}", sig.call_conv));
+            return unsupported(format!(
+                "exceptions with calling convention {}",
+                sig.call_conv
+            ));
         }
         for (tag, call) in &entries {
             if tag.is_none() && exn_ty(call).is_some() {
                 return unsupported("catch-all handler using the exception payload");
             }
         }
-        let payload: Vec<ValType> = payload_ir.iter().map(|&t| wasm_type(t)).collect::<Result<_>>()?;
+        let payload: Vec<ValType> = payload_ir
+            .iter()
+            .map(|&t| wasm_type(t))
+            .collect::<Result<_>>()?;
         let payload_block = match payload[..] {
             [] => BlockType::Empty,
             [t] => BlockType::Result(t),
             _ => {
                 let mut s = Signature::new(sig.call_conv);
                 s.returns.extend(payload_ir.iter().map(|&t| AbiParam::new(t)));
-                BlockType::FunctionType(self.env.type_index(&s)?)
+                BlockType::FunctionType(self.e.env.type_index(&s)?)
             }
         };
 
@@ -410,14 +412,14 @@ impl Emitter<'_> {
             let label = i as u32;
             catches.push(match tag {
                 Some(tag) => Catch::One {
-                    tag: self.env.exception_tag(*tag)?,
+                    tag: self.e.env.exception_tag(*tag)?,
                     label,
                 },
                 None => Catch::All { label },
             });
         }
         for (tag, _) in entries.iter().rev() {
-            self.ins(I::Block(if tag.is_some() {
+            self.e.ins(I::Block(if tag.is_some() {
                 payload_block
             } else {
                 BlockType::Empty
@@ -425,40 +427,39 @@ impl Emitter<'_> {
             self.labels.push(Label::Other);
         }
 
-        let result_locals: Vec<u32> = results.iter().map(|&t| self.new_local(t)).collect();
-        let payload_locals: Vec<u32> = payload.iter().map(|&t| self.new_local(t)).collect();
-        self.ins(I::TryTable(BlockType::Empty, Cow::Owned(catches)));
+        let result_locals: Vec<u32> = results.iter().map(|&t| self.e.new_local(t)).collect();
+        let payload_locals: Vec<u32> = payload.iter().map(|&t| self.e.new_local(t)).collect();
+        self.e.ins(I::TryTable(BlockType::Empty, Cow::Owned(catches)));
         self.labels.push(Label::Other);
         let args = dfg.inst_args(term);
         match func_ref {
             Some(func_ref) => {
                 for &a in args {
-                    self.value(a)?;
+                    self.e.value(a)?;
                 }
-                let name = &dfg.ext_funcs[func_ref].name;
-                let idx = self.env.func_index(Name::resolve(func, name))?;
-                self.ins(I::Call(idx));
+                let idx = self.e.callee_index(func_ref)?;
+                self.e.ins(I::Call(idx));
             }
             None => {
                 for &a in &args[1..] {
-                    self.value(a)?;
+                    self.e.value(a)?;
                 }
-                self.value(args[0])?;
+                self.e.value(args[0])?;
                 if dfg.value_type(args[0]) == types::I64 {
-                    self.ins(I::I32WrapI64);
+                    self.e.ins(I::I32WrapI64);
                 }
-                let (type_index, table_index) = self.indirect_call(sig_ref)?;
-                self.ins(I::CallIndirect {
+                let (type_index, table_index) = self.e.indirect_call(sig_ref)?;
+                self.e.ins(I::CallIndirect {
                     type_index,
                     table_index,
                 });
             }
         }
         for &l in result_locals.iter().rev() {
-            self.ins(I::LocalSet(l));
+            self.e.ins(I::LocalSet(l));
         }
         self.labels.pop();
-        self.ins(I::End);
+        self.e.ins(I::End);
         self.try_results[b] = result_locals;
         self.try_payload[b] = payload_locals;
 
@@ -478,42 +479,42 @@ impl Emitter<'_> {
     /// Move the block arguments into the target's parameters and transfer
     /// control.
     fn branch(&mut self, src: Block, call: BlockCall) -> Result<()> {
-        let func = self.func;
-        let info = self.info;
+        let func = self.e.func;
+        let info = self.e.info;
         let pool = &func.dfg.value_lists;
         let params = func.dfg.block_params(call.block(pool));
         // Push every argument, then set the parameters in reverse. The
         // `ret`/`exn` arguments of a `try_call` edge come from locals.
         let mut sets = Vec::new();
         for (a, &p) in call.args(pool).zip(params) {
-            if !info.live_val[p] {
+            if !info.is_live(p) {
                 continue;
             }
             match a {
-                BlockArg::Value(a) if self.locals.move_needed(a, p) => self.value(a)?,
+                BlockArg::Value(a) if self.e.locals.move_needed(a, p) => self.e.value(a)?,
                 BlockArg::Value(_) => continue,
                 BlockArg::TryCallRet(i) => {
-                    self.ins(I::LocalGet(self.try_results[src][i as usize]))
+                    self.e.ins(I::LocalGet(self.try_results[src][i as usize]))
                 }
                 BlockArg::TryCallExn(i) => {
-                    self.ins(I::LocalGet(self.try_payload[src][i as usize]))
+                    self.e.ins(I::LocalGet(self.try_payload[src][i as usize]))
                 }
             }
             sets.push(p);
         }
         for &p in sets.iter().rev() {
-            self.ins(I::LocalSet(self.local(p)));
+            self.e.ins(I::LocalSet(self.e.local(p)));
         }
 
         let t = call.block(&func.dfg.value_lists);
         if let Some(label) = self.dispatch_label {
-            self.ins(I::I32Const(info.rpo_num[t] as i32));
-            self.ins(I::LocalSet(label));
-            self.ins(I::Br(self.br_depth(Label::Dispatch)));
+            self.e.ins(I::I32Const(info.rpo_num[t] as i32));
+            self.e.ins(I::LocalSet(label));
+            self.e.ins(I::Br(self.br_depth(Label::Dispatch)));
         } else if info.is_backward(src, t) {
-            self.ins(I::Br(self.br_depth(Label::Loop(t))));
+            self.e.ins(I::Br(self.br_depth(Label::Loop(t))));
         } else if info.is_merge(t) {
-            self.ins(I::Br(self.br_depth(Label::BlockFollowedBy(t))));
+            self.e.ins(I::Br(self.br_depth(Label::BlockFollowedBy(t))));
         } else {
             self.tasks.push(Task::Tree(t));
         }

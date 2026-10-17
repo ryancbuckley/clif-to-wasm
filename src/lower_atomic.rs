@@ -19,9 +19,11 @@
 //! byte-reversed values carries the wrong way), so they use it too, except
 //! for single bytes, where byte order does not matter.
 
-use crate::emit::{Emitter, is64};
+use crate::emit::{Emitter, is64, w};
 use crate::{Result, unsupported};
-use cranelift_codegen::ir::{AtomicRmwOp, Inst, InstructionData as D, MemFlags, Opcode, Type, types};
+use cranelift_codegen::ir::{
+    AtomicRmwOp, Inst, InstructionData as D, MemFlags, Opcode, Type, types,
+};
 use wasm_encoder::{BlockType, Instruction as I, MemArg, ValType};
 
 impl Emitter<'_> {
@@ -123,8 +125,7 @@ impl Emitter<'_> {
         let vt = if is64(ty) { ValType::I64 } else { ValType::I32 };
         let ptr = self.config.module.ptr_ty();
         let p = self.scratch(ptr);
-        let x = self.scratch(vt);
-        let old = self.scratch(vt);
+        let [x, old] = self.scratches(vt);
         // The value as stored in memory, which differs from `old` when
         // big-endian.
         let raw = if big { self.scratch(vt) } else { old };
@@ -150,25 +151,16 @@ impl Emitter<'_> {
         }
         self.ins(cmpxchg(ty, m));
         self.ins(I::LocalGet(raw));
-        self.ins(if is64(ty) { I::I64Ne } else { I::I32Ne });
+        self.ins(w!(ty, I32Ne, I64Ne));
         self.ins(I::BrIf(0));
         self.ins(I::End);
         self.ins(I::LocalGet(old));
-
-        self.release(ptr, p);
-        self.release(vt, x);
-        self.release(vt, old);
-        if big {
-            self.release(vt, raw);
-        }
         Ok(())
     }
 
     /// Push `op(old, x)` for the locals `old` and `x`, zero-extended for
     /// narrow types.
     fn rmw_value(&mut self, op: AtomicRmwOp, ty: Type, old: u32, x: u32) {
-        let wide = is64(ty);
-        let pick = |a: I<'static>, b: I<'static>| if wide { b } else { a };
         if op == AtomicRmwOp::Xchg {
             self.ins(I::LocalGet(x));
             return;
@@ -176,16 +168,16 @@ impl Emitter<'_> {
         self.ins(I::LocalGet(old));
         self.ins(I::LocalGet(x));
         match op {
-            AtomicRmwOp::Add => self.ins(pick(I::I32Add, I::I64Add)),
-            AtomicRmwOp::Sub => self.ins(pick(I::I32Sub, I::I64Sub)),
-            AtomicRmwOp::And => self.ins(pick(I::I32And, I::I64And)),
-            AtomicRmwOp::Or => self.ins(pick(I::I32Or, I::I64Or)),
-            AtomicRmwOp::Xor => self.ins(pick(I::I32Xor, I::I64Xor)),
+            AtomicRmwOp::Add => self.ins(w!(ty, I32Add, I64Add)),
+            AtomicRmwOp::Sub => self.ins(w!(ty, I32Sub, I64Sub)),
+            AtomicRmwOp::And => self.ins(w!(ty, I32And, I64And)),
+            AtomicRmwOp::Or => self.ins(w!(ty, I32Or, I64Or)),
+            AtomicRmwOp::Xor => self.ins(w!(ty, I32Xor, I64Xor)),
             AtomicRmwOp::Xchg => unreachable!("handled above"),
             AtomicRmwOp::Nand => {
-                self.ins(pick(I::I32And, I::I64And));
-                self.ins(pick(I::I32Const(-1), I::I64Const(-1)));
-                self.ins(pick(I::I32Xor, I::I64Xor));
+                self.ins(w!(ty, I32And, I64And));
+                self.iconst(ty, -1);
+                self.ins(w!(ty, I32Xor, I64Xor));
             }
             AtomicRmwOp::Umin | AtomicRmwOp::Umax | AtomicRmwOp::Smin | AtomicRmwOp::Smax => {
                 // select(old, x, old cmp x), comparing sign-extended values
@@ -199,15 +191,11 @@ impl Emitter<'_> {
                 if signed {
                     self.sext(ty);
                 }
-                self.ins(match (op, wide) {
-                    (AtomicRmwOp::Umin, false) => I::I32LtU,
-                    (AtomicRmwOp::Umin, true) => I::I64LtU,
-                    (AtomicRmwOp::Umax, false) => I::I32GtU,
-                    (AtomicRmwOp::Umax, true) => I::I64GtU,
-                    (AtomicRmwOp::Smin, false) => I::I32LtS,
-                    (AtomicRmwOp::Smin, true) => I::I64LtS,
-                    (AtomicRmwOp::Smax, false) => I::I32GtS,
-                    _ => I::I64GtS,
+                self.ins(match op {
+                    AtomicRmwOp::Umin => w!(ty, I32LtU, I64LtU),
+                    AtomicRmwOp::Umax => w!(ty, I32GtU, I64GtU),
+                    AtomicRmwOp::Smin => w!(ty, I32LtS, I64LtS),
+                    _ => w!(ty, I32GtS, I64GtS),
                 });
                 self.ins(I::Select);
             }

@@ -1,4 +1,5 @@
-//! Floating point that wasm lacks: `f16` and fused multiply-add.
+//! Floating-point operations that wasm lacks natively (`f16` and `fma`),
+//! plus shared floating-point comparison lowering for scalars and vectors.
 //!
 //! An `f16` is represented by its bits, zero-extended in an `i32`. Loads,
 //! stores, bitcasts and `select` handle it like an `i16`; `fneg`, `fabs`
@@ -24,9 +25,79 @@
 //! `fma` would need a wider type and is not supported.
 
 use crate::emit::Emitter;
-use crate::{Result, unsupported};
+use crate::{Result, fixed_type, unsupported};
+use cranelift_codegen::ir::condcodes::FloatCC;
 use cranelift_codegen::ir::{Inst, Opcode, Type, types};
 use wasm_encoder::{Ieee32, Ieee64, Instruction as I, ValType};
+
+/// The instruction set for lowering a [`FloatCC`] comparison on a specific
+/// scalar or vector float type.
+pub(crate) struct FloatCmpOps {
+    pub vt: ValType,
+    pub eq: I<'static>,
+    pub ne: I<'static>,
+    pub lt: I<'static>,
+    pub le: I<'static>,
+    pub gt: I<'static>,
+    pub ge: I<'static>,
+    pub and: I<'static>,
+    pub or: I<'static>,
+    pub not: I<'static>,
+}
+
+impl FloatCmpOps {
+    pub const F32: Self = Self {
+        vt: ValType::F32,
+        eq: I::F32Eq,
+        ne: I::F32Ne,
+        lt: I::F32Lt,
+        le: I::F32Le,
+        gt: I::F32Gt,
+        ge: I::F32Ge,
+        and: I::I32And,
+        or: I::I32Or,
+        not: I::I32Eqz,
+    };
+
+    pub const F64: Self = Self {
+        vt: ValType::F64,
+        eq: I::F64Eq,
+        ne: I::F64Ne,
+        lt: I::F64Lt,
+        le: I::F64Le,
+        gt: I::F64Gt,
+        ge: I::F64Ge,
+        and: I::I32And,
+        or: I::I32Or,
+        not: I::I32Eqz,
+    };
+
+    pub const F32X4: Self = Self {
+        vt: ValType::V128,
+        eq: I::F32x4Eq,
+        ne: I::F32x4Ne,
+        lt: I::F32x4Lt,
+        le: I::F32x4Le,
+        gt: I::F32x4Gt,
+        ge: I::F32x4Ge,
+        and: I::V128And,
+        or: I::V128Or,
+        not: I::V128Not,
+    };
+
+    pub const F64X2: Self = Self {
+        vt: ValType::V128,
+        eq: I::F64x2Eq,
+        ne: I::F64x2Ne,
+        lt: I::F64x2Lt,
+        le: I::F64x2Le,
+        gt: I::F64x2Gt,
+        ge: I::F64x2Ge,
+        and: I::V128And,
+        or: I::V128Or,
+        not: I::V128Not,
+    };
+}
 
 impl Emitter<'_> {
     /// Push the next operand, a float, widening an `f16` to `f32`. Returns
@@ -39,8 +110,73 @@ impl Emitter<'_> {
                 Ok(types::F32)
             }
             t @ (types::F32 | types::F64) => Ok(t),
+            t if fixed_type(t).is_vector() => Ok(t),
             t => unsupported(format!("float operand of type {t}")),
         }
+    }
+
+    /// Lower a floating-point comparison (scalar or vector) using `ops`.
+    pub(crate) fn emit_fcmp(&mut self, cond: FloatCC, ops: FloatCmpOps) -> Result<()> {
+        use FloatCC::*;
+        // Unordered-or-X is the negation of the ordered inverse.
+        let simple = match cond {
+            Equal => Some((ops.eq.clone(), false)),
+            NotEqual => Some((ops.ne.clone(), false)),
+            LessThan => Some((ops.lt.clone(), false)),
+            LessThanOrEqual => Some((ops.le.clone(), false)),
+            GreaterThan => Some((ops.gt.clone(), false)),
+            GreaterThanOrEqual => Some((ops.ge.clone(), false)),
+            UnorderedOrLessThan => Some((ops.ge.clone(), true)),
+            UnorderedOrLessThanOrEqual => Some((ops.gt.clone(), true)),
+            UnorderedOrGreaterThan => Some((ops.le.clone(), true)),
+            UnorderedOrGreaterThanOrEqual => Some((ops.lt.clone(), true)),
+            _ => None,
+        };
+        if let Some((i, negate)) = simple {
+            self.float_operand()?;
+            self.float_operand()?;
+            self.ins(i);
+            if negate {
+                self.ins(ops.not);
+            }
+            return Ok(());
+        }
+        let [sa, sb] = self.scratches(ops.vt);
+        match cond {
+            Ordered | Unordered => {
+                // a == a (and|or) b == b, or the negation.
+                let (cmp, comb) = if cond == Ordered {
+                    (ops.eq, ops.and)
+                } else {
+                    (ops.ne, ops.or)
+                };
+                self.float_operand()?;
+                self.ins(I::LocalTee(sa));
+                self.ins(I::LocalGet(sa));
+                self.ins(cmp.clone());
+                self.float_operand()?;
+                self.ins(I::LocalTee(sb));
+                self.ins(I::LocalGet(sb));
+                self.ins(cmp);
+                self.ins(comb);
+            }
+            OrderedNotEqual | UnorderedOrEqual => {
+                self.float_operand()?;
+                self.ins(I::LocalTee(sa));
+                self.float_operand()?;
+                self.ins(I::LocalTee(sb));
+                self.ins(ops.lt);
+                self.ins(I::LocalGet(sa));
+                self.ins(I::LocalGet(sb));
+                self.ins(ops.gt);
+                self.ins(ops.or);
+                if cond == UnorderedOrEqual {
+                    self.ins(ops.not);
+                }
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
     }
 
     /// Lower an instruction with an `f16` result or operand, if it needs
@@ -147,6 +283,7 @@ impl Emitter<'_> {
 
     /// Convert the `f16` bits on the stack to an `f32`.
     pub(crate) fn f16_to_f32(&mut self) {
+        let mark = self.scratch_mark();
         let h = self.scratch(ValType::I32);
         self.ins(I::LocalTee(h));
         // Finite values: placing the exponent and fraction bits in an f32
@@ -180,7 +317,7 @@ impl Emitter<'_> {
         self.ins(I::I32Shl);
         self.ins(I::F32ReinterpretI32);
         self.ins(I::F32Copysign);
-        self.release(ValType::I32, h);
+        self.free_scratches(mark);
     }
 
     /// Round the `f32` on the stack to `f16` bits.
@@ -193,7 +330,7 @@ impl Emitter<'_> {
     /// Round the `f64` on the stack to `f16` bits, to nearest with ties to
     /// even.
     pub(crate) fn f64_to_f16(&mut self) {
-        let [b, e, sh, full, bits] = [(); 5].map(|_| self.scratch(ValType::I64));
+        let [b, e, sh, full, bits] = self.scratches(ValType::I64);
         let get = |s: &mut Self, l: u32| s.ins(I::LocalGet(l));
         let k = |s: &mut Self, v: i64| s.ins(I::I64Const(v));
         self.ins(I::I64ReinterpretF64);
@@ -304,9 +441,6 @@ impl Emitter<'_> {
         self.ins(I::I64And);
         self.ins(I::I64Or);
         self.ins(I::I32WrapI64);
-        for l in [b, e, sh, full, bits] {
-            self.release(ValType::I64, l);
-        }
     }
 
     /// max(x, 0) of the `i64` on the stack, using `s` as scratch.
@@ -326,7 +460,8 @@ impl Emitter<'_> {
         &mut self,
         push: &mut dyn FnMut(&mut Self, usize) -> Result<()>,
     ) -> Result<()> {
-        let [p, c, s, bb, err] = [(); 5].map(|_| self.scratch(ValType::F64));
+        let mark = self.scratch_mark();
+        let [p, c, s, bb, err] = self.scratches(ValType::F64);
         let sb = self.scratch(ValType::I64);
         let get = |e: &mut Self, l: u32| e.ins(I::LocalGet(l));
         push(self, 0)?;
@@ -388,16 +523,13 @@ impl Emitter<'_> {
         self.ins(I::Select);
         self.ins(I::I64Add);
         self.ins(I::F64ReinterpretI64);
-        for l in [p, c, s, bb, err] {
-            self.release(ValType::F64, l);
-        }
-        self.release(ValType::I64, sb);
+        self.free_scratches(mark);
         Ok(())
     }
 
     /// `fma` on `f32` vector lanes, one lane at a time.
     pub(crate) fn fma_f32_lanes(&mut self, ty: Type) -> Result<()> {
-        let vs = [(); 3].map(|_| self.scratch(ValType::V128));
+        let vs = self.scratches::<3>(ValType::V128);
         for &v in &vs {
             self.operand()?;
             self.ins(I::LocalSet(v));
@@ -416,10 +548,6 @@ impl Emitter<'_> {
                 I::F32x4ReplaceLane(lane)
             });
         }
-        for v in vs {
-            self.release(ValType::V128, v);
-        }
         Ok(())
     }
 }
-

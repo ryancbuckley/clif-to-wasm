@@ -16,15 +16,13 @@ not need. The backend works directly on the IR instead.
 
 | Pass | File | What it does | Switch |
 |------|------|--------------|--------|
-| Legalize | `src/legalize_i128.rs` | Rewrites `i128` values into `(lo, hi)` pairs of `i64` (signatures, block params, calls) before anything else runs; only when a function uses `i128` | |
-| Analysis | `src/analysis.rs` | RPO, deduplicated CFG edges, dominators, loop headers, merge nodes, reducibility, value-level DCE, use counts | |
+| Prepare & Legalize | `src/legalize_i128.rs` | Scans once for value aliases and `i128`; when present, clones the function, resolves aliases, and rewrites `i128` values into `(lo, hi)` pairs of `i64` (signatures, block params, calls) before anything else runs | |
+| Analysis | `src/analysis.rs` | RPO, deduplicated CFG edges, dominators, loop headers, merge nodes, reducibility, and single-pass backwards value/instruction liveness + use counts | |
 | Expression trees | `src/expr_trees.rs` | Greedy backwards tree building: a single-use def in the same block is folded into its user unless that would reorder side effects. The check is O(1) using Cranelift-style side-effect colors. Constants are rematerialized at every use. `operands()` here defines evaluation order for every later pass | `stack_values` |
-| Liveness | `src/liveness.rs` | Positions, and per-block live-range segments for the values that need a local; collects block-argument moves | |
-| Locals | `src/locals.rs` | Greedy coloring per wasm type. A value first tries its move partner's local (argument ↔ parameter), so most block-argument moves disappear | `coalesce` |
-| Structure | `src/structure.rs` | Ramsey's "Beyond Relooper" (ICFP 2022) over the dominator tree, run with an explicit task stack. Irreducible CFGs fall back to a `loop` + `br_table` dispatcher | |
-| Emit | `src/emit.rs` | Emitter state, value emission, and the operand cursor that lowering takes operands from | |
-| Lower | `src/lower.rs`, `src/lower_simd.rs`, `src/lower_atomic.rs`, `src/lower_float.rs` | One case per opcode. Vector operations, atomics, and the emulated floating point (`f16`, `fma`) have their own modules | |
-| Encode | `src/encode.rs` | Byte encoding with a `local.set x; local.get x` → `local.tee x` peephole; scratch and other extra locals | `use_tee` |
+| Locals | `src/locals.rs` | Builds per-block live-range segments for values that need a local, collects block-argument moves, and performs greedy coloring per wasm type. A value first tries its move partner's local (argument ↔ parameter), so most block-argument moves disappear | `coalesce` |
+| Structure | `src/structure.rs` | Ramsey's "Beyond Relooper" (ICFP 2022) over the dominator tree, run with an explicit task stack in `Structurer`. Irreducible CFGs fall back to a `loop` + `br_table` dispatcher | |
+| Emit | `src/emit.rs` | Function prologue/epilogue (shadow stack and narrow parameter masking), value emission, operand cursor, scoped LIFO scratch locals, and byte encoding with a `local.set x; local.get x` → `local.tee x` peephole | `use_tee` |
+| Lower | `src/lower.rs`, `src/lower_simd.rs`, `src/lower_atomic.rs`, `src/lower_float.rs` | One case per opcode. Vector operations, atomics, and emulated floating point (`f16`, `fma`, and shared scalar/vector `FloatCC` lowering) have their own modules | |
 
 Cross-module contracts are each stated in one place:
 
@@ -32,8 +30,7 @@ Cross-module contracts are each stated in one place:
   operands from it through `Emitter::operand`. Branches are the one
   documented exception.
 - **When a block-argument move can be skipped:** `Locals::move_needed`
-  depends on the live-range conventions documented at the top of
-  `liveness.rs`.
+  depends on the live-range conventions documented in `locals.rs`.
 
 The safety condition for folding into a tree: `color[i]` counts the effectful
 instructions before `i` in its block. An effectful def `d` may join the tree

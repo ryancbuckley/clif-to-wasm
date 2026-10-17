@@ -29,24 +29,76 @@ use wasm_encoder::{
 pub struct ModuleBuilder {
     types: Vec<(Vec<ValType>, Vec<ValType>)>,
     imports: Vec<(String, String, EntityType)>,
-    num_imported_funcs: u32,
-    num_imported_memories: u32,
-    num_imported_globals: u32,
-    num_imported_tables: u32,
-    num_imported_tags: u32,
     /// Type index and body of each defined function.
-    funcs: Vec<(u32, Option<CompiledFunction>)>,
-    exports: Vec<(String, ExportKind, u32)>,
-    memories: Vec<MemoryType>,
-    globals: Vec<(GlobalType, ConstExpr)>,
-    /// Every table, imported ones first, indexed by table index.
-    tables: Vec<TableType>,
+    funcs: IndexSpace<(u32, Option<CompiledFunction>)>,
+    memories: IndexSpace<MemoryType>,
+    globals: IndexSpace<(GlobalType, ConstExpr)>,
+    tables: IndexSpace<TableType, TableType>,
+    /// The type index of each defined exception tag.
+    tags: IndexSpace<u32>,
     /// The table made by `function_table`, which is sized in `finish`.
     function_table: Option<u32>,
     /// Active element segments: table, first slot, functions.
     elements: Vec<(u32, u64, Vec<u32>)>,
-    /// The type index of each defined exception tag.
-    tags: Vec<u32>,
+    exports: Vec<(String, ExportKind, u32)>,
+}
+
+/// A WebAssembly index space (functions, memories, globals, tables, or tags).
+///
+/// In every WebAssembly index space, imports precede definitions, so all
+/// imports of a given kind must be registered before any definition of that
+/// kind; otherwise indices already handed out would shift.
+struct IndexSpace<D, I = ()> {
+    imported: Vec<I>,
+    defined: Vec<D>,
+}
+
+impl<D, I> Default for IndexSpace<D, I> {
+    fn default() -> Self {
+        Self {
+            imported: Vec::new(),
+            defined: Vec::new(),
+        }
+    }
+}
+
+impl<D, I> IndexSpace<D, I> {
+    fn import(&mut self, item: I, msg: &str) -> u32 {
+        assert!(self.defined.is_empty(), "{msg}");
+        let idx = self.imported.len() as u32;
+        self.imported.push(item);
+        idx
+    }
+
+    fn define(&mut self, item: D) -> u32 {
+        let idx = self.total();
+        self.defined.push(item);
+        idx
+    }
+
+    fn defined(&self) -> &[D] {
+        &self.defined
+    }
+
+    fn defined_mut(&mut self, index: u32) -> &mut D {
+        let i = index
+            .checked_sub(self.imported.len() as u32)
+            .expect("expected a defined index, got an import index");
+        &mut self.defined[i as usize]
+    }
+
+    fn total(&self) -> u32 {
+        (self.imported.len() + self.defined.len()) as u32
+    }
+}
+
+impl<T> IndexSpace<T, T> {
+    fn get(&self, index: u32) -> Option<&T> {
+        let idx = index as usize;
+        self.imported
+            .get(idx)
+            .or_else(|| self.defined.get(idx.wrapping_sub(self.imported.len())))
+    }
 }
 
 impl ModuleBuilder {
@@ -67,9 +119,7 @@ impl ModuleBuilder {
         self.types.len() as u32 - 1
     }
 
-    // Imports. In each index space (functions, memories, globals, tables)
-    // imports come first, so an import must precede every definition of its
-    // kind; otherwise indices already handed out would shift.
+    // ---- Imports ------------------------------------------------------------
 
     /// Import a function. Returns its function index.
     pub fn import_function(
@@ -79,14 +129,12 @@ impl ModuleBuilder {
         params: &[ValType],
         results: &[ValType],
     ) -> u32 {
-        assert!(
-            self.funcs.is_empty(),
-            "function imports must precede declared functions"
-        );
+        let idx = self
+            .funcs
+            .import((), "function imports must precede declared functions");
         let ty = self.type_index(params, results);
-        self.import(module, name, EntityType::Function(ty));
-        self.num_imported_funcs += 1;
-        self.num_imported_funcs - 1
+        self.record_import(module, name, EntityType::Function(ty));
+        idx
     }
 
     /// Import a linear memory. Returns its memory index.
@@ -95,47 +143,40 @@ impl ModuleBuilder {
     /// have: `minimum: 0, maximum: None` accepts any memory of the right
     /// address width (and sharedness).
     pub fn import_memory(&mut self, module: &str, name: &str, ty: MemoryType) -> u32 {
-        assert!(
-            self.memories.is_empty(),
-            "memory imports must precede defined memories"
-        );
-        self.import(module, name, EntityType::Memory(ty));
-        self.num_imported_memories += 1;
-        self.num_imported_memories - 1
+        let idx = self
+            .memories
+            .import((), "memory imports must precede defined memories");
+        self.record_import(module, name, EntityType::Memory(ty));
+        idx
     }
 
     /// Import a global, such as the shadow stack pointer (which must be
     /// mutable). Returns its global index.
     pub fn import_global(&mut self, module: &str, name: &str, ty: GlobalType) -> u32 {
-        assert!(
-            self.globals.is_empty(),
-            "global imports must precede defined globals"
-        );
-        self.import(module, name, EntityType::Global(ty));
-        self.num_imported_globals += 1;
-        self.num_imported_globals - 1
+        let idx = self
+            .globals
+            .import((), "global imports must precede defined globals");
+        self.record_import(module, name, EntityType::Global(ty));
+        idx
     }
 
     /// Import a table, such as the program's table of function references.
     /// Returns its table index. Like memories, the declared limits are a
     /// lower bound.
     pub fn import_table(&mut self, module: &str, name: &str, ty: TableType) -> u32 {
-        assert!(
-            self.tables.len() as u32 == self.num_imported_tables,
-            "table imports must precede defined tables"
-        );
-        self.import(module, name, EntityType::Table(ty));
-        self.tables.push(ty);
-        self.num_imported_tables += 1;
-        self.num_imported_tables - 1
+        let idx = self
+            .tables
+            .import(ty, "table imports must precede defined tables");
+        self.record_import(module, name, EntityType::Table(ty));
+        idx
     }
 
     /// Import an exception tag whose payload has the given types. Returns
     /// its tag index.
     pub fn import_tag(&mut self, module: &str, name: &str, params: &[ValType]) -> u32 {
-        assert!(self.tags.is_empty(), "tag imports must precede defined tags");
+        let idx = self.tags.import((), "tag imports must precede defined tags");
         let ty = self.type_index(params, &[]);
-        self.import(
+        self.record_import(
             module,
             name,
             EntityType::Tag(TagType {
@@ -143,64 +184,59 @@ impl ModuleBuilder {
                 func_type_idx: ty,
             }),
         );
-        self.num_imported_tags += 1;
-        self.num_imported_tags - 1
+        idx
     }
 
-    fn import(&mut self, module: &str, name: &str, ty: EntityType) {
+    fn record_import(&mut self, module: &str, name: &str, ty: EntityType) {
         self.imports.push((module.into(), name.into(), ty));
     }
 
-    // Definitions.
+    // ---- Definitions --------------------------------------------------------
 
     /// Reserve a function index for a function with the given type.
     pub fn declare_function(&mut self, params: &[ValType], results: &[ValType]) -> u32 {
         let ty = self.type_index(params, results);
-        self.funcs.push((ty, None));
-        self.num_imported_funcs + self.funcs.len() as u32 - 1
+        self.funcs.define((ty, None))
     }
 
     /// Provide the body of a declared function.
     pub fn define_function(&mut self, index: u32, func: CompiledFunction) {
-        let slot = &mut self.funcs[(index - self.num_imported_funcs) as usize];
+        let (ty, body) = self.funcs.defined_mut(index);
         assert_eq!(
-            self.types[slot.0 as usize],
+            self.types[*ty as usize],
             (func.params.clone(), func.results.clone())
         );
-        slot.1 = Some(func);
+        *body = Some(func);
     }
 
     /// Define a linear memory. Returns its memory index.
     pub fn memory(&mut self, min_pages: u64, memory64: bool) -> u32 {
-        self.memories.push(MemoryType {
+        self.memories.define(MemoryType {
             minimum: min_pages,
             maximum: None,
             memory64,
             shared: false,
             page_size_log2: None,
-        });
-        self.num_imported_memories + self.memories.len() as u32 - 1
+        })
     }
 
     /// Define a mutable global. Returns its global index.
     pub fn global(&mut self, ty: ValType, init: ConstExpr) -> u32 {
-        self.globals.push((
+        self.globals.define((
             GlobalType {
                 val_type: ty,
                 mutable: true,
                 shared: false,
             },
             init,
-        ));
-        self.num_imported_globals + self.globals.len() as u32 - 1
+        ))
     }
 
     /// Define an exception tag whose payload has the given types. Returns its
     /// tag index.
     pub fn tag(&mut self, params: &[ValType]) -> u32 {
         let ty = self.type_index(params, &[]);
-        self.tags.push(ty);
-        self.num_imported_tags + self.tags.len() as u32 - 1
+        self.tags.define(ty)
     }
 
     /// Define a funcref table where slot `i` holds function `i`, for every
@@ -209,9 +245,8 @@ impl ModuleBuilder {
     /// example to make room for functions of other modules.
     pub fn function_table(&mut self) -> u32 {
         assert!(self.function_table.is_none(), "function_table called twice");
-        let index = self.tables.len() as u32;
         // The size is filled in by `finish`, once all functions are known.
-        self.tables.push(TableType {
+        let index = self.tables.define(TableType {
             element_type: RefType::FUNCREF,
             table64: false,
             minimum: 0,
@@ -227,14 +262,11 @@ impl ModuleBuilder {
     /// `first_slot + i`, which is what `Env::func_table_slot` should return
     /// for it. Instantiation fails if the slots are out of bounds.
     pub fn place_in_table(&mut self, table: u32, first_slot: u64, funcs: &[u32]) {
-        assert!(
-            (table as usize) < self.tables.len(),
-            "no table {table}"
-        );
+        assert!(self.tables.get(table).is_some(), "no table {table}");
         self.elements.push((table, first_slot, funcs.to_vec()));
     }
 
-    // Exports.
+    // ---- Exports ------------------------------------------------------------
 
     pub fn export_function(&mut self, name: &str, index: u32) {
         self.export(name, ExportKind::Func, index);
@@ -246,9 +278,9 @@ impl ModuleBuilder {
     }
 
     pub fn finish(mut self) -> Vec<u8> {
-        let total = self.num_imported_funcs + self.funcs.len() as u32;
+        let total = self.funcs.total();
         if let Some(t) = self.function_table {
-            self.tables[t as usize].minimum = total as u64;
+            self.tables.defined_mut(t).minimum = total as u64;
             self.elements.push((t, 0, (0..total).collect()));
         }
 
@@ -269,31 +301,30 @@ impl ModuleBuilder {
         }
 
         let mut functions = FunctionSection::new();
-        for (ty, _) in &self.funcs {
+        for (ty, _) in self.funcs.defined() {
             functions.function(*ty);
         }
         module.section(&functions);
 
-        let defined_tables = &self.tables[self.num_imported_tables as usize..];
-        if !defined_tables.is_empty() {
+        if !self.tables.defined().is_empty() {
             let mut tables = TableSection::new();
-            for t in defined_tables {
+            for t in self.tables.defined() {
                 tables.table(*t);
             }
             module.section(&tables);
         }
 
-        if !self.memories.is_empty() {
+        if !self.memories.defined().is_empty() {
             let mut memories = MemorySection::new();
-            for m in &self.memories {
+            for m in self.memories.defined() {
                 memories.memory(*m);
             }
             module.section(&memories);
         }
 
-        if !self.tags.is_empty() {
+        if !self.tags.defined().is_empty() {
             let mut tags = TagSection::new();
-            for &ty in &self.tags {
+            for &ty in self.tags.defined() {
                 tags.tag(TagType {
                     kind: TagKind::Exception,
                     func_type_idx: ty,
@@ -302,9 +333,9 @@ impl ModuleBuilder {
             module.section(&tags);
         }
 
-        if !self.globals.is_empty() {
+        if !self.globals.defined().is_empty() {
             let mut globals = GlobalSection::new();
-            for (t, init) in &self.globals {
+            for (t, init) in self.globals.defined() {
                 globals.global(*t, init);
             }
             module.section(&globals);
@@ -321,7 +352,7 @@ impl ModuleBuilder {
         if !self.elements.is_empty() {
             let mut elems = ElementSection::new();
             for (table, first, funcs) in &self.elements {
-                let offset = if self.tables[*table as usize].table64 {
+                let offset = if self.tables.get(*table).unwrap().table64 {
                     ConstExpr::i64_const(*first as i64)
                 } else {
                     let first = u32::try_from(*first).expect("slot out of range for table32");
@@ -335,7 +366,7 @@ impl ModuleBuilder {
         }
 
         let mut code = CodeSection::new();
-        for (_, f) in &self.funcs {
+        for (_, f) in self.funcs.defined() {
             let f = f.as_ref().expect("declared function was not defined");
             code.function(&f.to_wasm_function());
         }

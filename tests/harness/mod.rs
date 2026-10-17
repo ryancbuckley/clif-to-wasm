@@ -10,6 +10,9 @@ use cranelift_codegen::ir::{
     ExceptionTableItem, ExceptionTag, ExternalName, Function, Type, UserFuncName, immediates::*,
     types,
 };
+use cranelift_interpreter::environment::FunctionStore;
+use cranelift_interpreter::interpreter::{Interpreter, InterpreterState};
+use cranelift_interpreter::step::ControlFlow;
 use cranelift_reader::{Comparison, ParseOptions, RunCommand, parse_run_command, parse_test};
 use cranelift_wasm_backend::{
     Config, Env, Error, ModuleBuilder, Name, compile_function, wasm_signature,
@@ -499,3 +502,34 @@ pub fn run_clif(text: &str, config: &Config) -> Result<Outcome, String> {
     }
     Ok(out)
 }
+
+/// Execute `name` (e.g. `"f"`) in `cranelift-interpreter` over `funcs`.
+///
+/// Returns:
+/// - `None` if the interpreter panicked (e.g. an unimplemented vector op);
+/// - `Some(Ok(Some(vals)))` if the function returned `vals`;
+/// - `Some(Ok(None))` if the function trapped;
+/// - `Some(Err(msg))` if the interpreter returned an error.
+pub fn interpret(
+    funcs: &[Function],
+    name: &str,
+    args: &[DataValue],
+) -> Option<Result<Option<Vec<DataValue>>, String>> {
+    let mut store = FunctionStore::default();
+    for f in funcs {
+        store.add(f.name.to_string(), f);
+    }
+    let state = InterpreterState::default().with_function_store(store);
+    let mut interp = Interpreter::new(state).with_fuel(Some(1_000_000));
+    let target = format!("%{name}");
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match interp.call_by_name(&target, args) {
+            Ok(ControlFlow::Return(vals)) => Ok(Some(vals.to_vec())),
+            Ok(ControlFlow::Trap(_)) => Ok(None),
+            Ok(other) => Err(format!("unexpected control flow: {other:?}")),
+            Err(e) => Err(e.to_string()),
+        }
+    }))
+    .ok()
+}
+

@@ -11,9 +11,6 @@ use cranelift_codegen::ir::{
 };
 use cranelift_codegen::isa::{CallConv, TargetFrontendConfig};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use cranelift_interpreter::environment::FunctionStore;
-use cranelift_interpreter::interpreter::{Interpreter, InterpreterState};
-use cranelift_interpreter::step::ControlFlow;
 use cranelift_wasm_backend::Config;
 use harness::clifgen::{Rng, arg};
 
@@ -306,19 +303,11 @@ fn simd_ops_match_interpreter() {
             let mut rng = Rng(0x5eed ^ tested as u64);
             for _ in 0..iters {
                 let args: Vec<DataValue> = params.iter().map(|&t| arg(&mut rng, t)).collect();
-                let mut store = FunctionStore::default();
-                store.add("%f".into(), &func);
-                let mut interp =
-                    Interpreter::new(InterpreterState::default().with_function_store(store));
-                let expected = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    interp.call_by_name("%f", &args)
-                })) {
-                    Ok(Ok(ControlFlow::Return(v))) => Some(v.to_vec()),
-                    Ok(Ok(ControlFlow::Trap(_))) => None,
-                    _ => {
-                        skipped.push(format!("{name} {ty}"));
-                        break;
-                    }
+                let Some(Ok(expected)) =
+                    harness::interpret(std::slice::from_ref(&func), "f", &args)
+                else {
+                    skipped.push(format!("{name} {ty}"));
+                    break;
                 };
                 let got = runner.call("f", &args, &returns).unwrap();
                 let ok = match (&expected, &got) {

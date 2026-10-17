@@ -1,4 +1,8 @@
-//! Function-level analyses shared by the later passes.
+//! Function-level control-flow and data-flow analyses shared across passes.
+//!
+//! `FuncInfo::compute` performs a single-pass CFG and dominator analysis over
+//! reachable blocks, followed by backwards value- and instruction-level
+//! liveness (dead-code elimination and exact use counting).
 
 use crate::{Result, unsupported};
 use cranelift_codegen::dominator_tree::DominatorTree;
@@ -30,20 +34,25 @@ pub(crate) struct FuncInfo {
     pub reducible: bool,
     /// Instructions that must be emitted.
     pub live_inst: SecondaryMap<Inst, bool>,
-    /// Values whose content is needed.
-    pub live_val: SecondaryMap<Value, bool>,
-    /// Number of uses of each value by live instructions, counting block
-    /// arguments only when the receiving parameter is live.
+    /// Number of uses of each value by live instructions and live block
+    /// parameters. A value is live iff `use_count[v] > 0`.
     pub use_count: SecondaryMap<Value, u32>,
 }
 
 impl FuncInfo {
+    /// Does this block have two or more incoming forward edges?
     pub fn is_merge(&self, b: Block) -> bool {
         self.forward_in[b] >= 2
     }
 
+    /// Is the edge `from -> to` a retreating (backward) edge in RPO?
     pub fn is_backward(&self, from: Block, to: Block) -> bool {
         self.rpo_num[to] <= self.rpo_num[from]
+    }
+
+    /// Is `v` used by at least one live instruction or live block parameter?
+    pub fn is_live(&self, v: Value) -> bool {
+        self.use_count[v] > 0
     }
 
     pub fn compute(func: &Function) -> Result<FuncInfo> {
@@ -120,14 +129,19 @@ impl FuncInfo {
             domtree,
             reducible,
             live_inst: SecondaryMap::new(),
-            live_val: SecondaryMap::new(),
             use_count: SecondaryMap::new(),
         };
         info.compute_liveness(func);
         Ok(info)
     }
 
-    /// Value-level dead code elimination, followed by use counting.
+    /// Backwards value-level dead code elimination and exact use counting.
+    ///
+    /// Starting from effectful instructions and terminators, every operand of
+    /// a newly live instruction and every incoming block argument of a newly
+    /// live block parameter is pushed to the worklist once per use. Each pop
+    /// therefore increments `use_count[v]`, and the first pop (`use_count == 1`)
+    /// marks `v`'s definition live.
     fn compute_liveness(&mut self, func: &Function) {
         let dfg = &func.dfg;
         let pool = &dfg.value_lists;
@@ -144,10 +158,10 @@ impl FuncInfo {
         }
 
         while let Some(v) = worklist.pop() {
-            if self.live_val[v] {
+            self.use_count[v] += 1;
+            if self.use_count[v] > 1 {
                 continue;
             }
-            self.live_val[v] = true;
             match dfg.value_def(v) {
                 ValueDef::Result(inst, _) => {
                     if !self.live_inst[inst] {
@@ -169,23 +183,6 @@ impl FuncInfo {
                 ValueDef::Union(..) => unreachable!("unions only exist inside the egraph pass"),
             }
         }
-
-        for &b in &self.rpo {
-            for inst in func.layout.block_insts(b) {
-                if self.live_inst[inst] {
-                    for &v in dfg.inst_args(inst) {
-                        self.use_count[v] += 1;
-                    }
-                }
-            }
-            for i in 0..self.dests[b].len() {
-                let call = self.dests[b][i];
-                let args: Vec<Value> = self.live_args(func, call).collect();
-                for a in args {
-                    self.use_count[a] += 1;
-                }
-            }
-        }
     }
 
     /// The arguments of `call` whose receiving block parameter is live, paired
@@ -200,7 +197,7 @@ impl FuncInfo {
         call.args(pool)
             .zip(params.iter())
             .filter_map(move |(a, &p)| match a {
-                BlockArg::Value(a) if self.live_val[p] => Some((a, p)),
+                BlockArg::Value(a) if self.is_live(p) => Some((a, p)),
                 _ => None,
             })
     }
