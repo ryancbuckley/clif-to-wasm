@@ -114,6 +114,11 @@ pub struct ModuleLayout {
     /// (`get_pinned_reg`/`set_pinned_reg`). With `None`, functions that use
     /// it are rejected.
     pub pinned_reg_global: Option<GlobalIndex>,
+    /// Base byte address in linear memory of a 256-byte (64 × `i32`) striped
+    /// spinlock table used to synchronize `i128` atomic operations. Must be
+    /// 4-byte aligned and disjoint from the program's data and shadow stack.
+    /// With `None`, functions that use `i128` atomics are rejected.
+    pub atomic_lock_table_addr: Option<u64>,
 }
 
 impl ModuleLayout {
@@ -346,7 +351,7 @@ pub fn compile_function(
     config: &Config,
     env: &mut dyn Env,
 ) -> Result<CompiledFunction> {
-    let func = legalize_i128::prepare(func)?;
+    let func = legalize_i128::prepare(func, config.module.atomic_lock_table_addr)?;
     let info = analysis::FuncInfo::compute(&func)?;
     let trees = expr_trees::build(&func, &info, config.opts.stack_values);
     let locals = locals::allocate(&func, &info, &trees, config.opts.coalesce)?;

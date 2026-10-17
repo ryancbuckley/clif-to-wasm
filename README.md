@@ -89,13 +89,14 @@ agree with your `Config` and `Env` answers. It handles both kinds of module:
 
 | Group | Fields | Meaning |
 |---|---|---|
-| `module: ModuleLayout` | `memory64`, `memory_index`, `table_index`, `stack_pointer_global`, `pinned_reg_global` | Facts about the module the code goes in; they must match how the embedder builds it. |
+| `module: ModuleLayout` | `memory64`, `memory_index`, `table_index`, `stack_pointer_global`, `pinned_reg_global`, `atomic_lock_table_addr` | Facts about the module the code goes in; they must match how the embedder builds it. |
 | `engine: EngineFeatures` | `tail_calls` | Wasm features the engine supports. Without tail calls, `return_call` falls back to call + return. |
 | `opts: Optimizations` | `stack_values`, `coalesce`, `use_tee` | Output-quality switches, all on by default; `Optimizations::none()` turns them all off. |
 
 For example, `config.module.stack_pointer_global = Some(sp)` enables stack
-slots, `config.module.table_index = Some(t)` enables `call_indirect`, and
-`config.opts.coalesce = false` disables move coalescing.
+slots, `config.module.table_index = Some(t)` enables `call_indirect`,
+`config.module.atomic_lock_table_addr = Some(addr)` enables `i128` atomics,
+and `config.opts.coalesce = false` disables move coalescing.
 
 ## Supported
 
@@ -112,17 +113,21 @@ Atomics (`src/lower_atomic.rs`) use the wasm threads proposal's
 instructions: loads, stores, `fence`, compare-exchange, and the
 read-modify-writes that wasm has (`add`, `sub`, `and`, `or`, `xor`,
 `xchg`). `nand`, `umin`/`umax`/`smin`/`smax` and big-endian
-read-modify-writes become a compare-exchange loop.
+read-modify-writes become a compare-exchange loop. `i128` atomics
+(`atomic_load`, `atomic_store`, `atomic_cas`, `atomic_rmw`) expand in
+`src/legalize_i128.rs` into a spinlock-protected pair of `i64` atomic
+accesses using a 64-entry striped `i32` lock table at
+`ModuleLayout::atomic_lock_table_addr`.
 
 `i128` and `f128` are supported by legalizing them into pairs of `i64`
 (`src/legalize_i128.rs`). At the wasm level an `i128` or `f128` parameter or
 result is two `i64`s, low half first. For `i128`, arithmetic, bitwise ops,
 shifts and rotates, comparisons, `select`, extensions and truncations,
-`clz`/`ctz`/`popcnt`/`cls`, `bswap`/`bitrev`, loads and stores, calls, block
-parameters, add and subtract with an overflow flag, and bitcasts to and from
-128-bit vectors expand into `i64` code; division and remainder become a
-128-iteration shift-subtract loop, and conversions from `i128` to floats are
-correctly rounded (round to odd, then convert). For `f128`, constants
+`clz`/`ctz`/`popcnt`/`cls`, `bswap`/`bitrev`, loads and stores, atomics,
+calls, block parameters, add and subtract with an overflow flag, and bitcasts
+to and from 128-bit vectors expand into `i64` code; division and remainder
+become a 128-iteration shift-subtract loop, and conversions from `i128` to
+floats are correctly rounded (round to odd, then convert). For `f128`, constants
 (`f128const`), loads, stores, calls, block parameters, `select`, bitwise ops,
 `fneg`/`fabs`/`fcopysign`, and bitcasts to and from `i128` and 128-bit vectors
 are supported — the same surface that Cranelift's own `x64`, `aarch64`, and
@@ -177,8 +182,7 @@ Not yet supported (functions using these return `Error::Unsupported`):
 
 - `f128` arithmetic and conversions (matching Cranelift's x64/aarch64/riscv64
   backends).
-- `i128` atomics, and `umul_overflow`/`smul_overflow`/`umulhi`/`smulhi` on
-  `i128`.
+- `umul_overflow`/`smul_overflow`/`umulhi`/`smulhi` on `i128`.
 - Big-endian vector loads and stores, and arithmetic on `f16` lanes.
 - `try_call` with `i128`/`f128` arguments, results or payloads; dynamic stack
   slots; `get_return_address`.

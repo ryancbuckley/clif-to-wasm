@@ -23,7 +23,8 @@ use wasm_encoder::{ConstExpr, Encode, Instruction, ValType};
 use wasmtime::Val;
 
 pub const MEMORY_PAGES: u64 = 32;
-pub const STACK_TOP: i32 = MEMORY_PAGES as i32 * 65536;
+pub const LOCK_TABLE_ADDR: u64 = MEMORY_PAGES * 65536 - 256;
+pub const STACK_TOP: i32 = LOCK_TABLE_ADDR as i32;
 
 struct TestEnv<'a> {
     names: &'a HashMap<String, FuncIndex>,
@@ -210,6 +211,7 @@ pub fn compile_module(funcs: &[Function], config: &Config) -> (Vec<u8>, Vec<Stri
     config.module.pinned_reg_global = Some(pinned);
     config.module.table_index = Some(table);
     config.module.stack_pointer_global = Some(sp);
+    config.module.atomic_lock_table_addr = Some(LOCK_TABLE_ADDR);
     for (&f, &idx) in funcs.iter().zip(&indices) {
         let mut env = TestEnv {
             names: &names,

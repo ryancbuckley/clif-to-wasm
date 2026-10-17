@@ -307,3 +307,30 @@ block0:
         compile_function(f, &config, &mut SlotsOnly).unwrap();
     }
 }
+
+#[test]
+fn i128_atomic_needs_lock_table() {
+    let f = &parse_functions(
+        "
+function %load128(i32) -> i128 {
+block0(v0: i32):
+    v1 = atomic_load.i128 v0
+    return v1
+}
+",
+    )
+    .unwrap()[0];
+    let mut config = Config::default();
+    assert_eq!(config.module.atomic_lock_table_addr, None);
+    assert_eq!(
+        compile_function(f, &config, &mut SlotsOnly).unwrap_err(),
+        Error::Unsupported("i128 atomic without ModuleLayout::atomic_lock_table_addr".into()),
+    );
+    config.module.atomic_lock_table_addr = Some(2);
+    assert_eq!(
+        compile_function(f, &config, &mut SlotsOnly).unwrap_err(),
+        Error::Unsupported("unaligned ModuleLayout::atomic_lock_table_addr".into()),
+    );
+    config.module.atomic_lock_table_addr = Some(4096);
+    compile_function(f, &config, &mut SlotsOnly).unwrap();
+}

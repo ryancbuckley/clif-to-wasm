@@ -37,6 +37,11 @@
 //! Division and remainder become a small shift-subtract loop: the block is
 //! split at the division and 128 iterations of a restoring division run in
 //! between.
+//!
+//! Atomic `i128` operations (`atomic_load`, `atomic_store`, `atomic_cas`,
+//! `atomic_rmw`) expand into a spinlock-protected sequence of two `i64` atomic
+//! accesses, hashing the target address into a 64-entry striped `i32` lock
+//! table at [`crate::ModuleLayout::atomic_lock_table_addr`].
 
 use crate::{Result, unsupported};
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
@@ -46,8 +51,8 @@ use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::{Ieee64, Offset32};
 use cranelift_codegen::ir::{
-    AbiParam, Block, BlockArg, BlockCall, Endianness, Function, Inst, InstBuilder,
-    InstructionData as D, Opcode, Signature, TrapCode, Type, Value, types::*,
+    AbiParam, AtomicRmwOp, Block, BlockArg, BlockCall, Endianness, Function, Inst, InstBuilder,
+    InstructionData as D, MemFlagsData, Opcode, Signature, TrapCode, Type, Value, types::*,
 };
 use std::borrow::Cow;
 
@@ -62,7 +67,7 @@ fn is_pair(ty: Type) -> bool {
 /// Prepare `func` for the backend pipeline: resolve value aliases and legalize
 /// `i128`/`f128` into pairs of `i64`. Borrows `func` without cloning when
 /// neither is present.
-pub(crate) fn prepare(func: &Function) -> Result<Cow<'_, Function>> {
+pub(crate) fn prepare(func: &Function, lock_table_addr: Option<u64>) -> Result<Cow<'_, Function>> {
     let (aliases, wide) = scan(func);
     if !aliases && !wide {
         return Ok(Cow::Borrowed(func));
@@ -70,7 +75,7 @@ pub(crate) fn prepare(func: &Function) -> Result<Cow<'_, Function>> {
     let mut f = func.clone();
     f.dfg.resolve_all_aliases();
     if wide {
-        legalize(&mut f)?;
+        legalize(&mut f, lock_table_addr)?;
     }
     Ok(Cow::Owned(f))
 }
@@ -129,7 +134,7 @@ enum Out {
 
 /// The function must be alias-free; aliases are created for replaced
 /// scalar results and must be resolved afterwards.
-fn legalize(func: &mut Function) -> Result<()> {
+fn legalize(func: &mut Function, lock_table_addr: Option<u64>) -> Result<()> {
     legalize_signature(&mut func.signature);
     for sig in func.dfg.signatures.values_mut() {
         legalize_signature(sig);
@@ -144,6 +149,7 @@ fn legalize(func: &mut Function) -> Result<()> {
     let mut l = Legalizer {
         func,
         pairs: SecondaryMap::new(),
+        lock_table_addr,
     };
     for block in rpo {
         l.block_params(block);
@@ -159,6 +165,7 @@ fn legalize(func: &mut Function) -> Result<()> {
 struct Legalizer<'f> {
     func: &'f mut Function,
     pairs: SecondaryMap<Value, Option<Pair>>,
+    lock_table_addr: Option<u64>,
 }
 
 impl Legalizer<'_> {
@@ -316,7 +323,7 @@ impl Legalizer<'_> {
             }
         };
 
-        // Calls, returns, and division/remainder manage their own cursor or results.
+        // Calls, returns, division/remainder, and i128 atomics manage their own cursor or results.
         match (op, data) {
             (Opcode::Udiv | Opcode::Sdiv | Opcode::Urem | Opcode::Srem, _) => {
                 let (x, d) = (p(0)?, p(1)?);
@@ -325,6 +332,12 @@ impl Legalizer<'_> {
                 let (lo, hi) = self.divmod(inst, signed, rem, x, d);
                 self.finish(inst, &[Out::Pair(lo, hi)]);
                 return Ok(());
+            }
+            (
+                Opcode::AtomicLoad | Opcode::AtomicStore | Opcode::AtomicCas | Opcode::AtomicRmw,
+                _,
+            ) if ty == I128 || arg_tys.first() == Some(&I128) => {
+                return self.atomic(inst, data, &args, p);
             }
             (Opcode::Return, _) => {
                 let vals = self.expand(&args)?;
@@ -857,6 +870,166 @@ impl Legalizer<'_> {
             (false, _, _) => (q_lo, q_hi),
             (true, _, _) => (r_lo, r_hi),
         }
+    }
+
+    /// Expand an `i128` atomic operation into a spinlock-protected pair of
+    /// `i64` atomic accesses.
+    ///
+    /// WebAssembly's threads proposal only provides atomic instructions up to
+    /// 64 bits (`i64.atomic.*`). To make 128-bit atomic loads, stores, RMWs,
+    /// and compare-exchanges linearizable with respect to each other, we split
+    /// the current block around a striped spinlock in linear memory:
+    ///
+    /// 1. In `orig`, compute the high-half address (`addr + 8`) and hash `addr`
+    ///    into one of 64 `i32` lock words (`table_base + ((addr >> 2) & 0xfc)`),
+    ///    then jump to `spin`.
+    /// 2. In `spin`, `atomic_cas.i32(lock_addr, 0, 1)`; loop back to `spin` if
+    ///    the old value was non-zero, otherwise enter `cont`.
+    /// 3. In `cont`, perform the two 64-bit halves using `atomic_load.i64` /
+    ///    `atomic_store.i64` (preserving the instruction's `MemFlags` so that
+    ///    `lower_atomic` byte-swaps each half on `big` endianness and traps on
+    ///    unaligned addresses), release the lock with `atomic_store.i32(0)`,
+    ///    and replace `inst` with the resulting `(lo, hi)` pair.
+    fn atomic(
+        &mut self,
+        inst: Inst,
+        data: D,
+        args: &[Value],
+        p: impl Fn(usize) -> Result<Pair>,
+    ) -> Result<()> {
+        let Some(table_base) = self.lock_table_addr else {
+            return unsupported("i128 atomic without ModuleLayout::atomic_lock_table_addr");
+        };
+        if table_base & 3 != 0 {
+            return unsupported("unaligned ModuleLayout::atomic_lock_table_addr");
+        }
+        let (flags, addr) = match data {
+            D::LoadNoOffset { flags, .. }
+            | D::AtomicCas { flags, .. }
+            | D::AtomicRmw { flags, .. } => (self.func.dfg.mem_flags[flags], args[0]),
+            D::StoreNoOffset { flags, .. } => (self.func.dfg.mem_flags[flags], args[1]),
+            _ => unreachable!(),
+        };
+        let operand_pairs = match data.opcode() {
+            Opcode::AtomicLoad => (None, None),
+            Opcode::AtomicStore => (Some(p(0)?), None),
+            Opcode::AtomicRmw => (Some(p(1)?), None),
+            Opcode::AtomicCas => (Some(p(1)?), Some(p(2)?)),
+            _ => unreachable!(),
+        };
+
+        let func = &mut *self.func;
+        let addr_ty = func.dfg.value_type(addr);
+        if addr_ty == I32 && table_base > u32::MAX as u64 {
+            return unsupported("ModuleLayout::atomic_lock_table_addr out of 32-bit range");
+        }
+        let orig = func.layout.inst_block(inst).unwrap();
+        let cont = func.dfg.make_block();
+        func.layout.split_block(cont, inst);
+        let spin = func.dfg.make_block();
+        func.layout.insert_block(spin, cont);
+
+        // Compute addresses in `orig` before entering the spin loop: Both
+        // `lo_addr`/`hi_addr` and `lock_addr` dominate `spin` and `cont`.
+        let mut pos = FuncCursor::new(func).at_bottom(orig);
+        let addr_plus_8 = pos.ins().iadd_imm_s(addr, 8);
+        let (lo_addr, hi_addr) = match flags.endianness(Endianness::Little) {
+            Endianness::Little => (addr, addr_plus_8),
+            Endianness::Big => (addr_plus_8, addr),
+        };
+        let shifted = pos.ins().ushr_imm_u(addr, 2);
+        let offset = pos.ins().band_imm_u(shifted, 0xfc);
+        let base = pos.ins().iconst(addr_ty, table_base as i64);
+        let lock_addr = pos.ins().iadd(base, offset);
+        pos.ins().jump(spin, &[]);
+
+        // Spin until `atomic_cas.i32(lock_addr, 0, 1)` observes 0.
+        pos.goto_bottom(spin);
+        let zero = pos.ins().iconst(I32, 0);
+        let one = pos.ins().iconst(I32, 1);
+        let seen = pos
+            .ins()
+            .atomic_cas(MemFlagsData::trusted(), lock_addr, zero, one);
+        pos.ins().brif(seen, spin, &[], cont, &[]);
+
+        // Critical section in `cont`: access both 64-bit halves, then unlock.
+        let mut pos = FuncCursor::new(func).at_inst(inst);
+        let outs: Option<Pair> = match data {
+            D::LoadNoOffset {
+                opcode: Opcode::AtomicLoad,
+                ..
+            } => {
+                let lo = pos.ins().atomic_load(I64, flags, lo_addr);
+                let hi = pos.ins().atomic_load(I64, flags, hi_addr);
+                Some((lo, hi))
+            }
+            D::StoreNoOffset {
+                opcode: Opcode::AtomicStore,
+                ..
+            } => {
+                let (lo, hi) = operand_pairs.0.unwrap();
+                pos.ins().atomic_store(flags, lo, lo_addr);
+                pos.ins().atomic_store(flags, hi, hi_addr);
+                None
+            }
+            D::AtomicCas { .. } => {
+                let exp = operand_pairs.0.unwrap();
+                let new = operand_pairs.1.unwrap();
+                let old_lo = pos.ins().atomic_load(I64, flags, lo_addr);
+                let old_hi = pos.ins().atomic_load(I64, flags, hi_addr);
+                let old = (old_lo, old_hi);
+                let eq = icmp(&mut pos, IntCC::Equal, old, exp);
+                let (store_lo, store_hi) = select(&mut pos, eq, new, old);
+                pos.ins().atomic_store(flags, store_lo, lo_addr);
+                pos.ins().atomic_store(flags, store_hi, hi_addr);
+                Some(old)
+            }
+            D::AtomicRmw { op, .. } => {
+                let x = operand_pairs.0.unwrap();
+                let old_lo = pos.ins().atomic_load(I64, flags, lo_addr);
+                let old_hi = pos.ins().atomic_load(I64, flags, hi_addr);
+                let old = (old_lo, old_hi);
+                let (new_lo, new_hi) = match op {
+                    AtomicRmwOp::Add => add(&mut pos, old, x),
+                    AtomicRmwOp::Sub => sub(&mut pos, old, x),
+                    AtomicRmwOp::And => (pos.ins().band(old.0, x.0), pos.ins().band(old.1, x.1)),
+                    AtomicRmwOp::Nand => {
+                        let a = pos.ins().band(old.0, x.0);
+                        let b = pos.ins().band(old.1, x.1);
+                        (pos.ins().bnot(a), pos.ins().bnot(b))
+                    }
+                    AtomicRmwOp::Or => (pos.ins().bor(old.0, x.0), pos.ins().bor(old.1, x.1)),
+                    AtomicRmwOp::Xor => (pos.ins().bxor(old.0, x.0), pos.ins().bxor(old.1, x.1)),
+                    AtomicRmwOp::Xchg => x,
+                    AtomicRmwOp::Umin => {
+                        let c = icmp(&mut pos, IntCC::UnsignedLessThan, old, x);
+                        select(&mut pos, c, old, x)
+                    }
+                    AtomicRmwOp::Umax => {
+                        let c = icmp(&mut pos, IntCC::UnsignedGreaterThan, old, x);
+                        select(&mut pos, c, old, x)
+                    }
+                    AtomicRmwOp::Smin => {
+                        let c = icmp(&mut pos, IntCC::SignedLessThan, old, x);
+                        select(&mut pos, c, old, x)
+                    }
+                    AtomicRmwOp::Smax => {
+                        let c = icmp(&mut pos, IntCC::SignedGreaterThan, old, x);
+                        select(&mut pos, c, old, x)
+                    }
+                };
+                pos.ins().atomic_store(flags, new_lo, lo_addr);
+                pos.ins().atomic_store(flags, new_hi, hi_addr);
+                Some(old)
+            }
+            _ => unreachable!(),
+        };
+        let zero = pos.ins().iconst(I32, 0);
+        pos.ins()
+            .atomic_store(MemFlagsData::trusted(), zero, lock_addr);
+        let outs: Vec<Out> = outs.into_iter().map(|(lo, hi)| Out::Pair(lo, hi)).collect();
+        self.finish(inst, &outs);
+        Ok(())
     }
 }
 
