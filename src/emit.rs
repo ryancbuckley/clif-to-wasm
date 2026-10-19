@@ -41,6 +41,16 @@ use wasm_encoder::{BlockType, Encode, Instruction as I, MemArg, ValType};
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ScratchMark(usize);
 
+/// A by-value struct argument still to be copied into the frame, from
+/// [`Emitter::call_args`].
+pub(crate) struct ByvalCopy {
+    /// Offset of the copy in the frame.
+    dst: u32,
+    /// Holds the struct's address.
+    src: Local,
+    size: u32,
+}
+
 pub(crate) struct Emitter<'a> {
     pub func: &'a Function,
     pub config: &'a Config,
@@ -569,8 +579,19 @@ impl<'a> Emitter<'a> {
     /// the callee expects them: narrow `sext` arguments sign-extended, and
     /// by-value struct arguments copied into this frame (passing the copy's
     /// address).
-    pub(crate) fn call_args(&mut self, sig: &Signature, n: usize, tail: bool) -> Result<()> {
+    ///
+    /// The copies are made by [`Self::byval_copies`], once the call's last
+    /// operand has been pushed: an operand evaluated later may write to a
+    /// struct being passed, or be a call that copies its own struct arguments
+    /// into the same area.
+    pub(crate) fn call_args(
+        &mut self,
+        sig: &Signature,
+        n: usize,
+        tail: bool,
+    ) -> Result<Vec<ByvalCopy>> {
         let mut byval = self.byval_base;
+        let mut copies = Vec::new();
         for i in 0..n {
             self.operand()?;
             let p = sig.params.get(i);
@@ -592,13 +613,10 @@ impl<'a> Emitter<'a> {
                 }
                 let src = self.scratch(self.config.module.ptr_ty());
                 self.local_set(src);
-                self.frame_addr(fp, byval);
-                self.local_get(src);
-                self.ptr_const(size as i64);
-                let mem = self.config.module.memory_index.0;
-                self.ins(I::MemoryCopy {
-                    src_mem: mem,
-                    dst_mem: mem,
+                copies.push(ByvalCopy {
+                    dst: byval,
+                    src,
+                    size,
                 });
                 self.frame_addr(fp, byval);
                 self.ptr_to(value_type)?;
@@ -607,7 +625,24 @@ impl<'a> Emitter<'a> {
                 self.extend_for_abi(p);
             }
         }
-        Ok(())
+        Ok(copies)
+    }
+
+    /// Copy by-value struct arguments into the frame, after [`Self::call_args`]
+    /// and any other operand of the call. `memory.copy` leaves the arguments
+    /// on the stack alone.
+    pub(crate) fn byval_copies(&mut self, copies: Vec<ByvalCopy>) {
+        let mem = self.config.module.memory_index.0;
+        for c in copies {
+            let (fp, _) = self.frame.expect("frame for by-value arguments");
+            self.frame_addr(fp, c.dst);
+            self.local_get(c.src);
+            self.ptr_const(c.size as i64);
+            self.ins(I::MemoryCopy {
+                src_mem: mem,
+                dst_mem: mem,
+            });
+        }
     }
 
     /// Sign-extend the narrow value on the stack if `p` asks for it. Values
@@ -853,3 +888,219 @@ impl ExtraLocals {
         &self.types
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::collections::HashSet;
+    use wasmparser::{BinaryReader, Operator, OperatorsReader};
+
+    struct NoEnv;
+    impl Env for NoEnv {
+        fn func_index(&mut self, name: Name<'_>) -> Result<FuncIndex> {
+            Err(crate::Error::Env(name.to_string()))
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Op {
+        LocalGet(u32),
+        LocalSet(u32),
+        LocalTee(u32),
+        I32Const(i32),
+        I32Add,
+        Drop,
+    }
+
+    impl Op {
+        fn to_insn(self) -> I<'static> {
+            match self {
+                Op::LocalGet(x) => I::LocalGet(x),
+                Op::LocalSet(x) => I::LocalSet(x),
+                Op::LocalTee(x) => I::LocalTee(x),
+                Op::I32Const(c) => I::I32Const(c),
+                Op::I32Add => I::I32Add,
+                Op::Drop => I::Drop,
+            }
+        }
+    }
+
+    fn decode_ops(bytes: &[u8]) -> Vec<Op> {
+        let reader = OperatorsReader::new(BinaryReader::new(bytes, 0));
+        let mut out = Vec::new();
+        for op in reader {
+            let op = match op.unwrap() {
+                Operator::LocalGet { local_index } => Op::LocalGet(local_index),
+                Operator::LocalSet { local_index } => Op::LocalSet(local_index),
+                Operator::LocalTee { local_index } => Op::LocalTee(local_index),
+                Operator::I32Const { value } => Op::I32Const(value),
+                Operator::I32Add => Op::I32Add,
+                Operator::Drop => Op::Drop,
+                other => panic!("unexpected operator: {other:?}"),
+            };
+            out.push(op);
+        }
+        out
+    }
+
+    /// Reference model for `Body` peephole fusion.
+    fn model_peephole(ops: &[Op], use_tee: bool) -> Vec<Op> {
+        if !use_tee {
+            return ops.to_vec();
+        }
+        let mut out = Vec::with_capacity(ops.len());
+        let mut i = 0;
+        while i < ops.len() {
+            if let (Op::LocalSet(s), Some(&Op::LocalGet(g))) = (ops[i], ops.get(i + 1))
+                && s == g
+            {
+                out.push(Op::LocalTee(s));
+                i += 2;
+            } else {
+                out.push(ops[i]);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    fn op_strategy() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            4 => (0u32..4).prop_map(Op::LocalGet),
+            4 => (0u32..4).prop_map(Op::LocalSet),
+            2 => (0u32..4).prop_map(Op::LocalTee),
+            2 => any::<i32>().prop_map(Op::I32Const),
+            1 => Just(Op::I32Add),
+            1 => Just(Op::Drop),
+        ]
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum PoolAction {
+        Fresh(ValType),
+        Scratch(ValType),
+        Mark,
+        FreeLastMark,
+    }
+
+    fn valtype_strategy() -> impl Strategy<Value = ValType> {
+        prop_oneof![
+            Just(ValType::I32),
+            Just(ValType::I64),
+            Just(ValType::F32),
+            Just(ValType::F64),
+            Just(ValType::V128),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn body_peephole_matches_model(
+            ops in prop::collection::vec(op_strategy(), 0..64),
+            use_tee in any::<bool>(),
+        ) {
+            let mut body = Body::new(use_tee);
+            for &op in &ops {
+                body.ins(op.to_insn());
+            }
+            let (bytes, relocs) = body.finish();
+            prop_assert!(relocs.is_empty());
+            let decoded = decode_ops(&bytes);
+            let expected = model_peephole(&ops, use_tee);
+            prop_assert_eq!(decoded, expected);
+        }
+
+        #[test]
+        fn extra_locals_invariants(
+            base in 0u32..32,
+            actions in prop::collection::vec(
+                prop_oneof![
+                    2 => valtype_strategy().prop_map(PoolAction::Fresh),
+                    5 => valtype_strategy().prop_map(PoolAction::Scratch),
+                    2 => Just(PoolAction::Mark),
+                    2 => Just(PoolAction::FreeLastMark),
+                ],
+                0..80,
+            ),
+        ) {
+            let mut extra = ExtraLocals::new(base);
+            let mut marks: Vec<(ScratchMark, usize)> = Vec::new();
+            let mut fresh_set: HashSet<Local> = HashSet::new();
+            let mut active: Vec<(ValType, Local)> = Vec::new();
+
+            for action in actions {
+                match action {
+                    PoolAction::Fresh(ty) => {
+                        let l = extra.fresh(ty);
+                        prop_assert!(l.0 >= base);
+                        prop_assert!(fresh_set.insert(l), "duplicate fresh local {l:?}");
+                        for &(_, al) in &active {
+                            prop_assert_ne!(l, al, "fresh local aliased active scratch");
+                        }
+                        prop_assert_eq!(extra.types()[(l.0 - base) as usize], ty);
+                    }
+                    PoolAction::Scratch(ty) => {
+                        let l = extra.scratch(ty);
+                        prop_assert!(l.0 >= base);
+                        prop_assert!(!fresh_set.contains(&l), "scratch aliased fresh local");
+                        for &(_, al) in &active {
+                            prop_assert_ne!(l, al, "scratch aliased another active scratch");
+                        }
+                        prop_assert_eq!(extra.types()[(l.0 - base) as usize], ty);
+                        active.push((ty, l));
+                    }
+                    PoolAction::Mark => {
+                        marks.push((extra.mark(), active.len()));
+                    }
+                    PoolAction::FreeLastMark => {
+                        if let Some((m, len)) = marks.pop() {
+                            extra.free_since(m);
+                            active.truncate(len);
+                        }
+                    }
+                }
+                // Total allocated types equals fresh locals + active scratches + free scratches.
+                prop_assert_eq!(
+                    extra.types().len(),
+                    fresh_set.len() + extra.active_scratch.len() + extra.free_scratch.len()
+                );
+            }
+
+            // Reclaiming everything returns all scratches to the free pool and reuses them without growing `types`.
+            extra.free_since(ScratchMark(0));
+            let count_before = extra.types().len();
+            for &(ty, _) in &active {
+                let l = extra.scratch(ty);
+                prop_assert_eq!(extra.types()[(l.0 - base) as usize], ty);
+            }
+            prop_assert_eq!(extra.types().len(), count_before);
+        }
+    }
+
+    #[test]
+    fn stack_frame_overflow_is_unsupported() {
+        use cranelift_codegen::ir::{StackSlotData, StackSlotKind};
+        let mut func = Function::new();
+        let b0 = func.dfg.make_block();
+        func.layout.append_block(b0);
+        let ret = func.dfg.make_inst(D::MultiAry {
+            opcode: Opcode::Return,
+            args: cranelift_codegen::ir::ValueList::default(),
+        });
+        func.layout.append_inst(ret, b0);
+        func.sized_stack_slots.push(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            u32::MAX - 4,
+            0,
+        ));
+        let mut config = Config::default();
+        config.module.stack_pointer_global = Some(GlobalIndex(0));
+        let err = crate::compile_function(&func, &config, &mut NoEnv).unwrap_err();
+        assert_eq!(
+            err,
+            crate::Error::Unsupported("stack frame size overflow".into())
+        );
+    }
+}
+

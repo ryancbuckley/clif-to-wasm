@@ -295,3 +295,339 @@ pub(crate) fn has_lowering_side_effect(func: &Function, inst: Inst) -> bool {
     // global that `set_pinned_reg` writes, so the two must not be reordered.
     must_lower_even_if_unused(func, inst) || op.can_load()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cranelift_codegen::cursor::{Cursor, FuncCursor};
+    use cranelift_codegen::entity::EntityRef;
+    use cranelift_codegen::ir::{
+        AbiParam, InstBuilder, JumpTableData, MemFlagsData, Signature, TrapCode, types,
+    };
+    use cranelift_codegen::isa::CallConv;
+    use proptest::prelude::*;
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    #[test]
+    fn get_pinned_reg_has_lowering_side_effect() {
+        let mut func = Function::new();
+        let b0 = func.dfg.make_block();
+        func.layout.append_block(b0);
+        let mut pos = FuncCursor::new(&mut func).at_bottom(b0);
+        let v = pos.ins().get_pinned_reg(types::I64);
+        pos.ins().return_(&[v]);
+        let get_inst = func.layout.first_inst(b0).unwrap();
+        // `get_pinned_reg` has `other_side_effects`, so it is kept and ordered
+        // with other effects (Cranelift's lowering excludes it from both).
+        assert!(must_lower_even_if_unused(&func, get_inst));
+        assert!(has_lowering_side_effect(&func, get_inst));
+    }
+
+    /// Independent BFS reachability from `start`, optionally forbidding `avoid`.
+    fn reachable_without(
+        entry: Block,
+        succs: &HashMap<Block, Vec<Block>>,
+        avoid: Option<Block>,
+    ) -> HashSet<Block> {
+        let mut visited = HashSet::new();
+        if Some(entry) == avoid {
+            return visited;
+        }
+        let mut q = VecDeque::new();
+        visited.insert(entry);
+        q.push_back(entry);
+        while let Some(b) = q.pop_front() {
+            if let Some(nexts) = succs.get(&b) {
+                for &n in nexts {
+                    if Some(n) != avoid && visited.insert(n) {
+                        q.push_back(n);
+                    }
+                }
+            }
+        }
+        visited
+    }
+
+    fn analysis_func_strategy() -> impl Strategy<Value = Function> {
+        (
+            1usize..=7,
+            prop::collection::vec(0usize..=3, 1..=7),
+            prop::collection::vec(
+                prop::collection::vec((0u8..8, 0usize..16, 0usize..16), 0..=5),
+                1..=7,
+            ),
+            prop::collection::vec((0u8..5, 0usize..7, 0usize..7, 0usize..16), 1..=7),
+        )
+            .prop_map(|(num_blocks, param_counts, block_insts, terms)| {
+                let mut sig = Signature::new(CallConv::SystemV);
+                sig.params.push(AbiParam::new(types::I32));
+                sig.returns.push(AbiParam::new(types::I32));
+                let mut func = Function::with_name_signature(Default::default(), sig);
+
+                let blocks: Vec<Block> = (0..num_blocks).map(|_| func.dfg.make_block()).collect();
+                for (bi, &b) in blocks.iter().enumerate() {
+                    func.layout.append_block(b);
+                    if bi == 0 {
+                        func.dfg.append_block_param(b, types::I32);
+                    } else {
+                        let np = param_counts.get(bi).copied().unwrap_or(0);
+                        for _ in 0..np {
+                            func.dfg.append_block_param(b, types::I32);
+                        }
+                    }
+                }
+
+                let entry_p = func.dfg.block_params(blocks[0])[0];
+                let mut vals_per_block = Vec::with_capacity(num_blocks);
+
+                for bi in 0..num_blocks {
+                    let b = blocks[bi];
+                    let mut vals = vec![entry_p];
+                    if bi > 0 {
+                        vals.extend_from_slice(func.dfg.block_params(b));
+                    }
+                    let mut pos = FuncCursor::new(&mut func).at_bottom(b);
+                    if let Some(insts) = block_insts.get(bi) {
+                        for &(kind, ia, ib) in insts {
+                            let va = vals[ia % vals.len()];
+                            let vb = vals[ib % vals.len()];
+                            let r = match kind {
+                                0 => pos.ins().iadd(va, vb),
+                                1 => pos.ins().isub(va, vb),
+                                2 => pos.ins().imul(va, vb),
+                                3 => pos.ins().iconst(types::I32, ia as i64),
+                                4 => pos.ins().load(types::I32, MemFlagsData::trusted(), va, 0),
+                                5 => pos.ins().load(types::I32, MemFlagsData::new(), va, 0),
+                                6 => {
+                                    pos.ins().store(MemFlagsData::new(), va, vb, 0);
+                                    continue;
+                                }
+                                _ => pos.ins().udiv(va, vb),
+                            };
+                            vals.push(r);
+                        }
+                    }
+                    vals_per_block.push(vals);
+                }
+
+                let make_call = |func: &mut Function,
+                                 target: Block,
+                                 vals: &[Value],
+                                 seed: usize|
+                 -> BlockCall {
+                    let np = func.dfg.block_params(target).len();
+                    let args: Vec<BlockArg> = (0..np)
+                        .map(|i| BlockArg::Value(vals[(seed + i) % vals.len()]))
+                        .collect();
+                    func.dfg.block_call(target, &args)
+                };
+
+                for bi in 0..num_blocks {
+                    let b = blocks[bi];
+                    let vals = &vals_per_block[bi];
+                    let &(tkind, t1, t2, seed) = terms.get(bi).unwrap_or(&(0, 0, 0, 0));
+                    let cond = vals[seed % vals.len()];
+                    let ret_v = vals[(seed + 1) % vals.len()];
+                    if num_blocks == 1 || tkind == 0 {
+                        let mut pos = FuncCursor::new(&mut func).at_bottom(b);
+                        pos.ins().return_(&[ret_v]);
+                    } else if tkind == 4 {
+                        let mut pos = FuncCursor::new(&mut func).at_bottom(b);
+                        pos.ins().trap(TrapCode::user(1).unwrap());
+                    } else {
+                        let target1 = blocks[1 + (t1 % (num_blocks - 1))];
+                        let target2 = blocks[1 + (t2 % (num_blocks - 1))];
+                        match tkind {
+                            1 => {
+                                let c = make_call(&mut func, target1, vals, seed);
+                                let mut pos = FuncCursor::new(&mut func).at_bottom(b);
+                                let args: Vec<BlockArg> =
+                                    c.args(&pos.func.dfg.value_lists).collect();
+                                pos.ins().jump(target1, &args);
+                            }
+                            2 => {
+                                let c1 = make_call(&mut func, target1, vals, seed);
+                                let c2 = make_call(&mut func, target2, vals, seed + (t1 & 1));
+                                let mut pos = FuncCursor::new(&mut func).at_bottom(b);
+                                let a1: Vec<BlockArg> =
+                                    c1.args(&pos.func.dfg.value_lists).collect();
+                                let a2: Vec<BlockArg> =
+                                    c2.args(&pos.func.dfg.value_lists).collect();
+                                pos.ins().brif(cond, target1, &a1, target2, &a2);
+                            }
+                            _ => {
+                                let c1 = make_call(&mut func, target1, vals, seed);
+                                let c2 = make_call(&mut func, target2, vals, seed + 1);
+                                let jt = func.dfg.jump_tables.push(JumpTableData::new(
+                                    c1,
+                                    &[c2, c1],
+                                ));
+                                let mut pos = FuncCursor::new(&mut func).at_bottom(b);
+                                pos.ins().br_table(cond, jt);
+                            }
+                        }
+                    }
+                }
+
+                func
+            })
+    }
+
+    proptest! {
+        #[test]
+        fn func_info_matches_independent_oracle(func in analysis_func_strategy()) {
+            let info = FuncInfo::compute(&func).unwrap();
+            let entry = func.layout.entry_block().unwrap();
+            let pool = &func.dfg.value_lists;
+
+            // 1. Build independent adjacency list over all blocks.
+            let mut raw_succs: HashMap<Block, Vec<Block>> = HashMap::new();
+            for b in func.layout.blocks() {
+                let term = func.layout.last_inst(b).unwrap();
+                let mut s = Vec::new();
+                for call in func.dfg.insts[term]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
+                    s.push(call.block(pool));
+                }
+                raw_succs.insert(b, s);
+            }
+
+            // 2. Reachable blocks in `info.rpo` must match independent BFS reachability.
+            let reachable = reachable_without(entry, &raw_succs, None);
+            let rpo_set: HashSet<Block> = info.rpo.iter().copied().collect();
+            prop_assert_eq!(info.rpo.len(), rpo_set.len(), "duplicate blocks in rpo");
+            prop_assert_eq!(&rpo_set, &reachable);
+            prop_assert_eq!(info.rpo[0], entry);
+
+            for b in func.layout.blocks() {
+                if reachable.contains(&b) {
+                    let idx = info.rpo.iter().position(|&x| x == b).unwrap();
+                    prop_assert_eq!(info.rpo_num[b], RpoIndex(idx as u32));
+                } else {
+                    prop_assert_eq!(info.rpo_num[b], RpoIndex::UNREACHABLE);
+                }
+            }
+
+            // 3. Verify `preds`, `forward_in`, `loop_header`, and `reducible` against definition of dominance.
+            // Block `d` dominates reachable block `x` iff `x` is not reachable from `entry` when `d` is removed.
+            let dominates = |d: Block, x: Block| -> bool {
+                d == x || !reachable_without(entry, &raw_succs, Some(d)).contains(&x)
+            };
+
+            let mut expected_reducible = true;
+            for &b in &info.rpo {
+                let mut exp_preds = Vec::new();
+                let mut exp_forward = 0u32;
+                let mut exp_loop = false;
+                for &p in &info.rpo {
+                    for call in &info.dests[p] {
+                        if call.block(pool) == b {
+                            if !exp_preds.contains(&p) {
+                                exp_preds.push(p);
+                            }
+                            if info.rpo_num[b] <= info.rpo_num[p] {
+                                exp_loop = true;
+                                if !dominates(b, p) {
+                                    expected_reducible = false;
+                                }
+                            } else {
+                                exp_forward += 1;
+                            }
+                        }
+                    }
+                }
+                prop_assert_eq!(&info.preds[b], &exp_preds);
+                prop_assert_eq!(info.forward_in[b], exp_forward);
+                prop_assert_eq!(info.loop_header[b], exp_loop);
+            }
+            prop_assert_eq!(info.reducible, expected_reducible);
+
+            // 4. Independent iterative fixpoint oracle for `live_inst` and `use_count`.
+            let mut exp_live_inst: HashSet<Inst> = HashSet::new();
+            let mut exp_live_val: HashSet<Value> = HashSet::new();
+            for &b in &info.rpo {
+                for inst in func.layout.block_insts(b) {
+                    if must_lower_even_if_unused(&func, inst)
+                        || func.dfg.insts[inst].opcode().is_terminator()
+                    {
+                        exp_live_inst.insert(inst);
+                    }
+                }
+            }
+            loop {
+                let mut changed = false;
+                for &b in &info.rpo {
+                    for inst in func.layout.block_insts(b) {
+                        if exp_live_inst.contains(&inst) {
+                            for &arg in func.dfg.inst_args(inst) {
+                                if exp_live_val.insert(arg) {
+                                    changed = true;
+                                }
+                            }
+                        } else if func
+                            .dfg
+                            .inst_results(inst)
+                            .iter()
+                            .any(|r| exp_live_val.contains(r))
+                        {
+                            exp_live_inst.insert(inst);
+                            changed = true;
+                        }
+                    }
+                    for (idx, &param) in func.dfg.block_params(b).iter().enumerate() {
+                        if exp_live_val.contains(&param) {
+                            for &p in &info.preds[b] {
+                                for call in &info.dests[p] {
+                                    if call.block(pool) == b
+                                        && let BlockArg::Value(a) = call.args(pool).nth(idx).unwrap()
+                                        && exp_live_val.insert(a)
+                                    {
+                                        changed = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+
+            // Count uses across all live instructions and live block parameters in reachable blocks.
+            let mut exp_use_count: HashMap<Value, u32> = HashMap::new();
+            for &b in &info.rpo {
+                for inst in func.layout.block_insts(b) {
+                    prop_assert_eq!(info.live_inst[inst], exp_live_inst.contains(&inst));
+                    if exp_live_inst.contains(&inst) {
+                        for &arg in func.dfg.inst_args(inst) {
+                            *exp_use_count.entry(arg).or_default() += 1;
+                        }
+                    }
+                }
+                for (idx, &param) in func.dfg.block_params(b).iter().enumerate() {
+                    if exp_live_val.contains(&param) {
+                        for &p in &info.preds[b] {
+                            for call in &info.dests[p] {
+                                if call.block(pool) == b
+                                    && let BlockArg::Value(a) = call.args(pool).nth(idx).unwrap()
+                                {
+                                    *exp_use_count.entry(a).or_default() += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            for vi in 0..func.dfg.num_values() {
+                let v = Value::new(vi);
+                let exp = exp_use_count.get(&v).copied().unwrap_or(0);
+                prop_assert_eq!(info.use_count[v], exp, "use_count mismatch for {}", v);
+                prop_assert_eq!(info.is_live(v), exp_live_val.contains(&v));
+            }
+        }
+    }
+}
+

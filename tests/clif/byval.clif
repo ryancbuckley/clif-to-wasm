@@ -66,3 +66,79 @@ block0(v0: i64, v1: i64, v2: i32):
     return v9
 }
 ; run: %caller2(3, 4, 5) == 19
+
+; The copies are made at the call, after every argument is computed, even
+; when an argument folds into the call's operand tree: here a call with its
+; own struct argument (copied into the same area of the frame), and a call
+; that writes to the struct being passed.
+function %first_field(i64 sarg(16), i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = load.i64 v0
+    v3 = iadd v2, v1
+    return v3
+}
+
+function %nested_sarg(i64, i64) -> i64 {
+    fn0 = %first_field(i64 sarg(16), i64) -> i64
+    ss0 = explicit_slot 16, align = 8
+    ss1 = explicit_slot 16, align = 8
+block0(v0: i64, v1: i64):
+    v2 = stack_addr.i64 ss0
+    store v0, v2
+    v3 = stack_addr.i64 ss1
+    store v1, v3
+    v4 = iconst.i64 0
+    v5 = call fn0(v3, v4)
+    v6 = call fn0(v2, v5)
+    return v6
+}
+; run: %nested_sarg(1000, 7) == 1007
+
+function %bump(i64) -> i64 {
+block0(v0: i64):
+    v1 = load.i64 v0
+    v3 = iconst.i64 1
+    v2 = iadd v1, v3
+    store v2, v0
+    return v2
+}
+
+function %write_before_copy(i64) -> i64 {
+    fn0 = %first_field(i64 sarg(16), i64) -> i64
+    fn1 = %bump(i64) -> i64
+    ss0 = explicit_slot 16, align = 8
+block0(v0: i64):
+    v2 = stack_addr.i64 ss0
+    store v0, v2
+    v5 = call fn1(v2)
+    v6 = call fn0(v2, v5)
+    return v6
+}
+; run: %write_before_copy(10) == 22
+
+; The callee of a `call_indirect` comes from a call that writes to the
+; struct being passed.
+function %bump_then_callee(i64) -> i64 {
+    fn0 = %first_field(i64 sarg(16), i64) -> i64
+block0(v0: i64):
+    v1 = load.i64 v0
+    v3 = iconst.i64 1
+    v2 = iadd v1, v3
+    store v2, v0
+    v4 = func_addr.i64 fn0
+    return v4
+}
+
+function %write_before_copy_indirect(i64) -> i64 {
+    sig0 = (i64 sarg(16), i64) -> i64
+    fn1 = %bump_then_callee(i64) -> i64
+    ss0 = explicit_slot 16, align = 8
+block0(v0: i64):
+    v2 = stack_addr.i64 ss0
+    store v0, v2
+    v4 = iconst.i64 0
+    v5 = call fn1(v2)
+    v6 = call_indirect sig0, v5(v2, v4)
+    return v6
+}
+; run: %write_before_copy_indirect(10) == 11

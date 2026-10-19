@@ -460,3 +460,189 @@ impl ModuleBuilder {
         module.finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+    use wasm_encoder::Instruction as I;
+    use wasmparser::{Validator, WasmFeatures};
+
+    fn valtype_strat() -> impl Strategy<Value = ValType> {
+        prop_oneof![
+            Just(ValType::I32),
+            Just(ValType::I64),
+            Just(ValType::F32),
+            Just(ValType::F64),
+            Just(ValType::V128),
+        ]
+    }
+
+    fn sig_strat() -> impl Strategy<Value = (Vec<ValType>, Vec<ValType>)> {
+        (
+            prop::collection::vec(valtype_strat(), 0..4),
+            prop::collection::vec(valtype_strat(), 0..3),
+        )
+    }
+
+    fn trivial_body(params: &[ValType], results: &[ValType]) -> CompiledFunction {
+        use wasm_encoder::Encode;
+        let mut body = Vec::new();
+        for &r in results {
+            match r {
+                ValType::I32 => I::I32Const(0).encode(&mut body),
+                ValType::I64 => I::I64Const(0).encode(&mut body),
+                ValType::F32 => I::F32Const(wasm_encoder::Ieee32::new(0)).encode(&mut body),
+                ValType::F64 => I::F64Const(wasm_encoder::Ieee64::new(0)).encode(&mut body),
+                ValType::V128 => I::V128Const(0).encode(&mut body),
+                _ => unreachable!(),
+            }
+        }
+        I::End.encode(&mut body);
+        CompiledFunction {
+            params: params.to_vec(),
+            results: results.to_vec(),
+            locals: Vec::new(),
+            body,
+            relocs: Vec::new(),
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn module_builder_produces_valid_wasm(
+            imported_funcs in prop::collection::vec(sig_strat(), 0..5),
+            defined_funcs in prop::collection::vec(sig_strat(), 0..6),
+            imported_globals in prop::collection::vec(valtype_strat(), 0..4),
+            defined_globals in prop::collection::vec(valtype_strat(), 0..4),
+            imported_tags in prop::collection::vec(prop::collection::vec(valtype_strat(), 0..3), 0..3),
+            defined_tags in prop::collection::vec(prop::collection::vec(valtype_strat(), 0..3), 0..3),
+            import_mem in any::<bool>(),
+            def_mem in any::<bool>(),
+            mem64 in any::<bool>(),
+            use_func_table in any::<bool>(),
+            import_tbl in any::<bool>(),
+            table64 in any::<bool>(),
+        ) {
+            let mut b = ModuleBuilder::new();
+            let mut all_funcs = Vec::new();
+
+            // Type deduplication property: registering identical signatures returns the same TypeIndex.
+            for (i, (params, results)) in imported_funcs.iter().enumerate() {
+                let t1 = b.type_index(params, results);
+                let idx = b.import_function("env", &format!("ifunc_{i}"), params, results);
+                let t2 = b.type_index(params, results);
+                prop_assert_eq!(t1, t2);
+                prop_assert_eq!(idx, FuncIndex(i as u32));
+                all_funcs.push(idx);
+            }
+
+            if import_mem {
+                let m = b.import_memory(
+                    "env",
+                    "imem",
+                    MemoryType {
+                        minimum: 1,
+                        maximum: None,
+                        memory64: mem64,
+                        shared: false,
+                        page_size_log2: None,
+                    },
+                );
+                prop_assert_eq!(m, MemoryIndex(0));
+            }
+            if def_mem {
+                let m = b.memory(1, mem64);
+                prop_assert_eq!(m, MemoryIndex(import_mem as u32));
+                b.export("mem_export", m);
+            }
+
+            for (i, &vt) in imported_globals.iter().enumerate() {
+                let g = b.import_global(
+                    "env",
+                    &format!("iglob_{i}"),
+                    GlobalType {
+                        val_type: vt,
+                        mutable: true,
+                        shared: false,
+                    },
+                );
+                prop_assert_eq!(g, GlobalIndex(i as u32));
+            }
+            for (i, &vt) in defined_globals.iter().enumerate() {
+                let init = match vt {
+                    ValType::I32 => ConstExpr::i32_const(0),
+                    ValType::I64 => ConstExpr::i64_const(0),
+                    ValType::F32 => ConstExpr::f32_const(wasm_encoder::Ieee32::new(0)),
+                    ValType::F64 => ConstExpr::f64_const(wasm_encoder::Ieee64::new(0)),
+                    ValType::V128 => ConstExpr::v128_const(0),
+                    _ => unreachable!(),
+                };
+                let g = b.global(vt, init);
+                prop_assert_eq!(g, GlobalIndex((imported_globals.len() + i) as u32));
+                b.export(&format!("eglob_{i}"), g);
+            }
+
+            for (i, params) in imported_tags.iter().enumerate() {
+                let t = b.import_tag("env", &format!("itag_{i}"), params);
+                prop_assert_eq!(t, TagIndex(i as u32));
+            }
+            for (i, params) in defined_tags.iter().enumerate() {
+                let t = b.tag(params);
+                prop_assert_eq!(t, TagIndex((imported_tags.len() + i) as u32));
+                b.export(&format!("etag_{i}"), t);
+            }
+
+            let imported_tbl = if import_tbl {
+                let t = b.import_table(
+                    "env",
+                    "itbl",
+                    TableType {
+                        element_type: RefType::FUNCREF,
+                        table64,
+                        minimum: 10,
+                        maximum: None,
+                        shared: false,
+                    },
+                );
+                prop_assert_eq!(t, TableIndex(0));
+                Some(t)
+            } else {
+                None
+            };
+
+            let mut decls = Vec::new();
+            for (i, (params, results)) in defined_funcs.iter().enumerate() {
+                let idx = b.declare_function(params, results);
+                prop_assert_eq!(idx, FuncIndex((imported_funcs.len() + i) as u32));
+                decls.push((idx, params.clone(), results.clone()));
+                all_funcs.push(idx);
+            }
+
+            // Define functions in reverse order to test out-of-order definition.
+            for (idx, params, results) in decls.iter().rev() {
+                b.define_function(*idx, trivial_body(params, results));
+            }
+            for (i, &f) in all_funcs.iter().enumerate() {
+                b.export_function(&format!("fn_{i}"), f);
+            }
+
+            if use_func_table {
+                let ft = b.function_table();
+                prop_assert_eq!(ft, TableIndex(import_tbl as u32));
+                b.export("ftbl", ft);
+            } else if let Some(t) = imported_tbl {
+                b.place_in_table(t, 2, &all_funcs);
+            }
+
+            let wasm = b.finish();
+            let mut validator = Validator::new_with_features(WasmFeatures::all());
+            prop_assert!(
+                validator.validate_all(&wasm).is_ok(),
+                "invalid wasm produced by ModuleBuilder: {:?}",
+                validator.validate_all(&wasm).err()
+            );
+        }
+    }
+}
+

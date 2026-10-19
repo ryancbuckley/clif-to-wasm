@@ -487,3 +487,492 @@ fn new_slot(slots: &mut Vec<Slot>, classes: &mut Vec<Class>, ty: ValType) -> Loc
     class_of(classes, ty).all.push(l);
     l
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cranelift_codegen::cursor::{Cursor, FuncCursor};
+    use cranelift_codegen::ir::{AbiParam, BlockArg, BlockCall, InstBuilder, Signature, types};
+    use cranelift_codegen::isa::CallConv;
+    use proptest::prelude::*;
+    use std::collections::{BTreeSet, HashMap, HashSet};
+
+    fn point_set(segs: &[Segment]) -> BTreeSet<u32> {
+        let mut pts = BTreeSet::new();
+        for &(lo, hi) in segs {
+            assert!(lo.0 < hi.0, "invalid segment ({lo:?}, {hi:?})");
+            for p in lo.0..hi.0 {
+                assert!(pts.insert(p), "overlapping segments in single list: {segs:?}");
+            }
+        }
+        pts
+    }
+
+    /// Strategy generating a valid sorted list of non-overlapping half-open
+    /// segments, including adjacent segments that touch at an endpoint.
+    fn segments_strategy() -> impl Strategy<Value = Vec<Segment>> {
+        prop::collection::vec((0u32..4, 1u32..6), 0..12).prop_map(|steps| {
+            let mut out = Vec::new();
+            let mut cur = 0u32;
+            for (gap, len) in steps {
+                let lo = cur + gap;
+                let hi = lo + len;
+                out.push((Pos(lo), Pos(hi)));
+                cur = hi;
+            }
+            out
+        })
+    }
+
+    #[derive(Clone, Debug)]
+    enum ClassOp {
+        NewSlot,
+        TakeFree { delta_lo: u32, duration: u32 },
+        ExtendExisting { slot_seed: usize, extra: u32 },
+    }
+
+    /// Strategy generating a random multi-block Cranelift `Function` with
+    /// loops, diamond merges, block parameters, and multi-result instructions.
+    fn cfg_func_strategy() -> impl Strategy<Value = Function> {
+        (
+            1usize..=6,
+            prop::collection::vec(0usize..=3, 1..=6),
+            prop::collection::vec(
+                prop::collection::vec((0u8..7, 0usize..16, 0usize..16), 0..=6),
+                1..=6,
+            ),
+            prop::collection::vec((0u8..4, 0usize..6, 0usize..6, 0usize..16), 1..=6),
+        )
+            .prop_map(|(num_blocks, param_counts, block_insts, terms)| {
+                let mut sig = Signature::new(CallConv::SystemV);
+                sig.params.push(AbiParam::new(types::I32));
+                sig.params.push(AbiParam::new(types::I64));
+                sig.returns.push(AbiParam::new(types::I32));
+                let mut func = Function::with_name_signature( Default::default(), sig);
+
+                let blocks: Vec<Block> = (0..num_blocks).map(|_| func.dfg.make_block()).collect();
+                for (bi, &b) in blocks.iter().enumerate() {
+                    func.layout.append_block(b);
+                    if bi == 0 {
+                        func.dfg.append_block_param(b, types::I32);
+                        func.dfg.append_block_param(b, types::I64);
+                    } else {
+                        let np = param_counts.get(bi).copied().unwrap_or(0);
+                        for pi in 0..np {
+                            let ty = if pi % 2 == 0 { types::I32 } else { types::I64 };
+                            func.dfg.append_block_param(b, ty);
+                        }
+                    }
+                }
+
+                // Track values defined in each block so uses inside that block
+                // (or in blocks dominated by entry) are always valid SSA.
+                let entry_i32 = func.dfg.block_params(blocks[0])[0];
+                let entry_i64 = func.dfg.block_params(blocks[0])[1];
+                let mut block_vals: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(num_blocks);
+
+                for bi in 0..num_blocks {
+                    let b = blocks[bi];
+                    let mut i32s = vec![entry_i32];
+                    let mut i64s = vec![entry_i64];
+                    if bi > 0 {
+                        for &p in func.dfg.block_params(b) {
+                            if func.dfg.value_type(p) == types::I32 {
+                                i32s.push(p);
+                            } else {
+                                i64s.push(p);
+                            }
+                        }
+                    }
+                    let mut pos = FuncCursor::new(&mut func).at_bottom(b);
+                    if let Some(ops) = block_insts.get(bi) {
+                        for &(kind, a_idx, b_idx) in ops {
+                            let a32 = i32s[a_idx % i32s.len()];
+                            let b32 = i32s[b_idx % i32s.len()];
+                            let a64 = i64s[a_idx % i64s.len()];
+                            let b64 = i64s[b_idx % i64s.len()];
+                            match kind {
+                                0 => i32s.push(pos.ins().iadd(a32, b32)),
+                                1 => i32s.push(pos.ins().isub(a32, b32)),
+                                2 => i64s.push(pos.ins().iadd(a64, b64)),
+                                3 => i64s.push(pos.ins().imul(a64, b64)),
+                                4 => {
+                                    let c = pos.ins().iconst(types::I32, (a_idx as i64) - 3);
+                                    i32s.push(c);
+                                }
+                                5 => {
+                                    let (sum, carry) = pos.ins().uadd_overflow(a32, b32);
+                                    i32s.push(sum);
+                                    let ext = pos.ins().uextend(types::I32, carry);
+                                    i32s.push(ext);
+                                }
+                                _ => {
+                                    let s = pos.ins().select(a32, b64, a64);
+                                    i64s.push(s);
+                                }
+                            }
+                        }
+                    }
+                    block_vals.push((i32s, i64s));
+                }
+
+                let make_call = |func: &mut Function,
+                                 target: Block,
+                                 i32s: &[Value],
+                                 i64s: &[Value],
+                                 seed: usize|
+                 -> BlockCall {
+                    let params: Vec<Value> = func.dfg.block_params(target).to_vec();
+                    let mut args = Vec::with_capacity(params.len());
+                    for (pi, p) in params.into_iter().enumerate() {
+                        let v = if func.dfg.value_type(p) == types::I32 {
+                            i32s[(seed + pi) % i32s.len()]
+                        } else {
+                            i64s[(seed + pi) % i64s.len()]
+                        };
+                        args.push(BlockArg::Value(v));
+                    }
+                    func.dfg.block_call(target, &args)
+                };
+
+                for bi in 0..num_blocks {
+                    let b = blocks[bi];
+                    let (ref i32s, ref i64s) = block_vals[bi];
+                    let &(tkind, t1, t2, vseed) = terms.get(bi).unwrap_or(&(0, 0, 0, 0));
+                    let cond = i32s[vseed % i32s.len()];
+                    let ret_val = i32s[(vseed + 1) % i32s.len()];
+                    // Entry block cannot be branched to because it has entry parameters.
+                    if num_blocks == 1 || tkind == 0 {
+                        let mut pos = FuncCursor::new(&mut func).at_bottom(b);
+                        pos.ins().return_(&[ret_val]);
+                    } else {
+                        let target1 = blocks[1 + (t1 % (num_blocks - 1))];
+                        let target2 = blocks[1 + (t2 % (num_blocks - 1))];
+                        if tkind == 1 {
+                            let call = make_call(&mut func, target1, i32s, i64s, vseed);
+                            let mut pos = FuncCursor::new(&mut func).at_bottom(b);
+                            let args: Vec<BlockArg> =
+                                call.args(&pos.func.dfg.value_lists).collect();
+                            pos.ins().jump(target1, &args);
+                        } else {
+                            let c1 = make_call(&mut func, target1, i32s, i64s, vseed);
+                            let c2 = make_call(&mut func, target2, i32s, i64s, vseed + 1);
+                            let mut pos = FuncCursor::new(&mut func).at_bottom(b);
+                            let a1: Vec<BlockArg> = c1.args(&pos.func.dfg.value_lists).collect();
+                            let a2: Vec<BlockArg> = c2.args(&pos.func.dfg.value_lists).collect();
+                            pos.ins().brif(cond, target1, &a1, target2, &a2);
+                        }
+                    }
+                }
+
+                func
+            })
+    }
+
+    proptest! {
+        #[test]
+        fn buckets_matches_reference_model(
+            n in 0usize..48,
+            raw_entries in prop::collection::vec((0usize..48, any::<u32>()), 0..120),
+        ) {
+            let entries: Vec<(Value, u32)> = raw_entries
+                .into_iter()
+                .filter(|&(k, _)| k < n)
+                .map(|(k, v)| (Value::new(k), v))
+                .collect();
+
+            let buckets = Buckets::new(n, entries.iter().copied());
+            let mut expected = vec![Vec::new(); n];
+            for &(v, item) in &entries {
+                expected[v.index()].push(item);
+            }
+            for (i, exp) in expected.iter().enumerate() {
+                prop_assert_eq!(buckets.get(Value::new(i)), exp.as_slice());
+            }
+        }
+
+        #[test]
+        fn overlaps_matches_point_set_oracle(
+            a in segments_strategy(),
+            b in segments_strategy(),
+        ) {
+            let pts_a = point_set(&a);
+            let pts_b = point_set(&b);
+            let expected = !pts_a.is_disjoint(&pts_b);
+            prop_assert_eq!(overlaps(&a, &b), expected);
+            prop_assert_eq!(overlaps(&b, &a), expected);
+        }
+
+        #[test]
+        fn merge_into_preserves_sorted_non_overlapping_union(
+            combined in segments_strategy(),
+            choices in prop::collection::vec(any::<bool>(), 0..16),
+        ) {
+            let mut a = Vec::new();
+            let mut b = Vec::new();
+            for (i, &seg) in combined.iter().enumerate() {
+                if choices.get(i).copied().unwrap_or(false) {
+                    a.push(seg);
+                } else {
+                    b.push(seg);
+                }
+            }
+            prop_assert!(!overlaps(&a, &b));
+            let expected_pts: BTreeSet<u32> =
+                point_set(&a).union(&point_set(&b)).copied().collect();
+
+            let mut merged = a.clone();
+            merge_into(&mut merged, &b);
+            prop_assert_eq!(point_set(&merged), expected_pts);
+            prop_assert_eq!(merged, combined);
+        }
+
+        #[test]
+        fn class_take_free_handles_stale_heap_entries(
+            ops in prop::collection::vec(
+                prop_oneof![
+                    2 => Just(ClassOp::NewSlot),
+                    5 => (0u32..5, 1u32..10).prop_map(|(delta_lo, duration)| ClassOp::TakeFree { delta_lo, duration }),
+                    4 => (0usize..32, 1u32..12).prop_map(|(slot_seed, extra)| ClassOp::ExtendExisting { slot_seed, extra }),
+                ],
+                1..60,
+            ),
+        ) {
+            let mut slots = Vec::new();
+            let mut classes = Vec::new();
+            let mut cur_lo = 0u32;
+
+            for op in ops {
+                match op {
+                    ClassOp::NewSlot => {
+                        let l = new_slot(&mut slots, &mut classes, ValType::I32);
+                        slots[l.0 as usize].end = Pos(cur_lo + 1);
+                        class_of(&mut classes, ValType::I32)
+                            .ends
+                            .push(Reverse((Pos(cur_lo + 1), l)));
+                    }
+                    ClassOp::TakeFree { delta_lo, duration } => {
+                        cur_lo += delta_lo;
+                        let lo = Pos(cur_lo);
+                        let got = class_of(&mut classes, ValType::I32).take_free(&slots, lo);
+                        if let Some(l) = got {
+                            prop_assert!(
+                                slots[l.0 as usize].end <= lo,
+                                "take_free returned active slot {l:?} with end {:?} > {lo:?}",
+                                slots[l.0 as usize].end
+                            );
+                            let new_end = Pos(cur_lo + duration);
+                            slots[l.0 as usize].end = new_end;
+                            class_of(&mut classes, ValType::I32)
+                                .ends
+                                .push(Reverse((new_end, l)));
+                        } else {
+                            // Verify no slot in `free` or `ends` actually has `end <= lo`.
+                            let class = class_of(&mut classes, ValType::I32);
+                            for &l in &class.free {
+                                prop_assert!(slots[l.0 as usize].end > lo);
+                            }
+                            for &Reverse((_, l)) in class.ends.iter() {
+                                prop_assert!(slots[l.0 as usize].end > lo);
+                            }
+                        }
+                    }
+                    ClassOp::ExtendExisting { slot_seed, extra } => {
+                        if !slots.is_empty() {
+                            let idx = slot_seed % slots.len();
+                            let l = Local(idx as u32);
+                            let new_end = slots[idx].end.max(Pos(cur_lo + extra));
+                            slots[idx].end = new_end;
+                            class_of(&mut classes, ValType::I32)
+                                .ends
+                                .push(Reverse((new_end, l)));
+                        }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn live_ranges_and_allocation_soundness(
+            func in cfg_func_strategy(),
+            stack_values in any::<bool>(),
+        ) {
+            let info = FuncInfo::compute(&func).unwrap();
+            let trees = crate::expr_trees::build(&func, &info, stack_values);
+            let ranges = compute_live_ranges(&func, &info, &trees);
+
+            // 1. Every value's segment list is non-empty, sorted, and non-overlapping.
+            let mut seg_map: HashMap<Value, Vec<Segment>> = HashMap::new();
+            for (v, segs) in ranges.iter() {
+                prop_assert!(!segs.is_empty());
+                for (i, &(lo, hi)) in segs.iter().enumerate() {
+                    prop_assert!(lo < hi, "empty or inverted segment for {v}: ({lo:?}, {hi:?})");
+                    if i > 0 {
+                        prop_assert!(
+                            segs[i - 1].1 <= lo,
+                            "unsorted or overlapping segments for {v}: {segs:?}"
+                        );
+                    }
+                }
+                seg_map.insert(v, segs.to_vec());
+            }
+
+            // 2. Independent textbook iterative backwards dataflow liveness oracle.
+            // Collect per-block local-value uses at each root position, and definitions.
+            let is_local = |v: Value| needs_local(&func, &info, &trees, v);
+            let mut live_in: HashMap<Block, HashSet<Value>> = HashMap::new();
+            let mut live_out: HashMap<Block, HashSet<Value>> = HashMap::new();
+            for &b in &info.rpo {
+                live_in.insert(b, HashSet::new());
+                live_out.insert(b, HashSet::new());
+            }
+
+            let mut changed = true;
+            let mut ops = Vec::new();
+            while changed {
+                changed = false;
+                for &b in info.rpo.iter().rev() {
+                    let mut out_set = HashSet::new();
+                    for &call in &info.dests[b] {
+                        let succ = call.block(&func.dfg.value_lists);
+                        let mut succ_in = live_in[&succ].clone();
+                        // Block parameters of `succ` are defined on the incoming edge, not before.
+                        for &p in func.dfg.block_params(succ) {
+                            succ_in.remove(&p);
+                        }
+                        for (a, _) in info.live_arg_pairs(&func, call) {
+                            if is_local(a) {
+                                succ_in.insert(a);
+                            }
+                        }
+                        out_set.extend(succ_in);
+                    }
+                    if out_set != live_out[&b] {
+                        live_out.insert(b, out_set.clone());
+                        changed = true;
+                    }
+
+                    // Walk instructions in `b` backwards.
+                    let mut cur = out_set;
+                    let term = func.layout.last_inst(b).unwrap();
+                    // At terminator, remove block-arg uses that were added in `out_set`
+                    // and re-apply terminator operands accurately.
+                    for inst in func.layout.block_insts(b).rev() {
+                        if trees.is_root(inst) {
+                            for &r in func.dfg.inst_results(inst) {
+                                cur.remove(&r);
+                            }
+                            // Collect all local operands in the tree rooted at `inst`.
+                            for cand in func.layout.block_insts(b) {
+                                if trees.root(cand) == Some(inst) {
+                                    operands(&func, &info, cand, &mut ops);
+                                    for o in &ops {
+                                        if is_local(o.value) {
+                                            cur.insert(o.value);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let _ = term;
+                    }
+                    if b == info.rpo[0] {
+                        for &p in func.dfg.block_params(b) {
+                            cur.remove(&p);
+                        }
+                    }
+                    if cur != live_in[&b] {
+                        live_in.insert(b, cur);
+                        changed = true;
+                    }
+                }
+            }
+
+            // 3. Verify `allocate` with both `coalesce = false` and `coalesce = true`.
+            let alloc_no_coal = allocate(&func, &info, &trees, false).unwrap();
+            let alloc_coal = allocate(&func, &info, &trees, true).unwrap();
+
+            for locals in [&alloc_no_coal, &alloc_coal] {
+                // Every entry parameter i gets Local(i).
+                for (i, &p) in func.dfg.block_params(info.rpo[0]).iter().enumerate() {
+                    prop_assert_eq!(locals.local_of[p], Local(i as u32));
+                }
+
+                // Every pair of distinct values assigned the same Local must have non-overlapping segments
+                // and identical ValType.
+                let mut by_local: HashMap<Local, Vec<Value>> = HashMap::new();
+                for (v, _) in ranges.iter() {
+                    let l = locals.local_of[v];
+                    prop_assert_ne!(l, Local::NONE);
+                    let vt = wasm_type(func.dfg.value_type(v)).unwrap();
+                    if l.0 >= locals.num_params {
+                        prop_assert_eq!(locals.decls[(l.0 - locals.num_params) as usize], vt);
+                    }
+                    for &other in by_local.get(&l).unwrap_or(&Vec::new()) {
+                        prop_assert!(
+                            !overlaps(&seg_map[&v], &seg_map[&other]),
+                            "values {v} and {other} share {l:?} but segments overlap: {:?} vs {:?}",
+                            seg_map[&v],
+                            seg_map[&other]
+                        );
+                    }
+                    by_local.entry(l).or_default().push(v);
+                }
+
+                // Check against the textbook dataflow oracle at every instruction boundary:
+                // no two simultaneously live values may share a Local.
+                for &b in &info.rpo {
+                    let mut cur = live_out[&b].clone();
+                    for inst in func.layout.block_insts(b).rev() {
+                        if !trees.is_root(inst) {
+                            continue;
+                        }
+                        // All values in `cur` are live right after `inst` (except `inst` results if unused,
+                        // which are not in `cur`).
+                        let mut seen = HashMap::new();
+                        for &v in &cur {
+                            if let Some(&prev) = seen.get(&locals.local_of[v]) {
+                                prop_assert_eq!(
+                                    prev,
+                                    v,
+                                    "dataflow oracle found two values ({} and {}) live after {} in {} sharing {:?}",
+                                    prev,
+                                    v,
+                                    inst,
+                                    b,
+                                    locals.local_of[v]
+                                );
+                            }
+                            seen.insert(locals.local_of[v], v);
+                        }
+                        for &r in func.dfg.inst_results(inst) {
+                            cur.remove(&r);
+                        }
+                        for cand in func.layout.block_insts(b) {
+                            if trees.root(cand) == Some(inst) {
+                                operands(&func, &info, cand, &mut ops);
+                                for o in &ops {
+                                    if is_local(o.value) {
+                                        cur.insert(o.value);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 4. Coalescing never increases the number of required block-argument moves.
+            let count_moves = |locals: &Locals| -> usize {
+                info.rpo
+                    .iter()
+                    .flat_map(|&b| &info.dests[b])
+                    .flat_map(|&call| info.live_arg_pairs(&func, call))
+                    .filter(|&(a, p)| locals.move_needed(a, p))
+                    .count()
+            };
+            prop_assert!(count_moves(&alloc_coal) <= count_moves(&alloc_no_coal));
+        }
+    }
+}
+

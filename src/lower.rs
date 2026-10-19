@@ -745,7 +745,8 @@ impl Emitter<'_> {
             (Opcode::Call | Opcode::ReturnCall, D::Call { func_ref, .. }) => {
                 let sig = &dfg.signatures[dfg.ext_funcs[func_ref].signature];
                 let tail = op == Opcode::ReturnCall;
-                self.call_args(sig, args.len(), tail)?;
+                let copies = self.call_args(sig, args.len(), tail)?;
+                self.byval_copies(copies);
                 let idx = self.callee_index(func_ref)?;
                 if tail {
                     self.epilogue();
@@ -765,8 +766,9 @@ impl Emitter<'_> {
                 D::CallIndirect { sig_ref, .. },
             ) => {
                 let tail = op == Opcode::ReturnCallIndirect;
-                self.call_args(&dfg.signatures[sig_ref], args.len() - 1, tail)?;
+                let copies = self.call_args(&dfg.signatures[sig_ref], args.len() - 1, tail)?;
                 self.operand()?;
+                self.byval_copies(copies);
                 if is64(aty) {
                     self.ins(I::I32WrapI64);
                 }
