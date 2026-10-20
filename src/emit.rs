@@ -576,6 +576,7 @@ impl<'a> Emitter<'a> {
             let p = sig.params.get(i);
             if let Some(&AbiParam {
                 purpose: ArgumentPurpose::StructArgument(size),
+                value_type,
                 ..
             }) = p
             {
@@ -583,6 +584,12 @@ impl<'a> Emitter<'a> {
                     return unsupported("tail call with a by-value struct argument");
                 }
                 let (fp, _) = self.frame.expect("frame for by-value arguments");
+                // The address in the memory's address type.
+                match (self.config.module.memory64, value_type) {
+                    (false, types::I64) => self.ins(I::I32WrapI64),
+                    (true, types::I32) => self.ins(I::I64ExtendI32U),
+                    _ => {}
+                }
                 let src = self.scratch(self.config.module.ptr_ty());
                 self.local_set(src);
                 self.frame_addr(fp, byval);
@@ -594,6 +601,7 @@ impl<'a> Emitter<'a> {
                     dst_mem: mem,
                 });
                 self.frame_addr(fp, byval);
+                self.ptr_to(value_type)?;
                 byval += size.next_multiple_of(16);
             } else {
                 self.extend_for_abi(p);

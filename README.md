@@ -98,6 +98,45 @@ slots, `config.module.table_index = Some(t)` enables `call_indirect`,
 `config.module.atomic_lock_table_addr = Some(addr)` enables `i128` atomics,
 and `config.opts.coalesce = false` disables move coalescing.
 
+### Relocatable objects and `cranelift-module`
+
+With `ModuleLayout::relocatable`, the backend emits code for a relocatable
+wasm object (the [tool conventions] that `wasm-ld` and `wild` link): `Env`
+answers with symbol indices, and every function index, global, table, type,
+data address, table slot and TLS offset is a padded LEB recorded in
+`CompiledFunction::relocs`. `object::ObjectBuilder` (`src/object.rs`) collects
+symbols and definitions and writes the object, with its `linking`,
+`reloc.CODE`/`reloc.DATA` and `target_features` sections, importing
+`__linear_memory`, `__stack_pointer`, `__indirect_function_table` and
+`__tls_base` from `env` as LLVM does.
+
+The `module` feature adds `object_module::WasmObjectModule`, a
+`cranelift_module::Module` that compiles each function it is given into such
+an object. `rustc_codegen_cranelift` uses it to compile Rust to wasm (see the
+playground in `../browser_rust_playground`). Cranelift has no wasm
+`TargetIsa`, and one cannot be implemented outside cranelift-codegen, so the
+frontend is given Pulley's ISA of the same pointer width
+(`object_module::frontend_isa`).
+
+[tool conventions]: https://github.com/WebAssembly/tool-conventions/blob/main/Linking.md
+
+### Calling convention
+
+To link with code compiled by LLVM (such as Rust's standard library), calls
+follow LLVM's wasm ABI:
+
+- Narrow (`i8`/`i16`) arguments and returns marked `sext` are sign-extended
+  by the caller (arguments) or callee (returns); `uext` ones are already
+  zero-extended. Narrow call results are masked, since callees may return
+  garbage in the upper bits when the signature does not say otherwise.
+- By-value struct arguments (`ArgumentPurpose::StructArgument`) are copied
+  into the caller's frame and passed by address.
+- With `ModuleLayout::demote_multi_results`, a function with more than one
+  wasm result (after splitting `i128`/`f128`) instead takes a hidden first
+  parameter pointing to the results, laid out like a C struct, and returns
+  nothing (`src/legalize_abi.rs`). Without it, multiple results use
+  multi-value.
+
 ## Supported
 
 Scalar `i8`–`i64`, `f32` and `f64`: integer and float arithmetic, bit ops
@@ -186,11 +225,15 @@ Not yet supported (functions using these return `Error::Unsupported`):
 - Big-endian vector loads and stores, and arithmetic on `f16` lanes.
 - `try_call` with `i128`/`f128` arguments, results or payloads; dynamic stack
   slots; `get_return_address`.
+- In relocatable objects: `try_call` (exception tag relocations) and `i128`
+  atomics (the lock table needs an address); tail calls with by-value struct
+  arguments.
 
 ## Testing
 
 ```sh
 cargo test --release                     # local CLIF runtests + differential fuzzing
+cargo test --release --features module   # also: relocatable objects linked with rust-lld
 FUZZ_ITERS=30000 cargo test --release --test fuzz -- --nocapture
 
 # Cranelift's upstream runtests (wasmtime v49.0.2 matches Cranelift 0.136.2):
@@ -223,6 +266,12 @@ cargo run --example runclif  -- tests/clif/control.clif
 - `tests/module.rs` links a JIT-style module into a host module, sharing the
   host's memory, table and stack pointer, and calls across in both
   directions.
+- `tests/object.rs` (`--features module`) writes two relocatable objects
+  through `WasmObjectModule`, links them with `rust-lld -flavor wasm` (found
+  through `rustc --print sysroot`, or `RUST_LLD`) and runs the result: calls
+  across objects, data and function pointer relocations, `call_indirect`,
+  stack slots, demoted multi-value returns and `sext` arguments.
+- The CLIF runtests also run with `demote_multi_results`.
 - The harness provides what upstream tests expect from an embedder:
   libcalls (`CeilF32` and friends, compiled from CLIF), a pinned-register
   global, atomics (wasmtime's `threads` feature), and exception tags. A

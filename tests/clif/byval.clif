@@ -1,0 +1,68 @@
+test run
+
+; A by-value struct argument (`sarg`) is copied by the caller: the callee
+; gets the address of its own copy.
+
+function %callee(i64 sarg(24)) -> i64 {
+block0(v0: i64):
+    v1 = load.i64 v0
+    v2 = load.i64 v0+16
+    v3 = iadd v1, v2
+    ; Writes go to the copy, not the caller's struct.
+    v4 = iconst.i64 -1
+    store v4, v0
+    store v4, v0+8
+    return v3
+}
+
+function %caller(i64, i64) -> i64 {
+    fn0 = %callee(i64 sarg(24)) -> i64
+    ss0 = explicit_slot 24, align = 8
+block0(v0: i64, v1: i64):
+    v3 = stack_addr.i64 ss0
+    store v0, v3
+    v2 = iconst.i64 100
+    store v2, v3+8
+    store v1, v3+16
+    v4 = call fn0(v3)
+    ; The struct is unchanged after the call.
+    v5 = load.i64 v3
+    v6 = load.i64 v3+8
+    v7 = iadd v4, v5
+    v8 = iadd v7, v6
+    return v8
+}
+; run: %caller(1, 2) == 104
+; run: %caller(10, 20) == 140
+
+; Two struct arguments and a plain one in between.
+function %callee2(i64 sarg(16), i32, i64 sarg(8)) -> i64 {
+block0(v0: i64, v1: i32, v2: i64):
+    v3 = load.i64 v0+8
+    v4 = load.i64 v2
+    v5 = uextend.i64 v1
+    v6 = iadd v3, v4
+    v7 = iadd v6, v5
+    v8 = iconst.i64 0
+    store v8, v0+8
+    store v8, v2
+    return v7
+}
+
+function %caller2(i64, i64, i32) -> i64 {
+    fn0 = %callee2(i64 sarg(16), i32, i64 sarg(8)) -> i64
+    ss0 = explicit_slot 16, align = 8
+    ss1 = explicit_slot 8, align = 8
+block0(v0: i64, v1: i64, v2: i32):
+    v3 = stack_addr.i64 ss0
+    v4 = stack_addr.i64 ss1
+    store v0, v3+8
+    store v1, v4
+    v5 = call fn0(v3, v2, v4)
+    v6 = load.i64 v3+8
+    v7 = load.i64 v4
+    v8 = iadd v5, v6
+    v9 = iadd v8, v7
+    return v9
+}
+; run: %caller2(3, 4, 5) == 19
