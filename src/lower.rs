@@ -659,12 +659,23 @@ impl Emitter<'_> {
                     stack_slot, offset, ..
                 },
             ) => self.stack_addr(stack_slot, offset.into(), ty)?,
-            (Opcode::SymbolValue, D::UnaryGlobalValue { global_value, .. }) => {
+            (
+                Opcode::SymbolValue | Opcode::TlsValue,
+                D::UnaryGlobalValue { global_value, .. },
+            ) => {
                 let gv = &func.global_values[global_value];
                 let cranelift_codegen::ir::GlobalValueData::Symbol { name, offset, .. } = gv else {
                     return unsupported(format!("global value {gv}"));
                 };
                 let offset = offset.bits();
+                let tls = op == Opcode::TlsValue;
+                if tls {
+                    let Some(base) = self.config.module.tls_base_global else {
+                        return unsupported("tls_value without ModuleLayout::tls_base_global");
+                    };
+                    self.global_get(base);
+                    self.ptr_to(ty)?;
+                }
                 match self.env.symbol_value(Name::resolve(func, name))? {
                     SymbolValue::Const(c) => self.iconst(ty, c as i64 + offset),
                     SymbolValue::Global(g) => {
@@ -674,12 +685,29 @@ impl Emitter<'_> {
                             self.ins(w!(ty, I32Add, I64Add));
                         }
                     }
+                    SymbolValue::Symbol(sym) => {
+                        use crate::RelocKind as R;
+                        let (k32, k64) = if tls {
+                            (R::MemoryAddrTlsSleb, R::MemoryAddrTlsSleb64)
+                        } else {
+                            (R::MemoryAddrSleb, R::MemoryAddrSleb64)
+                        };
+                        self.reloc_const(ty, k32, k64, sym, offset);
+                    }
+                }
+                if tls {
+                    self.ins(w!(ty, I32Add, I64Add));
                 }
             }
             (Opcode::FuncAddr, D::FuncAddr { func_ref, .. }) => {
                 let name = &dfg.ext_funcs[func_ref].name;
                 let slot = self.env.func_table_slot(Name::resolve(func, name))?;
-                self.iconst(ty, slot as i64);
+                if self.config.module.relocatable {
+                    use crate::RelocKind as R;
+                    self.reloc_const(ty, R::TableIndexSleb, R::TableIndexSleb64, slot as u32, 0);
+                } else {
+                    self.iconst(ty, slot as i64);
+                }
             }
 
             (Opcode::GetPinnedReg | Opcode::SetPinnedReg, _) => {
@@ -715,59 +743,52 @@ impl Emitter<'_> {
 
             // Calls.
             (Opcode::Call | Opcode::ReturnCall, D::Call { func_ref, .. }) => {
-                for _ in args {
-                    self.operand()?;
-                }
+                let sig = &dfg.signatures[dfg.ext_funcs[func_ref].signature];
+                let tail = op == Opcode::ReturnCall;
+                self.call_args(sig, args.len(), tail)?;
                 let idx = self.callee_index(func_ref)?;
-                if op == Opcode::ReturnCall {
+                if tail {
                     self.epilogue();
                     if self.config.engine.tail_calls {
-                        self.ins(I::ReturnCall(idx.0));
+                        self.call(idx, true);
                     } else {
-                        self.ins(I::Call(idx.0));
+                        self.call(idx, false);
                         self.ins(I::Return);
                     }
                 } else {
-                    self.ins(I::Call(idx.0));
+                    self.call(idx, false);
+                    self.call_result(inst);
                 }
             }
             (
                 Opcode::CallIndirect | Opcode::ReturnCallIndirect,
                 D::CallIndirect { sig_ref, .. },
             ) => {
-                for _ in &args[1..] {
-                    self.operand()?;
-                }
+                let tail = op == Opcode::ReturnCallIndirect;
+                self.call_args(&dfg.signatures[sig_ref], args.len() - 1, tail)?;
                 self.operand()?;
                 if is64(aty) {
                     self.ins(I::I32WrapI64);
                 }
                 let (type_index, table_index) = self.indirect_call(sig_ref)?;
-                let (type_index, table_index) = (type_index.0, table_index.0);
-                if op == Opcode::ReturnCallIndirect {
+                if tail {
                     self.epilogue();
                     if self.config.engine.tail_calls {
-                        self.ins(I::ReturnCallIndirect {
-                            type_index,
-                            table_index,
-                        });
+                        self.call_indirect(type_index, table_index, true);
                     } else {
-                        self.ins(I::CallIndirect {
-                            type_index,
-                            table_index,
-                        });
+                        self.call_indirect(type_index, table_index, false);
                         self.ins(I::Return);
                     }
                 } else {
-                    self.ins(I::CallIndirect {
-                        type_index,
-                        table_index,
-                    });
+                    self.call_indirect(type_index, table_index, false);
+                    self.call_result(inst);
                 }
             }
             (Opcode::Return, _) => {
-                for _ in args {
+                let returns = &func.signature.returns;
+                for (i, _) in args.iter().enumerate() {
                     self.operand()?;
+                    self.extend_for_abi(returns.get(i));
                 }
                 self.epilogue();
                 self.ins(I::Return);

@@ -29,6 +29,7 @@ use crate::locals::{Local, Locals};
 use crate::{CompiledFunction, Config, Env, Result, unsupported, wasm_signature, wasm_type};
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::{
+    ArgumentPurpose,
     AbiParam, Block, BlockArg, BlockCall, ExceptionTableItem, ExceptionTag, Function, Inst,
     InstructionData, Opcode, Signature, types,
 };
@@ -432,28 +433,40 @@ impl Structurer<'_> {
         self.e.ins(I::TryTable(BlockType::Empty, Cow::Owned(catches)));
         self.labels.push(Label::Other);
         let args = dfg.inst_args(term);
+        if self.e.config.module.relocatable {
+            return unsupported("try_call in a relocatable object");
+        }
+        if sig
+            .params
+            .iter()
+            .any(|p| matches!(p.purpose, ArgumentPurpose::StructArgument(_)))
+        {
+            return unsupported("try_call with a by-value struct argument");
+        }
+        let direct_args = if func_ref.is_some() { args } else { &args[1..] };
+        for (i, &a) in direct_args.iter().enumerate() {
+            self.e.value(a)?;
+            self.e.extend_for_abi(sig.params.get(i));
+        }
         match func_ref {
             Some(func_ref) => {
-                for &a in args {
-                    self.e.value(a)?;
-                }
                 let idx = self.e.callee_index(func_ref)?;
-                self.e.ins(I::Call(idx.0));
+                self.e.call(idx, false);
             }
             None => {
-                for &a in &args[1..] {
-                    self.e.value(a)?;
-                }
                 self.e.value(args[0])?;
                 if dfg.value_type(args[0]) == types::I64 {
                     self.e.ins(I::I32WrapI64);
                 }
                 let (type_index, table_index) = self.e.indirect_call(sig_ref)?;
-                self.e.ins(I::CallIndirect {
-                    type_index: type_index.0,
-                    table_index: table_index.0,
-                });
+                self.e.call_indirect(type_index, table_index, false);
             }
+        }
+        if let &[t] = &results[..]
+            && t == ValType::I32
+            && let Some(&p) = sig.returns.first()
+        {
+            self.e.mask(p.value_type);
         }
         for &l in result_locals.iter().rev() {
             self.e.local_set(l);

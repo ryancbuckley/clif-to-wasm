@@ -36,6 +36,7 @@ use wasm_encoder::ValType;
 mod analysis;
 mod emit;
 mod expr_trees;
+mod legalize_abi;
 mod legalize_i128;
 mod locals;
 mod lower;
@@ -119,6 +120,30 @@ pub struct ModuleLayout {
     /// 4-byte aligned and disjoint from the program's data and shadow stack.
     /// With `None`, functions that use `i128` atomics are rejected.
     pub atomic_lock_table_addr: Option<u64>,
+    /// A mutable global holding the base address of the current thread's
+    /// thread-local storage block (`__tls_base` in the wasm tool
+    /// conventions). `tls_value` adds a symbol's offset in that block to it.
+    /// With `None`, functions that use `tls_value` are rejected.
+    pub tls_base_global: Option<GlobalIndex>,
+    /// Produce code for a relocatable object file (the wasm [tool
+    /// conventions] for linking) instead of a finished module.
+    ///
+    /// The indices that [`Env`] returns and the global and table indices in
+    /// this struct then name entries of the object's symbol table (type
+    /// indices still name the object's type section), and every use of one is
+    /// encoded with a padded LEB and recorded in [`CompiledFunction::relocs`].
+    /// [`crate::object`] builds such objects.
+    ///
+    /// [tool conventions]: https://github.com/WebAssembly/tool-conventions/blob/main/Linking.md
+    pub relocatable: bool,
+    /// Return more than one wasm value through memory, the way LLVM's wasm
+    /// backend does: a function whose results (after splitting `i128` and
+    /// `f128` into two `i64`s) are more than one gets a hidden first
+    /// parameter pointing to space for them, laid out like a C struct (each
+    /// result at the next multiple of its size), and returns nothing. This
+    /// is needed to call, or be called by, code compiled by LLVM. When off,
+    /// multiple results use multi-value returns.
+    pub demote_multi_results: bool,
 }
 
 impl ModuleLayout {
@@ -215,13 +240,17 @@ impl std::fmt::Display for Name<'_> {
     }
 }
 
-/// The value of a `symbol_value`.
+/// The value of a `symbol_value`, or for `tls_value` the symbol's offset
+/// from the thread-local storage base.
 #[derive(Debug, Clone, Copy)]
 pub enum SymbolValue {
     /// A link-time constant address.
     Const(u64),
     /// An address held in a wasm global.
     Global(GlobalIndex),
+    /// With [`ModuleLayout::relocatable`]: the address of the data symbol
+    /// with this index in the object's symbol table, filled in by the linker.
+    Symbol(u32),
 }
 
 /// The module environment: resolves references from a function to entities
@@ -237,7 +266,8 @@ pub trait Env {
     }
 
     /// The value of `func_addr`: the function's slot in the indirect call
-    /// table.
+    /// table. With [`ModuleLayout::relocatable`], the index of the
+    /// function's symbol instead.
     fn func_table_slot(&mut self, name: Name<'_>) -> Result<u64> {
         Err(Error::Env(format!(
             "func_addr {name} requires Env::func_table_slot"
@@ -272,6 +302,60 @@ pub struct CompiledFunction {
     pub locals: Vec<(u32, ValType)>,
     /// The encoded instruction sequence, including the final `end`.
     pub body: Vec<u8>,
+    /// With [`ModuleLayout::relocatable`], the relocations in `body`.
+    pub relocs: Vec<Reloc>,
+}
+
+/// A relocation in a function body, for [`ModuleLayout::relocatable`].
+///
+/// The field is a padded LEB (5 bytes, or 10 for the 64-bit kinds) holding a
+/// placeholder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reloc {
+    /// Byte offset of the field in [`CompiledFunction::body`].
+    pub offset: u32,
+    pub kind: RelocKind,
+    /// The symbol index, or for [`RelocKind::TypeIndexLeb`] the type index.
+    pub index: u32,
+    /// Added to the symbol's address (memory address kinds only).
+    pub addend: i64,
+}
+
+/// Relocation types of the wasm tool conventions, with their numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum RelocKind {
+    FunctionIndexLeb = 0,
+    TableIndexSleb = 1,
+    TableIndexI32 = 2,
+    MemoryAddrSleb = 4,
+    MemoryAddrI32 = 5,
+    TypeIndexLeb = 6,
+    GlobalIndexLeb = 7,
+    TagIndexLeb = 10,
+    MemoryAddrSleb64 = 15,
+    MemoryAddrI64 = 16,
+    TableIndexSleb64 = 18,
+    TableIndexI64 = 19,
+    TableNumberLeb = 20,
+    MemoryAddrTlsSleb = 21,
+    MemoryAddrTlsSleb64 = 25,
+}
+
+impl RelocKind {
+    /// Whether the relocation has an addend.
+    pub fn has_addend(self) -> bool {
+        use RelocKind::*;
+        matches!(
+            self,
+            MemoryAddrSleb
+                | MemoryAddrI32
+                | MemoryAddrSleb64
+                | MemoryAddrI64
+                | MemoryAddrTlsSleb
+                | MemoryAddrTlsSleb64
+        )
+    }
 }
 
 impl CompiledFunction {
@@ -345,13 +429,28 @@ pub fn wasm_signature(sig: &Signature) -> Result<(Vec<ValType>, Vec<ValType>)> {
     Ok((lower(&sig.params)?, lower(&sig.returns)?))
 }
 
+/// The wasm signature of a function with IR signature `sig` in a module laid
+/// out as `layout`: [`wasm_signature`], after moving multiple results into
+/// memory if [`ModuleLayout::demote_multi_results`] says so.
+pub fn wasm_signature_in(
+    sig: &Signature,
+    layout: &ModuleLayout,
+) -> Result<(Vec<ValType>, Vec<ValType>)> {
+    let (mut params, mut results) = wasm_signature(sig)?;
+    if layout.demote_multi_results && results.len() > 1 {
+        params.insert(0, layout.ptr_ty());
+        results.clear();
+    }
+    Ok((params, results))
+}
+
 /// Compile one function.
 pub fn compile_function(
     func: &ir::Function,
     config: &Config,
     env: &mut dyn Env,
 ) -> Result<CompiledFunction> {
-    let func = legalize_i128::prepare(func, config.module.atomic_lock_table_addr)?;
+    let func = legalize_i128::prepare(func, &config.module)?;
     let info = analysis::FuncInfo::compute(&func)?;
     let trees = expr_trees::build(&func, &info, config.opts.stack_values);
     let locals = locals::allocate(&func, &info, &trees, config.opts.coalesce)?;

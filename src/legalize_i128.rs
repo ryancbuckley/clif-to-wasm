@@ -67,15 +67,23 @@ fn is_pair(ty: Type) -> bool {
 /// Prepare `func` for the backend pipeline: resolve value aliases and legalize
 /// `i128`/`f128` into pairs of `i64`. Borrows `func` without cloning when
 /// neither is present.
-pub(crate) fn prepare(func: &Function, lock_table_addr: Option<u64>) -> Result<Cow<'_, Function>> {
+pub(crate) fn prepare<'a>(
+    func: &'a Function,
+    layout: &crate::ModuleLayout,
+) -> Result<Cow<'a, Function>> {
     let (aliases, wide) = scan(func);
-    if !aliases && !wide {
+    let demote = layout.demote_multi_results && crate::legalize_abi::scan(func);
+    if !aliases && !wide && !demote {
         return Ok(Cow::Borrowed(func));
     }
     let mut f = func.clone();
+    if demote {
+        let ptr = if layout.memory64 { I64 } else { I32 };
+        crate::legalize_abi::demote(&mut f, ptr)?;
+    }
     f.dfg.resolve_all_aliases();
     if wide {
-        legalize(&mut f, lock_table_addr)?;
+        legalize(&mut f, layout.atomic_lock_table_addr)?;
     }
     Ok(Cow::Owned(f))
 }

@@ -16,7 +16,7 @@ use cranelift_interpreter::step::ControlFlow;
 use cranelift_reader::{Comparison, ParseOptions, RunCommand, parse_run_command, parse_test};
 use cranelift_wasm_backend::{
     Config, Env, Error, FuncIndex, ModuleBuilder, Name, TagIndex, TypeIndex, compile_function,
-    wasm_signature,
+    wasm_signature, wasm_signature_in,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use wasm_encoder::{ConstExpr, Encode, Instruction, ValType};
@@ -24,7 +24,10 @@ use wasmtime::Val;
 
 pub const MEMORY_PAGES: u64 = 32;
 pub const LOCK_TABLE_ADDR: u64 = MEMORY_PAGES * 65536 - 256;
-pub const STACK_TOP: i32 = LOCK_TABLE_ADDR as i32;
+/// Where callers of a demoted function (`demote_multi_results`) get
+/// results back: just below the lock table, above the stack.
+pub const RET_AREA_ADDR: u64 = LOCK_TABLE_ADDR - 256;
+pub const STACK_TOP: i32 = RET_AREA_ADDR as i32;
 
 struct TestEnv<'a> {
     names: &'a HashMap<String, FuncIndex>,
@@ -159,7 +162,7 @@ pub fn compile_module(funcs: &[Function], config: &Config) -> (Vec<u8>, Vec<Stri
     let mut indices = Vec::new();
     let mut unsupported = Vec::new();
     for &f in &funcs {
-        let (p, r) = wasm_signature(&f.signature).unwrap_or_default();
+        let (p, r) = wasm_signature_in(&f.signature, &config.module).unwrap_or_default();
         let idx = builder.declare_function(&p, &r);
         names.insert(func_name(f), idx);
         indices.push(idx);
@@ -189,10 +192,12 @@ pub fn compile_module(funcs: &[Function], config: &Config) -> (Vec<u8>, Vec<Stri
                 results: vec![],
                 locals: vec![],
                 body,
+                relocs: vec![],
             },
         );
     }
-    builder.memory(MEMORY_PAGES, config.module.memory64);
+    let memory = builder.memory(MEMORY_PAGES, config.module.memory64);
+    builder.export("memory", memory);
     let table = builder.function_table();
     let sp = builder.global(
         if config.module.memory64 {
@@ -223,7 +228,7 @@ pub fn compile_module(funcs: &[Function], config: &Config) -> (Vec<u8>, Vec<Stri
             Err(e) => {
                 unsupported.push(format!("{}: {e}", func_name(f)));
                 // A stub with the right signature keeps the module valid.
-                stub(f)
+                stub(f, &config)
             }
         };
         builder.define_function(idx, compiled);
@@ -232,13 +237,14 @@ pub fn compile_module(funcs: &[Function], config: &Config) -> (Vec<u8>, Vec<Stri
     (builder.finish(), unsupported)
 }
 
-fn stub(f: &Function) -> cranelift_wasm_backend::CompiledFunction {
-    let (params, results) = wasm_signature(&f.signature).unwrap_or_default();
+fn stub(f: &Function, config: &Config) -> cranelift_wasm_backend::CompiledFunction {
+    let (params, results) = wasm_signature_in(&f.signature, &config.module).unwrap_or_default();
     cranelift_wasm_backend::CompiledFunction {
         params,
         results,
         locals: vec![],
         body: vec![0x00, 0x0b], // unreachable; end
+        relocs: vec![],
     }
 }
 
@@ -281,6 +287,19 @@ impl Runner {
         self.call_timed(name, args, returns).0
     }
 
+    /// Like `call`, for a function whose narrow results marked in `sext`
+    /// are returned sign-extended (`sext` in the signature).
+    pub fn call_sext(
+        &self,
+        name: &str,
+        args: &[DataValue],
+        returns: &[Type],
+        sext: &[bool],
+    ) -> Result<Option<Vec<DataValue>>, String> {
+        let mut elapsed = 0.0;
+        self.call_inner(name, args, returns, sext, &mut elapsed)
+    }
+
     /// Like `call`, also returning the time (in seconds) spent in the call
     /// itself, excluding instantiation.
     pub fn call_timed(
@@ -290,7 +309,7 @@ impl Runner {
         returns: &[Type],
     ) -> (Result<Option<Vec<DataValue>>, String>, f64) {
         let mut elapsed = 0.0;
-        let r = self.call_inner(name, args, returns, &mut elapsed);
+        let r = self.call_inner(name, args, returns, &[], &mut elapsed);
         (r, elapsed)
     }
 
@@ -299,6 +318,7 @@ impl Runner {
         name: &str,
         args: &[DataValue],
         returns: &[Type],
+        sext: &[bool],
         elapsed: &mut f64,
     ) -> Result<Option<Vec<DataValue>>, String> {
         let mut store = wasmtime::Store::new(&self.engine, ());
@@ -329,15 +349,49 @@ impl Runner {
             }
         };
         let mut results: Vec<Val> = vec![Val::I32(0); returns.iter().map(width).sum::<usize>()];
+        // With `demote_multi_results`, the results come back in memory, at
+        // the address passed as a hidden first argument.
+        let demoted = results.len() > 1 && f.ty(&store).results().len() == 0;
+        let ret_area = RET_AREA_ADDR;
+        if demoted {
+            let p = f.ty(&store).params().next();
+            wargs.insert(
+                0,
+                match p {
+                    Some(wasmtime::ValType::I64) => Val::I64(ret_area as i64),
+                    _ => Val::I32(ret_area as i32),
+                },
+            );
+        }
         let start = std::time::Instant::now();
-        let trapped = f.call(&mut store, &wargs, &mut results).is_err();
+        let trapped = if demoted {
+            f.call(&mut store, &wargs, &mut []).is_err()
+        } else {
+            f.call(&mut store, &wargs, &mut results).is_err()
+        };
         *elapsed = start.elapsed().as_secs_f64();
         if trapped {
             return Ok(None);
         }
+        if demoted {
+            let mem = instance
+                .get_memory(&mut store, "memory")
+                .ok_or("no memory export")?;
+            let data = mem.data(&store);
+            let mut off = 0usize;
+            let mut out = Vec::new();
+            for &ty in returns {
+                let n = ty.bytes() as usize;
+                off = off.next_multiple_of(n.min(16).max(1));
+                let at = ret_area as usize + off;
+                out.push(DataValue::read_from_slice_le(&data[at..at + n], ty));
+                off += n;
+            }
+            return Ok(Some(out));
+        }
         let mut out = Vec::new();
         let mut i = 0;
-        for &ty in returns {
+        for (k, &ty) in returns.iter().enumerate() {
             if matches!(ty, types::I128 | types::F128) {
                 let (Val::I64(lo), Val::I64(hi)) = (&results[i], &results[i + 1]) else {
                     return Err(format!("bad {ty} result"));
@@ -350,7 +404,17 @@ impl Runner {
                 });
                 i += 2;
             } else {
-                out.push(from_val(&results[i], ty)?);
+                let mut v = results[i];
+                if sext.get(k) == Some(&true)
+                    && let (Val::I32(x), Some(bits)) = (v, narrow_bits(ty))
+                {
+                    let low = x & ((1i64 << bits) - 1) as i32;
+                    if x != (low << (32 - bits)) >> (32 - bits) {
+                        return Err(format!("{ty} sext result {x:#x} is not sign-extended"));
+                    }
+                    v = Val::I32(low);
+                }
+                out.push(from_val(&v, ty)?);
                 i += 1;
             }
         }
@@ -374,6 +438,14 @@ fn to_val(v: &DataValue) -> Option<Val> {
         DataValue::V16(b) => Val::V128(u128::from(u16::from_le_bytes(b)).into()),
         _ => return None,
     })
+}
+
+fn narrow_bits(ty: Type) -> Option<u32> {
+    match ty {
+        types::I8 => Some(8),
+        types::I16 => Some(16),
+        _ => None,
+    }
 }
 
 fn from_val(v: &Val, ty: Type) -> Result<DataValue, String> {
@@ -498,8 +570,14 @@ pub fn run_clif(text: &str, config: &Config) -> Result<Outcome, String> {
                 .iter()
                 .map(|p| p.value_type)
                 .collect();
+            let sext: Vec<bool> = callee
+                .signature
+                .returns
+                .iter()
+                .map(|p| p.extension == cranelift_codegen::ir::ArgumentExtension::Sext)
+                .collect();
             let text = comment.text.trim();
-            match runner.call(target, &inv.args, &returns) {
+            match runner.call_sext(target, &inv.args, &returns, &sext) {
                 Err(e) if e == "argument type" => out
                     .unsupported
                     .push(format!("{target}: argument types in `{text}`")),

@@ -25,13 +25,14 @@ use crate::analysis::{FuncInfo, is_remat};
 use crate::expr_trees::{ExprTrees, Operand, operands};
 use crate::locals::{Local, Locals};
 use crate::{
-    CompiledFunction, Config, Env, FuncIndex, GlobalIndex, Name, Result, TableIndex, TypeIndex,
-    unsupported, wasm_signature,
+    CompiledFunction, Config, Env, FuncIndex, GlobalIndex, Name, Reloc, RelocKind, Result,
+    TableIndex, TypeIndex, unsupported, wasm_signature,
 };
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::{
-    Endianness, FuncRef, Function, Inst, InstructionData as D, MemFlags, Opcode, SigRef, StackSlot,
-    Type, Value, ValueDef, types,
+    AbiParam, ArgumentExtension, ArgumentPurpose, Endianness, FuncRef, Function, Inst,
+    InstructionData as D, MemFlags, Opcode, SigRef, Signature, StackSlot, Type, Value, ValueDef,
+    types,
 };
 use wasm_encoder::{BlockType, Encode, Instruction as I, MemArg, ValType};
 
@@ -49,6 +50,8 @@ pub(crate) struct Emitter<'a> {
     pub locals: Locals,
     /// Shadow-stack frame: `(frame_pointer_local, frame_size)`.
     frame: Option<(Local, u32)>,
+    /// Frame offset of the area where calls copy by-value struct arguments.
+    byval_base: u32,
     slot_offset: SecondaryMap<StackSlot, u32>,
     body: Body,
     /// Locals created during emission (scratch locals, frame pointer, etc.).
@@ -104,6 +107,7 @@ impl<'a> Emitter<'a> {
             trees,
             locals,
             frame: None,
+            byval_base: 0,
             slot_offset: SecondaryMap::new(),
             body: Body::new(config.opts.use_tee),
             extra: ExtraLocals::new(base),
@@ -121,7 +125,25 @@ impl<'a> Emitter<'a> {
         if !func.dynamic_stack_slots.is_empty() {
             return unsupported("dynamic stack slots");
         }
-        if !func.sized_stack_slots.is_empty() {
+        // Calls copy by-value struct arguments (`StructArgument`) into the
+        // frame; one area serves all calls, sized for the largest.
+        let mut byval_size: u32 = 0;
+        for b in func.layout.blocks() {
+            for inst in func.layout.block_insts(b) {
+                if let Some(sig) = func.dfg.call_signature(inst) {
+                    let size: u32 = func.dfg.signatures[sig]
+                        .params
+                        .iter()
+                        .map(|p| match p.purpose {
+                            ArgumentPurpose::StructArgument(n) => n.next_multiple_of(16),
+                            _ => 0,
+                        })
+                        .sum();
+                    byval_size = byval_size.max(size);
+                }
+            }
+        }
+        if !func.sized_stack_slots.is_empty() || byval_size > 0 {
             let Some(sp) = config.module.stack_pointer_global else {
                 return unsupported("stack slots without ModuleLayout::stack_pointer_global");
             };
@@ -131,11 +153,23 @@ impl<'a> Emitter<'a> {
                     return unsupported("stack slot alignment above 16");
                 }
                 let align = 1u32 << data.align_shift;
-                size = size.next_multiple_of(align);
-                self.slot_offset[slot] = size;
-                size += data.size;
+                let Some(aligned) = size.checked_next_multiple_of(align) else {
+                    return unsupported("stack frame size overflow");
+                };
+                self.slot_offset[slot] = aligned;
+                let Some(next) = aligned.checked_add(data.size) else {
+                    return unsupported("stack frame size overflow");
+                };
+                size = next;
             }
-            let size = size.next_multiple_of(16);
+            let Some(size) = size
+                .checked_next_multiple_of(16)
+                .and_then(|s| Some((s, s.checked_add(byval_size)?)))
+            else {
+                return unsupported("stack frame size overflow");
+            };
+            let (byval_base, size) = size;
+            self.byval_base = byval_base;
             let fp = self.new_local(config.module.ptr_ty());
             self.frame = Some((fp, size));
             self.global_get(sp);
@@ -194,11 +228,73 @@ impl<'a> Emitter<'a> {
     }
 
     pub fn global_get(&mut self, g: GlobalIndex) {
-        self.ins(I::GlobalGet(g.0));
+        if self.config.module.relocatable {
+            self.body.op(&[0x23]);
+            self.body.uleb(RelocKind::GlobalIndexLeb, g.0);
+        } else {
+            self.ins(I::GlobalGet(g.0));
+        }
     }
 
     pub fn global_set(&mut self, g: GlobalIndex) {
-        self.ins(I::GlobalSet(g.0));
+        if self.config.module.relocatable {
+            self.body.op(&[0x24]);
+            self.body.uleb(RelocKind::GlobalIndexLeb, g.0);
+        } else {
+            self.ins(I::GlobalSet(g.0));
+        }
+    }
+
+    /// `call`, or `return_call` if `tail`.
+    pub(crate) fn call(&mut self, f: FuncIndex, tail: bool) {
+        if self.config.module.relocatable {
+            self.body.op(&[if tail { 0x12 } else { 0x10 }]);
+            self.body.uleb(RelocKind::FunctionIndexLeb, f.0);
+        } else if tail {
+            self.ins(I::ReturnCall(f.0));
+        } else {
+            self.ins(I::Call(f.0));
+        }
+    }
+
+    /// `call_indirect`, or `return_call_indirect` if `tail`.
+    pub(crate) fn call_indirect(&mut self, ty: TypeIndex, table: TableIndex, tail: bool) {
+        let (type_index, table_index) = (ty.0, table.0);
+        if self.config.module.relocatable {
+            self.body.op(&[if tail { 0x13 } else { 0x11 }]);
+            self.body.uleb(RelocKind::TypeIndexLeb, type_index);
+            self.body.uleb(RelocKind::TableNumberLeb, table_index);
+        } else if tail {
+            self.ins(I::ReturnCallIndirect {
+                type_index,
+                table_index,
+            });
+        } else {
+            self.ins(I::CallIndirect {
+                type_index,
+                table_index,
+            });
+        }
+    }
+
+    /// A constant of type `ty` (`i32` or `i64`) that the linker fills in
+    /// from symbol `index`, with a relocation of the 32-bit kind `k32` or
+    /// the 64-bit kind `k64`.
+    pub(crate) fn reloc_const(
+        &mut self,
+        ty: Type,
+        k32: RelocKind,
+        k64: RelocKind,
+        index: u32,
+        addend: i64,
+    ) {
+        if ty == types::I64 {
+            self.body.op(&[0x42]);
+            self.body.sleb64(k64, index, addend);
+        } else {
+            self.body.op(&[0x41]);
+            self.body.sleb32(k32, index, addend);
+        }
     }
 
     /// Complete the function body (`unreachable; end`), run-length encode all
@@ -207,7 +303,7 @@ impl<'a> Emitter<'a> {
         let (params, results) = wasm_signature(&self.func.signature)?;
         self.ins(I::Unreachable);
         self.ins(I::End);
-        let body = self.body.finish();
+        let (body, relocs) = self.body.finish();
         let mut decls: Vec<(u32, ValType)> = Vec::new();
         for &ty in self.locals.decls.iter().chain(self.extra.types()) {
             match decls.last_mut() {
@@ -220,6 +316,7 @@ impl<'a> Emitter<'a> {
             results,
             locals: decls,
             body,
+            relocs,
         })
     }
 
@@ -468,6 +565,67 @@ impl<'a> Emitter<'a> {
         self.env.func_index(Name::resolve(self.func, name))
     }
 
+    /// Push the first `n` arguments of a call with signature `sig`, the way
+    /// the callee expects them: narrow `sext` arguments sign-extended, and
+    /// by-value struct arguments copied into this frame (passing the copy's
+    /// address).
+    pub(crate) fn call_args(&mut self, sig: &Signature, n: usize, tail: bool) -> Result<()> {
+        let mut byval = self.byval_base;
+        for i in 0..n {
+            self.operand()?;
+            let p = sig.params.get(i);
+            if let Some(&AbiParam {
+                purpose: ArgumentPurpose::StructArgument(size),
+                ..
+            }) = p
+            {
+                if tail {
+                    return unsupported("tail call with a by-value struct argument");
+                }
+                let (fp, _) = self.frame.expect("frame for by-value arguments");
+                let src = self.scratch(self.config.module.ptr_ty());
+                self.local_set(src);
+                self.frame_addr(fp, byval);
+                self.local_get(src);
+                self.ptr_const(size as i64);
+                let mem = self.config.module.memory_index.0;
+                self.ins(I::MemoryCopy {
+                    src_mem: mem,
+                    dst_mem: mem,
+                });
+                self.frame_addr(fp, byval);
+                byval += size.next_multiple_of(16);
+            } else {
+                self.extend_for_abi(p);
+            }
+        }
+        Ok(())
+    }
+
+    /// Sign-extend the narrow value on the stack if `p` asks for it. Values
+    /// are kept zero-extended, which already satisfies `uext`.
+    pub(crate) fn extend_for_abi(&mut self, p: Option<&AbiParam>) {
+        if let Some(p) = p
+            && p.extension == ArgumentExtension::Sext
+        {
+            self.sext(p.value_type);
+        }
+    }
+
+    /// Restore the narrow-value invariant on a call's result: callees, LLVM
+    /// ones in particular, may leave garbage in the upper bits.
+    pub(crate) fn call_result(&mut self, inst: Inst) {
+        if let &[r] = self.func.dfg.inst_results(inst) {
+            self.mask(self.func.dfg.value_type(r));
+        }
+    }
+
+    fn frame_addr(&mut self, fp: Local, offset: u32) {
+        self.local_get(fp);
+        self.ptr_const(offset as i64);
+        self.ptr_add();
+    }
+
     /// The type and table indices for an indirect call with signature `sig`.
     pub(crate) fn indirect_call(&mut self, sig: SigRef) -> Result<(TypeIndex, TableIndex)> {
         let Some(table_index) = self.config.module.table_index else {
@@ -524,6 +682,7 @@ struct Body {
     bytes: Vec<u8>,
     pending_set: Option<u32>,
     use_tee: bool,
+    relocs: Vec<Reloc>,
 }
 
 impl Body {
@@ -532,7 +691,45 @@ impl Body {
             bytes: Vec::new(),
             pending_set: None,
             use_tee,
+            relocs: Vec::new(),
         }
+    }
+
+    fn flush(&mut self) {
+        if let Some(l) = self.pending_set.take() {
+            I::LocalSet(l).encode(&mut self.bytes);
+        }
+    }
+
+    /// Raw opcode bytes, for instructions whose immediates are relocated.
+    fn op(&mut self, opcode: &[u8]) {
+        self.flush();
+        self.bytes.extend_from_slice(opcode);
+    }
+
+    fn reloc(&mut self, kind: RelocKind, index: u32, addend: i64) {
+        self.relocs.push(Reloc {
+            offset: self.bytes.len() as u32,
+            kind,
+            index,
+            addend,
+        });
+    }
+
+    /// A relocated index: a 5-byte LEB holding `index` as a placeholder.
+    fn uleb(&mut self, kind: RelocKind, index: u32) {
+        self.reloc(kind, index, 0);
+        write_padded_uleb(&mut self.bytes, index);
+    }
+
+    fn sleb32(&mut self, kind: RelocKind, index: u32, addend: i64) {
+        self.reloc(kind, index, addend);
+        write_padded_sleb(&mut self.bytes, addend as i32 as i64, 5);
+    }
+
+    fn sleb64(&mut self, kind: RelocKind, index: u32, addend: i64) {
+        self.reloc(kind, index, addend);
+        write_padded_sleb(&mut self.bytes, addend, 10);
     }
 
     fn ins(&mut self, i: I<'_>) {
@@ -550,11 +747,30 @@ impl Body {
         i.encode(&mut self.bytes);
     }
 
-    fn finish(mut self) -> Vec<u8> {
-        if let Some(l) = self.pending_set.take() {
-            I::LocalSet(l).encode(&mut self.bytes);
-        }
-        self.bytes
+    fn finish(mut self) -> (Vec<u8>, Vec<Reloc>) {
+        self.flush();
+        (self.bytes, self.relocs)
+    }
+}
+
+/// Write `v` as an unsigned LEB padded to 5 bytes.
+pub(crate) fn write_padded_uleb(out: &mut Vec<u8>, v: u32) {
+    let mut v = v;
+    for i in 0..5 {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        out.push(if i < 4 { byte | 0x80 } else { byte });
+    }
+}
+
+/// Write `v` as a signed LEB padded to `len` bytes (5 for 32-bit fields, 10
+/// for 64-bit ones).
+pub(crate) fn write_padded_sleb(out: &mut Vec<u8>, v: i64, len: usize) {
+    let mut v = v;
+    for i in 0..len {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        out.push(if i + 1 < len { byte | 0x80 } else { byte });
     }
 }
 
