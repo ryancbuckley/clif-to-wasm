@@ -6,10 +6,17 @@ edition = "2024"
 [dependencies]
 cranelift-codegen = { version = "=0.136.2", default-features = false, features = ["std", "unwind"] }
 wasm-encoder = "0.245"
+cranelift-module = { version = "=0.136.2", optional = true }
+
+[features]
+# A `cranelift_module::Module` that writes relocatable wasm objects, for
+# frontends such as rustc_codegen_cranelift.
+module = ["dep:cranelift-module", "cranelift-codegen/pulley"]
 
 [dev-dependencies]
 cranelift-frontend = "=0.136.2"
 cranelift-interpreter = "=0.136.2"
+cranelift-module = "=0.136.2"
 cranelift-reader = "=0.136.2"
 target-lexicon = "0.13.5"
 wasmparser = "0.245"
@@ -20,3 +27,7 @@ wat = "1.261.0"
 [[bench]]
 name = "codegen"
 harness = false
+
+[[test]]
+name = "object"
+required-features = ["module"]

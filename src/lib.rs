@@ -44,6 +44,9 @@ mod lower_atomic;
 mod lower_float;
 mod lower_simd;
 pub mod module;
+pub mod object;
+#[cfg(feature = "module")]
+pub mod object_module;
 mod structure;
 
 pub use module::{

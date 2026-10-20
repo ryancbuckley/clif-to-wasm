@@ -66,7 +66,10 @@ pub(crate) fn demote(func: &mut Function, ptr: Type) -> Result<()> {
     let own = func.signature.returns.clone();
     let mut ret_ptr: Option<Value> = None;
     if needs_demotion(&func.signature) {
-        let entry = func.layout.entry_block().expect("function has an entry block");
+        let entry = func
+            .layout
+            .entry_block()
+            .expect("function has an entry block");
         let old = func.dfg.detach_block_params(entry);
         let old: Vec<Value> = old.as_slice(&func.dfg.value_lists).to_vec();
         ret_ptr = Some(func.dfg.append_block_param(entry, ptr));
