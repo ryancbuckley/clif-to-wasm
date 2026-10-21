@@ -620,12 +620,36 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// Restore the narrow-value invariant on a call's result: callees, LLVM
-    /// ones in particular, may leave garbage in the upper bits.
-    pub(crate) fn call_result(&mut self, inst: Inst) {
-        if let &[r] = self.func.dfg.inst_results(inst) {
-            self.mask(self.func.dfg.value_type(r));
+    /// Restore the narrow-value invariant on a call's results: callees, LLVM
+    /// ones in particular, may leave garbage in the upper bits, and `sext`
+    /// returns arrive sign-extended.
+    pub(crate) fn call_result(&mut self, inst: Inst) -> Result<()> {
+        let dfg = &self.func.dfg;
+        let results = dfg.inst_results(inst);
+        if let &[r] = results {
+            self.mask(dfg.value_type(r));
+            return Ok(());
         }
+        if !results
+            .iter()
+            .any(|&r| narrow_bits(dfg.value_type(r)).is_some())
+        {
+            return Ok(());
+        }
+        // Only the last result is on top: set them all aside, then push them
+        // back masked.
+        let tys: Vec<Type> = results.iter().map(|&r| dfg.value_type(r)).collect();
+        let mut held = Vec::with_capacity(tys.len());
+        for &ty in tys.iter().rev() {
+            let l = self.scratch(crate::wasm_type(ty)?);
+            self.local_set(l);
+            held.push(l);
+        }
+        for (&ty, &l) in tys.iter().zip(held.iter().rev()) {
+            self.local_get(l);
+            self.mask(ty);
+        }
+        Ok(())
     }
 
     fn frame_addr(&mut self, fp: Local, offset: u32) {

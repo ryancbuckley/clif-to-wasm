@@ -54,3 +54,46 @@ fn clif_runtests() {
         panic!("{} problems:\n{}", problems.len(), problems.join("\n"));
     }
 }
+
+/// Narrow results of a `try_call` with several results are masked, as for
+/// `call` (in `calls.clif`). Not in `exceptions.clif`, because
+/// `demote_multi_results` does not support such a `try_call`.
+#[test]
+fn try_call_masks_several_narrow_results() {
+    let text = "
+test run
+
+function %two_sext() -> i8 sext, i16 sext tail {
+block0:
+    v0 = iconst.i8 -1
+    v1 = iconst.i16 -32768
+    return v0, v1
+}
+
+function %try_uextend_two_sext() -> i32, i32 {
+    sig0 = () -> i8 sext, i16 sext tail
+    fn0 = %two_sext() -> i8 sext, i16 sext tail
+block0:
+    try_call fn0(), sig0, block1(ret0, ret1), [ default: block2 ]
+
+block1(v0: i8, v1: i16):
+    v2 = uextend.i32 v0
+    v3 = uextend.i32 v1
+    return v2, v3
+
+block2:
+    v4 = iconst.i32 0
+    return v4, v4
+}
+; run: %try_uextend_two_sext() == [255, 32768]
+";
+    for (cname, config) in configs() {
+        if config.module.demote_multi_results {
+            continue;
+        }
+        let out = harness::run_clif(text, &config).unwrap();
+        assert!(out.unsupported.is_empty(), "[{cname}] {:?}", out.unsupported);
+        assert!(out.failures.is_empty(), "[{cname}] {:?}", out.failures);
+        assert_eq!(out.passed, 1, "[{cname}]");
+    }
+}

@@ -757,7 +757,7 @@ impl Emitter<'_> {
                     }
                 } else {
                     self.call(idx, false);
-                    self.call_result(inst);
+                    self.call_result(inst)?;
                 }
             }
             (
@@ -781,7 +781,7 @@ impl Emitter<'_> {
                     }
                 } else {
                     self.call_indirect(type_index, table_index, false);
-                    self.call_result(inst);
+                    self.call_result(inst)?;
                 }
             }
             (Opcode::Return, _) => {

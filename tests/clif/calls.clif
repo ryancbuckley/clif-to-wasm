@@ -95,3 +95,22 @@ block0(v0: i32):
     return v4
 }
 ; run: %slot_across_call(1) == 100
+
+; Narrow results of a call with several results are masked too: `sext`
+; returns arrive sign-extended, but narrow values are kept zero-extended.
+function %two_sext() -> i8 sext, i16 sext {
+block0:
+    v0 = iconst.i8 -1
+    v1 = iconst.i16 -32768
+    return v0, v1
+}
+
+function %uextend_two_sext() -> i32, i32 {
+    fn0 = %two_sext() -> i8 sext, i16 sext
+block0:
+    v0, v1 = call fn0()
+    v2 = uextend.i32 v0
+    v3 = uextend.i32 v1
+    return v2, v3
+}
+; run: %uextend_two_sext() == [255, 32768]

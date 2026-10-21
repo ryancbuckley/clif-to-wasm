@@ -462,13 +462,8 @@ impl Structurer<'_> {
                 self.e.call_indirect(type_index, table_index, false);
             }
         }
-        if let &[t] = &results[..]
-            && t == ValType::I32
-            && let Some(&p) = sig.returns.first()
-        {
+        for (&l, p) in result_locals.iter().zip(&sig.returns).rev() {
             self.e.mask(p.value_type);
-        }
-        for &l in result_locals.iter().rev() {
             self.e.local_set(l);
         }
         self.labels.pop();
