@@ -15,8 +15,8 @@ use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{DataDescription, Linkage, Module};
-use cranelift_wasm_backend::Config;
-use cranelift_wasm_backend::object_module::{ObjectOptions, WasmObjectModule, frontend_isa};
+use clif_to_wasm::Config;
+use clif_to_wasm::object_module::{ObjectOptions, WasmObjectModule, frontend_isa};
 use std::path::PathBuf;
 use std::process::Command;
 

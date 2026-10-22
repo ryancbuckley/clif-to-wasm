@@ -4,7 +4,7 @@
 
 mod harness;
 
-use cranelift_wasm_backend::Config;
+use clif_to_wasm::Config;
 use harness::clifgen::Rng;
 use wasmtime::{Engine, Instance, Module, Store, TypedFunc};
 

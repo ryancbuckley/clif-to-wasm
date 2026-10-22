@@ -20,7 +20,7 @@ mod harness;
 
 use cranelift_codegen::data_value::DataValue;
 use cranelift_codegen::ir::{Function, types};
-use cranelift_wasm_backend::Config;
+use clif_to_wasm::Config;
 use harness::kernels::{KERNELS, functions};
 use std::time::Instant;
 
@@ -178,16 +178,16 @@ fn main() {
     println!("| corpus | funcs | CLIF insts | time | µs/func | ns/inst |");
     println!("|---|---:|---:|---:|---:|---:|");
     struct NoEnv;
-    impl cranelift_wasm_backend::Env for NoEnv {
+    impl clif_to_wasm::Env for NoEnv {
         fn func_index(
             &mut self,
-            _: cranelift_wasm_backend::Name<'_>,
-        ) -> cranelift_wasm_backend::Result<cranelift_wasm_backend::FuncIndex> {
-            Ok(cranelift_wasm_backend::FuncIndex(0))
+            _: clif_to_wasm::Name<'_>,
+        ) -> clif_to_wasm::Result<clif_to_wasm::FuncIndex> {
+            Ok(clif_to_wasm::FuncIndex(0))
         }
     }
     let config = harness::config(|c| {
-        c.module.stack_pointer_global = Some(cranelift_wasm_backend::GlobalIndex(0))
+        c.module.stack_pointer_global = Some(clif_to_wasm::GlobalIndex(0))
     });
     for (cname, modules) in &corpora {
         let funcs: Vec<Function> = modules
@@ -199,7 +199,7 @@ fn main() {
                 f
             })
             // Skip the few that need more of an environment than `NoEnv`.
-            .filter(|f| cranelift_wasm_backend::compile_function(f, &config, &mut NoEnv).is_ok())
+            .filter(|f| clif_to_wasm::compile_function(f, &config, &mut NoEnv).is_ok())
             .collect();
         let insts = num_insts(&funcs);
         let mut times = Vec::new();
@@ -207,7 +207,7 @@ fn main() {
             let t = Instant::now();
             for f in &funcs {
                 std::hint::black_box(
-                    cranelift_wasm_backend::compile_function(f, &config, &mut NoEnv).unwrap(),
+                    clif_to_wasm::compile_function(f, &config, &mut NoEnv).unwrap(),
                 );
             }
             times.push(t.elapsed().as_secs_f64());

@@ -14,7 +14,7 @@ use cranelift_interpreter::environment::FunctionStore;
 use cranelift_interpreter::interpreter::{Interpreter, InterpreterState};
 use cranelift_interpreter::step::ControlFlow;
 use cranelift_reader::{Comparison, ParseOptions, RunCommand, parse_run_command, parse_test};
-use cranelift_wasm_backend::{
+use clif_to_wasm::{
     Config, Env, Error, FuncIndex, ModuleBuilder, Name, TagIndex, TypeIndex, compile_function,
     wasm_signature, wasm_signature_in,
 };
@@ -187,7 +187,7 @@ pub fn compile_module(funcs: &[Function], config: &Config) -> (Vec<u8>, Vec<Stri
         }
         builder.define_function(
             idx,
-            cranelift_wasm_backend::CompiledFunction {
+            clif_to_wasm::CompiledFunction {
                 params: payload.to_vec(),
                 results: vec![],
                 locals: vec![],
@@ -237,9 +237,9 @@ pub fn compile_module(funcs: &[Function], config: &Config) -> (Vec<u8>, Vec<Stri
     (builder.finish(), unsupported)
 }
 
-fn stub(f: &Function, config: &Config) -> cranelift_wasm_backend::CompiledFunction {
+fn stub(f: &Function, config: &Config) -> clif_to_wasm::CompiledFunction {
     let (params, results) = wasm_signature_in(&f.signature, &config.module).unwrap_or_default();
-    cranelift_wasm_backend::CompiledFunction {
+    clif_to_wasm::CompiledFunction {
         params,
         results,
         locals: vec![],

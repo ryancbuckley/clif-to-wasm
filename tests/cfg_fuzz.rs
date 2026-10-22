@@ -21,7 +21,7 @@ use cranelift_codegen::ir::{
     MemFlagsData, Signature, StackSlot, StackSlotData, StackSlotKind, Type, UserFuncName, Value, types,
 };
 use cranelift_codegen::isa::CallConv;
-use cranelift_wasm_backend::{Config, Optimizations};
+use clif_to_wasm::{Config, Optimizations};
 use proptest::prelude::*;
 
 /// Scalar types first (the first five are the integers), then vectors,

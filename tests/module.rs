@@ -7,7 +7,7 @@ mod harness;
 
 use cranelift_codegen::ir::{Function, Signature};
 use cranelift_reader::parse_functions;
-use cranelift_wasm_backend::{
+use clif_to_wasm::{
     CompiledFunction, Config, Env, Error, FuncIndex, ModuleBuilder, Name, TableIndex, TypeIndex,
     compile_function, wasm_signature,
 };

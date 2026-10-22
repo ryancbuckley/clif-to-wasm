@@ -1,4 +1,4 @@
-# cranelift-wasm-backend
+# clif-to-wasm
 
 A WebAssembly backend for [Cranelift](https://cranelift.dev): it compiles a
 Cranelift IR `Function` into a wasm function body.
@@ -59,7 +59,7 @@ accept only pure trees, so an unconditional effect never becomes conditional.
 ## Usage
 
 ```rust
-use cranelift_wasm_backend::{compile_function, Config, Env, FuncIndex, Name, Result};
+use clif_to_wasm::{compile_function, Config, Env, FuncIndex, Name, Result};
 
 struct MyEnv;
 impl Env for MyEnv {

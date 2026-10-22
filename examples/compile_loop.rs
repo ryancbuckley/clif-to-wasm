@@ -14,7 +14,7 @@ fn main() {
         .map(|s| harness::clifgen::generate(s).0)
         .collect();
     let config = harness::config(|c| {
-        c.module.stack_pointer_global = Some(cranelift_wasm_backend::GlobalIndex(0))
+        c.module.stack_pointer_global = Some(clif_to_wasm::GlobalIndex(0))
     });
     // Resolve aliases up front, as Cranelift's own pipeline does, so that the
     // timing covers only this backend.
@@ -26,12 +26,12 @@ fn main() {
         })
         .collect();
     struct NoEnv;
-    impl cranelift_wasm_backend::Env for NoEnv {
+    impl clif_to_wasm::Env for NoEnv {
         fn func_index(
             &mut self,
-            _: cranelift_wasm_backend::Name<'_>,
-        ) -> cranelift_wasm_backend::Result<cranelift_wasm_backend::FuncIndex> {
-            Ok(cranelift_wasm_backend::FuncIndex(0))
+            _: clif_to_wasm::Name<'_>,
+        ) -> clif_to_wasm::Result<clif_to_wasm::FuncIndex> {
+            Ok(clif_to_wasm::FuncIndex(0))
         }
     }
     let start = std::time::Instant::now();
@@ -39,7 +39,7 @@ fn main() {
     while start.elapsed().as_secs_f64() < secs {
         for f in &funcs {
             std::hint::black_box(
-                cranelift_wasm_backend::compile_function(f, &config, &mut NoEnv).unwrap(),
+                clif_to_wasm::compile_function(f, &config, &mut NoEnv).unwrap(),
             );
         }
         n += 1;

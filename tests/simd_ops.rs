@@ -11,7 +11,7 @@ use cranelift_codegen::ir::{
 };
 use cranelift_codegen::isa::{CallConv, TargetFrontendConfig};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use cranelift_wasm_backend::Config;
+use clif_to_wasm::Config;
 use harness::clifgen::{Rng, arg};
 
 const VTYPES: [Type; 13] = [

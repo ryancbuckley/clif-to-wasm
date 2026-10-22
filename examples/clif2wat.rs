@@ -13,7 +13,7 @@ fn main() {
         funcs.retain(|f| harness::func_name(f) == *only);
     }
     let (wasm, unsupported) =
-        harness::compile_module(&funcs, &cranelift_wasm_backend::Config::default());
+        harness::compile_module(&funcs, &clif_to_wasm::Config::default());
     for u in unsupported {
         eprintln!("unsupported: {u}");
     }

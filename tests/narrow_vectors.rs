@@ -8,7 +8,7 @@ mod harness;
 
 use cranelift_codegen::data_value::DataValue;
 use cranelift_codegen::ir::{Type, types};
-use cranelift_wasm_backend::Config;
+use clif_to_wasm::Config;
 use proptest::prelude::*;
 
 const NARROW: [Type; 7] = [

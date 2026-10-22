@@ -153,6 +153,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "clif-to-wasm"
+version = "0.1.0"
+dependencies = [
+ "cranelift-codegen",
+ "cranelift-frontend",
+ "cranelift-interpreter",
+ "cranelift-module",
+ "cranelift-reader",
+ "proptest",
+ "target-lexicon",
+ "wasm-encoder 0.245.1",
+ "wasmparser 0.245.1",
+ "wasmprinter 0.245.1",
+ "wasmtime",
+ "wat",
+]
+
+[[package]]
 name = "cobs"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -377,24 +395,6 @@ name = "cranelift-srcgen"
 version = "0.136.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4944ef05513e1c1a85a945cf8f29d95ddea8bcbb19e0bfd4e71063450967420"
-
-[[package]]
-name = "cranelift-wasm-backend"
-version = "0.1.0"
-dependencies = [
- "cranelift-codegen",
- "cranelift-frontend",
- "cranelift-interpreter",
- "cranelift-module",
- "cranelift-reader",
- "proptest",
- "target-lexicon",
- "wasm-encoder 0.245.1",
- "wasmparser 0.245.1",
- "wasmprinter 0.245.1",
- "wasmtime",
- "wat",
-]
 
 [[package]]
 name = "crc32fast"

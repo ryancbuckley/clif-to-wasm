@@ -42,7 +42,7 @@ fn main() {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let mut config = cranelift_wasm_backend::Config::default();
+        let mut config = clif_to_wasm::Config::default();
         config.module.demote_multi_results = std::env::var_os("DEMOTE").is_some();
         let result = std::panic::catch_unwind(|| harness::run_clif(&text, &config));
         match result {

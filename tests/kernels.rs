@@ -5,7 +5,7 @@ mod harness;
 
 use cranelift_codegen::data_value::DataValue;
 use cranelift_codegen::ir::types;
-use cranelift_wasm_backend::Config;
+use clif_to_wasm::Config;
 use harness::kernels::{KERNELS, functions};
 
 #[test]
