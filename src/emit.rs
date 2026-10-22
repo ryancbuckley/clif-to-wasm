@@ -41,6 +41,16 @@ use wasm_encoder::{BlockType, Encode, Instruction as I, MemArg, ValType};
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ScratchMark(usize);
 
+/// A by-value struct argument still to be copied into the frame, from
+/// [`Emitter::call_args`].
+pub(crate) struct ByvalCopy {
+    /// Offset of the copy in the frame.
+    dst: u32,
+    /// Holds the struct's address.
+    src: Local,
+    size: u32,
+}
+
 pub(crate) struct Emitter<'a> {
     pub func: &'a Function,
     pub config: &'a Config,
@@ -569,8 +579,19 @@ impl<'a> Emitter<'a> {
     /// the callee expects them: narrow `sext` arguments sign-extended, and
     /// by-value struct arguments copied into this frame (passing the copy's
     /// address).
-    pub(crate) fn call_args(&mut self, sig: &Signature, n: usize, tail: bool) -> Result<()> {
+    ///
+    /// The copies are made by [`Self::byval_copies`], once the call's last
+    /// operand has been pushed: an operand evaluated later may write to a
+    /// struct being passed, or be a call that copies its own struct arguments
+    /// into the same area.
+    pub(crate) fn call_args(
+        &mut self,
+        sig: &Signature,
+        n: usize,
+        tail: bool,
+    ) -> Result<Vec<ByvalCopy>> {
         let mut byval = self.byval_base;
+        let mut copies = Vec::new();
         for i in 0..n {
             self.operand()?;
             let p = sig.params.get(i);
@@ -592,13 +613,10 @@ impl<'a> Emitter<'a> {
                 }
                 let src = self.scratch(self.config.module.ptr_ty());
                 self.local_set(src);
-                self.frame_addr(fp, byval);
-                self.local_get(src);
-                self.ptr_const(size as i64);
-                let mem = self.config.module.memory_index.0;
-                self.ins(I::MemoryCopy {
-                    src_mem: mem,
-                    dst_mem: mem,
+                copies.push(ByvalCopy {
+                    dst: byval,
+                    src,
+                    size,
                 });
                 self.frame_addr(fp, byval);
                 self.ptr_to(value_type)?;
@@ -607,7 +625,24 @@ impl<'a> Emitter<'a> {
                 self.extend_for_abi(p);
             }
         }
-        Ok(())
+        Ok(copies)
+    }
+
+    /// Copy by-value struct arguments into the frame, after [`Self::call_args`]
+    /// and any other operand of the call. `memory.copy` leaves the arguments
+    /// on the stack alone.
+    pub(crate) fn byval_copies(&mut self, copies: Vec<ByvalCopy>) {
+        let mem = self.config.module.memory_index.0;
+        for c in copies {
+            let (fp, _) = self.frame.expect("frame for by-value arguments");
+            self.frame_addr(fp, c.dst);
+            self.local_get(c.src);
+            self.ptr_const(c.size as i64);
+            self.ins(I::MemoryCopy {
+                src_mem: mem,
+                dst_mem: mem,
+            });
+        }
     }
 
     /// Sign-extend the narrow value on the stack if `p` asks for it. Values
