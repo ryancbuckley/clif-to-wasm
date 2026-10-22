@@ -21,6 +21,12 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn new_module() -> WasmObjectModule {
+    module_with_imports(Box::new(|_| None))
+}
+
+fn module_with_imports(
+    import_names: Box<dyn Fn(&str) -> Option<(String, String)> + Send + Sync>,
+) -> WasmObjectModule {
     let flags = settings::Flags::new(settings::builder());
     let isa = frontend_isa(flags, false).unwrap();
     let mut config = Config::default();
@@ -33,6 +39,7 @@ fn new_module() -> WasmObjectModule {
             features: vec!["bulk-memory".into(), "sign-ext".into()],
             stub_unsupported: false,
             libcall_names: cranelift_module::default_libcall_names(),
+            import_names,
         },
     )
 }
@@ -263,5 +270,102 @@ fn objects_link_and_run() {
         .get_typed_func::<(), i32>(&mut store, "run")
         .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 1241);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An object calling `random_get` from `wasi_snapshot_preview1` under a
+/// mangled symbol name, as Rust's `#[link(wasm_import_module = "...")]`
+/// declares it.
+fn object_with_import() -> Vec<u8> {
+    const SYMBOL: &str = "_RNvNtCs1_9getrandom7wasi_p110random_get";
+    let mut m = module_with_imports(Box::new(|name| {
+        (name == SYMBOL).then(|| ("wasi_snapshot_preview1".into(), "random_get".into()))
+    }));
+    let i32t = types::I32;
+    let random_get = m
+        .declare_function(SYMBOL, Linkage::Import, &sig(&[i32t, i32t], &[i32t]))
+        .unwrap();
+    let run = m
+        .declare_function("run", Linkage::Export, &sig(&[], &[i32t]))
+        .unwrap();
+    define(&mut m, run, sig(&[], &[i32t]), |m, b| {
+        let f = m.declare_func_in_func(random_get, b.func);
+        let p = b.ins().iconst(i32t, 0);
+        let n = b.ins().iconst(i32t, 8);
+        let call = b.ins().call(f, &[p, n]);
+        let r = b.inst_results(call)[0];
+        b.ins().return_(&[r]);
+    });
+    m.finish()
+}
+
+/// The function imports of a wasm module, as (module, field).
+fn func_imports(wasm: &[u8]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        if let wasmparser::Payload::ImportSection(s) = payload.unwrap() {
+            for imp in s.into_imports() {
+                let imp = imp.unwrap();
+                if matches!(imp.ty, wasmparser::TypeRef::Func(_)) {
+                    out.push((imp.module.to_owned(), imp.name.to_owned()));
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn imports_from_other_modules() {
+    let obj = object_with_import();
+    wasmparser::Validator::new().validate_all(&obj).unwrap();
+    assert_eq!(
+        func_imports(&obj),
+        [("wasi_snapshot_preview1".to_owned(), "random_get".to_owned())]
+    );
+    // Its symbol keeps the mangled name, with WASM_SYM_EXPLICIT_NAME.
+    let mut found = false;
+    for payload in wasmparser::Parser::new(0).parse_all(&obj) {
+        if let wasmparser::Payload::CustomSection(c) = payload.unwrap()
+            && let wasmparser::KnownCustom::Linking(l) = c.as_known()
+        {
+            for sub in l {
+                if let wasmparser::Linking::SymbolTable(syms) = sub.unwrap() {
+                    for sym in syms {
+                        if let wasmparser::SymbolInfo::Func { flags, name, .. } = sym.unwrap()
+                            && flags.contains(wasmparser::SymbolFlags::UNDEFINED)
+                        {
+                            assert!(flags.contains(wasmparser::SymbolFlags::EXPLICIT_NAME));
+                            assert_eq!(name, Some("_RNvNtCs1_9getrandom7wasi_p110random_get"));
+                            found = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(found, "no undefined function symbol");
+
+    // A linker keeps the import as it is.
+    let Some(lld) = rust_lld() else {
+        eprintln!("skipping the link: rust-lld not found (set RUST_LLD)");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("cwb-import-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let o = dir.join("import.o");
+    let out = dir.join("linked.wasm");
+    std::fs::write(&o, &obj).unwrap();
+    let status = Command::new(&lld)
+        .args(["-flavor", "wasm", "--no-entry", "--export=run", "-o"])
+        .arg(&out)
+        .arg(&o)
+        .status()
+        .unwrap();
+    assert!(status.success(), "wasm-ld failed");
+    assert_eq!(
+        func_imports(&std::fs::read(&out).unwrap()),
+        [("wasi_snapshot_preview1".to_owned(), "random_get".to_owned())]
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -70,6 +70,10 @@ pub struct ObjectOptions {
     pub stub_unsupported: bool,
     /// The symbol names of libcalls.
     pub libcall_names: Box<dyn Fn(LibCall) -> String + Send + Sync>,
+    /// For the symbol name of an imported function, the wasm module and
+    /// field to import it as, if not `env` and the symbol name (Rust's
+    /// `#[link(wasm_import_module = "...")]`).
+    pub import_names: Box<dyn Fn(&str) -> Option<(String, String)> + Send + Sync>,
 }
 
 /// A `cranelift_module::Module` writing a relocatable wasm object.
@@ -81,6 +85,7 @@ pub struct WasmObjectModule {
     threads: bool,
     stub_unsupported: bool,
     libcall_names: Box<dyn Fn(LibCall) -> String + Send + Sync>,
+    import_names: Box<dyn Fn(&str) -> Option<(String, String)> + Send + Sync>,
     funcs: SecondaryMap<FuncId, Option<SymbolId>>,
     data: SecondaryMap<DataId, Option<SymbolId>>,
     defined_funcs: SecondaryMap<FuncId, bool>,
@@ -143,6 +148,7 @@ impl WasmObjectModule {
             threads: options.threads,
             stub_unsupported: options.stub_unsupported,
             libcall_names: options.libcall_names,
+            import_names: options.import_names,
             funcs: SecondaryMap::new(),
             data: SecondaryMap::new(),
             defined_funcs: SecondaryMap::new(),
@@ -171,7 +177,14 @@ impl WasmObjectModule {
         let flags = flags_for(decl.linkage);
         let sig = decl.signature.clone();
         let (p, r) = self.wasm_sig(&sig)?;
-        let s = self.obj.function(&name, flags, &p, &r);
+        let import = match decl.linkage {
+            Linkage::Import => (self.import_names)(&name),
+            _ => None,
+        };
+        let s = match import {
+            Some((module, field)) => self.obj.import_function(&name, flags, &module, &field, &p, &r),
+            None => self.obj.function(&name, flags, &p, &r),
+        };
         self.funcs[id] = Some(s);
         Ok(s)
     }

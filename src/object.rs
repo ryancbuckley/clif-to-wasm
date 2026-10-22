@@ -68,6 +68,7 @@ const FLAG_WEAK: u32 = 0x1;
 const FLAG_LOCAL: u32 = 0x2;
 const FLAG_HIDDEN: u32 = 0x4;
 const FLAG_UNDEFINED: u32 = 0x10;
+const FLAG_EXPLICIT_NAME: u32 = 0x40;
 const FLAG_NO_STRIP: u32 = 0x80;
 const FLAG_TLS: u32 = 0x100;
 
@@ -120,6 +121,9 @@ struct Symbol {
     name: String,
     flags: SymbolFlags,
     kind: SymKind,
+    /// For an undefined function: the wasm module and field it is imported
+    /// as, if not `env` and its name.
+    import: Option<(String, String)>,
 }
 
 struct Segment {
@@ -173,6 +177,7 @@ impl ObjectBuilder {
             name: name.to_owned(),
             flags,
             kind,
+            import: None,
         });
         id
     }
@@ -188,6 +193,24 @@ impl ObjectBuilder {
     ) -> SymbolId {
         let ty = self.type_index(params, results);
         self.symbol(name, flags, SymKind::Func { ty, def: None })
+    }
+
+    /// Declare a function imported as `field` from the wasm module `module`
+    /// (Rust's `#[link(wasm_import_module = "...")]`), under the symbol name
+    /// `name`. Functions declared with [`Self::function`] and not defined
+    /// are imported from `env` under their symbol name instead.
+    pub fn import_function(
+        &mut self,
+        name: &str,
+        flags: SymbolFlags,
+        module: &str,
+        field: &str,
+        params: &[ValType],
+        results: &[ValType],
+    ) -> SymbolId {
+        let s = self.function(name, flags, params, results);
+        self.symbols[s.0 as usize].import = Some((module.to_owned(), field.to_owned()));
+        s
     }
 
     /// Declare a data symbol, thread-local if `tls`. It is undefined unless
@@ -404,7 +427,11 @@ impl ObjectBuilder {
             let SymKind::Func { ty, .. } = s.kind else {
                 unreachable!()
             };
-            imports.import("env", &s.name, wasm_encoder::EntityType::Function(ty));
+            let (module, field) = match &s.import {
+                Some((m, f)) => (m.as_str(), f.as_str()),
+                None => ("env", s.name.as_str()),
+            };
+            imports.import(module, field, wasm_encoder::EntityType::Function(ty));
         }
         for &i in &global_imports {
             let s = &self.symbols[i];
@@ -573,10 +600,16 @@ impl ObjectBuilder {
                         if def.is_none() {
                             flags |= FLAG_UNDEFINED;
                         }
+                        // An import's symbol takes the import's name unless
+                        // it has its own.
+                        let explicit = def.is_none() && s.import.is_some();
+                        if explicit {
+                            flags |= FLAG_EXPLICIT_NAME;
+                        }
                         sub.push(0);
                         flags.encode(&mut sub);
                         index[i].encode(&mut sub);
-                        if def.is_some() {
+                        if def.is_some() || explicit {
                             s.name.as_str().encode(&mut sub);
                         }
                     }
