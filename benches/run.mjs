@@ -1,6 +1,6 @@
 // Runs benchmark kernels in V8. Invoked by benches/codegen.rs with V8 flags
-// selecting the tier, e.g.:
-//   node --liftoff --no-wasm-tier-up --no-wasm-lazy-compilation run.mjs m.wasm 5 sieve:1000000
+// selecting the compiler tier, e.g.:
+//   node --liftoff-only --no-wasm-lazy-compilation benches/run.mjs m.wasm 5 sieve:1000000
 // Prints JSON: { compile_ms, kernels: { name: { ms: [...], result } } }
 import fs from 'fs';
 

@@ -1,34 +1,29 @@
 //! A WebAssembly backend for Cranelift.
 //!
-//! This crate translates a Cranelift [`ir::Function`] into the body of a
-//! WebAssembly function. It is not a `TargetIsa`: Cranelift's machine backends
-//! are built around register allocation, which a stack machine with unlimited
-//! locals does not need. Instead the pipeline is:
+//! Translates a Cranelift [`ir::Function`] into a WebAssembly function body.
+//! Rather than implementing `TargetIsa` (which centers on register allocation),
+//! this crate operates directly on CLIF in five stages:
 //!
-//! 0. **Preparation & Legalization** ([`legalize_i128`]): value aliases are
-//!    resolved and `i128` values become pairs of `i64`s, so the later passes
-//!    only see canonical SSA values of types wasm has.
-//! 1. **Analysis** ([`analysis`]): reachability, reverse postorder, CFG edges,
-//!    dominators, loop headers and merge nodes, value-level dead code
-//!    elimination and use counts in a single pass.
-//! 2. **Expression trees** ([`expr_trees`]): greedy, backwards, per-block
-//!    tree building, so that values pass on the operand stack instead of
-//!    through locals. A single-use def is folded into its user when doing so
-//!    does not reorder side effects; this is checked in O(1) with
-//!    Cranelift-style side-effect *colors*. Constants are rematerialized at
-//!    every use.
-//! 3. **Local allocation** ([`locals`]): values that are not consumed directly
-//!    off the operand stack get a wasm local; locals are shared between values
-//!    whose live ranges do not overlap, preferring to give block arguments and
-//!    parameters the same local.
-//! 4. **Structuring and emission** ([`structure`], [`emit`], [`lower`]):
-//!    control flow is rebuilt from the dominator tree following Ramsey's
-//!    "Beyond Relooper" (ICFP 2022), while instructions are lowered and
-//!    peephole-encoded into the function body. Irreducible control flow falls
-//!    back to a dispatch loop.
+//! 0. **Preparation & Legalization** (`legalize_i128`, `legalize_abi`):
+//!    resolves value aliases, splits `i128`/`f128` values into `(lo, hi)` `i64`
+//!    pairs, and optionally demotes multi-result returns to memory.
+//! 1. **Analysis** (`analysis`): computes reachability, RPO, CFG edges,
+//!    dominators, loop headers, merge nodes, and single-pass backward liveness
+//!    and use counts.
+//! 2. **Expression trees** (`expr_trees`): folds single-use definitions into
+//!    their consumer within each block when side-effect order is preserved
+//!    (checked in O(1) via effect colors). Constants are rematerialized at each
+//!    use.
+//! 3. **Local allocation** (`locals`): assigns wasm locals to remaining
+//!    values by coloring per-block live-range segments, preferring to coalesce
+//!    block arguments with their target parameters.
+//! 4. **Structuring and emission** (`structure`, `emit`, `lower`):
+//!    reconstructs structured control flow from the dominator tree via Ramsey's
+//!    "Beyond Relooper" (ICFP 2022) and lowers instructions with a `local.tee`
+//!    peephole. Irreducible CFGs fall back to a dispatch loop.
 //!
-//! Anything more aggressive (cross-block local sinking, value-carrying blocks,
-//! local reordering for LEB size) is left to `wasm-opt`.
+//! More expensive size passes (cross-block sinking, value-carrying blocks,
+//! local frequency sorting) are left to `wasm-opt`.
 
 use cranelift_codegen::ir::{self, ExternalName, LibCall, Signature, UserExternalName};
 use wasm_encoder::ValType;
@@ -79,78 +74,62 @@ pub(crate) fn unsupported<T>(msg: impl Into<String>) -> Result<T> {
     Err(Error::Unsupported(msg.into()))
 }
 
-/// Code generation settings, in three groups.
+/// Code generation settings.
 #[derive(Debug, Clone, Default)]
 pub struct Config {
-    /// Facts about the wasm module the code will be placed in. They must
-    /// match how the embedder builds that module.
+    /// Target module layout; must match the surrounding wasm module.
     pub module: ModuleLayout,
-    /// Wasm features the engine that runs the code supports.
+    /// Wasm features supported by the target engine.
     pub engine: EngineFeatures,
-    /// Optimizations. They change how good the output is, never what it
-    /// does; turning one off is for benchmarking and debugging.
+    /// Output-quality switches (all enabled by default).
     pub opts: Optimizations,
 }
 
-/// Facts about the wasm module that will contain the compiled functions.
+/// Layout of the wasm module that will contain compiled functions.
 #[derive(Debug, Clone, Default)]
 pub struct ModuleLayout {
-    /// Whether the linear memory uses 64-bit addresses (memory64). This
-    /// decides the wasm type of load/store addresses and of the shadow stack
-    /// pointer. IR addresses of the other width are converted.
+    /// Whether linear memory uses 64-bit addresses (`memory64`), determining
+    /// the wasm type of addresses and the shadow stack pointer.
     pub memory64: bool,
-    /// Which linear memory loads and stores access. A module can have
-    /// several (the multi-memory feature); with one memory this is
-    /// `MemoryIndex(0)`.
+    /// Linear memory index accessed by loads and stores (`MemoryIndex(0)` in
+    /// single-memory modules).
     pub memory_index: MemoryIndex,
-    /// Which table `call_indirect` looks functions up in. Wasm has no raw
-    /// function pointers: a function "address" is an index into a table of
-    /// function references. With one table this is `Some(TableIndex(0))`. With
-    /// `None`, functions that use `call_indirect` are rejected.
+    /// Function table used by `call_indirect` (`Some(TableIndex(0))` in
+    /// single-table modules). When `None`, `call_indirect` is rejected.
     pub table_index: Option<TableIndex>,
-    /// A mutable global holding the shadow stack pointer. Stack slots must
-    /// live in linear memory, since wasm has no addressable stack; functions
-    /// that use them move this pointer down on entry and back on exit. The
-    /// stack grows downwards and the pointer is assumed to be 16-byte
-    /// aligned. With `None`, functions that need stack slots are rejected.
+    /// Mutable global holding the 16-byte-aligned, downward-growing shadow
+    /// stack pointer. When `None`, functions requiring stack slots are rejected.
     pub stack_pointer_global: Option<GlobalIndex>,
-    /// A mutable `i64` global standing in for Cranelift's pinned register
-    /// (`get_pinned_reg`/`set_pinned_reg`). With `None`, functions that use
-    /// it are rejected.
+    /// Mutable `i64` global backing `get_pinned_reg`/`set_pinned_reg`. When
+    /// `None`, functions using the pinned register are rejected.
     pub pinned_reg_global: Option<GlobalIndex>,
-    /// Base byte address in linear memory of a 256-byte (64 × `i32`) striped
-    /// spinlock table used to synchronize `i128` atomic operations. Must be
-    /// 4-byte aligned and disjoint from the program's data and shadow stack.
-    /// With `None`, functions that use `i128` atomics are rejected.
+    /// 4-byte-aligned byte address in linear memory of a 256-byte (64 × `i32`)
+    /// striped spinlock table for `i128` atomics, disjoint from program data
+    /// and the shadow stack. When `None`, `i128` atomics are rejected.
     pub atomic_lock_table_addr: Option<u64>,
-    /// A mutable global holding the base address of the current thread's
-    /// thread-local storage block (`__tls_base` in the wasm tool
-    /// conventions). `tls_value` adds a symbol's offset in that block to it.
-    /// With `None`, functions that use `tls_value` are rejected.
+    /// Mutable global holding the current thread's TLS base address
+    /// (`__tls_base`). When `None`, `tls_value` is rejected.
     pub tls_base_global: Option<GlobalIndex>,
-    /// Produce code for a relocatable object file (the wasm [tool
-    /// conventions] for linking) instead of a finished module.
+    /// Emit code for a relocatable object file ([WebAssembly linking
+    /// conventions]) instead of a finished module.
     ///
-    /// The indices that [`Env`] returns and the global and table indices in
-    /// this struct then name entries of the object's symbol table (type
-    /// indices still name the object's type section), and every use of one is
-    /// encoded with a padded LEB and recorded in [`CompiledFunction::relocs`].
-    /// [`crate::object`] builds such objects.
+    /// Indices returned by [`Env`] and globals/tables in this struct then refer
+    /// to symbol table entries (type indices still refer to the type section),
+    /// encoded as padded LEB128s and recorded in [`CompiledFunction::relocs`].
+    /// See [`crate::object`].
     ///
-    /// [tool conventions]: https://github.com/WebAssembly/tool-conventions/blob/main/Linking.md
+    /// [WebAssembly linking conventions]: https://github.com/WebAssembly/tool-conventions/blob/main/Linking.md
     pub relocatable: bool,
-    /// Return more than one wasm value through memory, the way LLVM's wasm
-    /// backend does: a function whose results (after splitting `i128` and
-    /// `f128` into two `i64`s) are more than one gets a hidden first
-    /// parameter pointing to space for them, laid out like a C struct (each
-    /// result at the next multiple of its size), and returns nothing. This
-    /// is needed to call, or be called by, code compiled by LLVM. When off,
-    /// multiple results use multi-value returns.
+    /// Demote multi-value returns to a hidden first pointer parameter (LLVM's
+    /// Basic C ABI for WebAssembly). When enabled, functions returning more
+    /// than one wasm value (after splitting `i128`/`f128`) write results to a
+    /// caller-provided C-layout return area and return nothing. When disabled,
+    /// wasm multi-value returns are used.
     pub demote_multi_results: bool,
 }
 
 impl ModuleLayout {
-    /// The wasm type of addresses.
+    /// Wasm value type for memory addresses.
     pub(crate) fn ptr_ty(&self) -> ValType {
         if self.memory64 {
             ValType::I64
@@ -160,12 +139,11 @@ impl ModuleLayout {
     }
 }
 
-/// Wasm features the generated code may use.
+/// Wasm features available in the target engine.
 #[derive(Debug, Clone)]
 pub struct EngineFeatures {
-    /// Tail calls (`return_call`). Without them, a Cranelift tail call
-    /// becomes an ordinary call followed by a return, which is correct but
-    /// grows the call stack.
+    /// Emit wasm tail calls (`return_call` / `return_call_indirect`). When
+    /// false, tail calls lower to a normal call followed by `return`.
     pub tail_calls: bool,
 }
 
@@ -175,22 +153,21 @@ impl Default for EngineFeatures {
     }
 }
 
-/// Optimization switches; all are on by default.
+/// Codegen optimization switches (all enabled by default).
 #[derive(Debug, Clone)]
 pub struct Optimizations {
-    /// Pass single-use values on the operand stack, by building expression
-    /// trees (see `expr_trees.rs`). When off, every value goes through a
-    /// local (constants are still rematerialized).
+    /// Fold single-use values into expression trees on the operand stack
+    /// (`expr_trees.rs`). When false, every non-constant value uses a local.
     pub stack_values: bool,
-    /// Try to give a block argument and the parameter it is passed to the
-    /// same local, so that the move disappears.
+    /// Coalesce block arguments with target block parameters into a shared
+    /// local to eliminate moves.
     pub coalesce: bool,
     /// Fuse `local.set x; local.get x` into `local.tee x`.
     pub use_tee: bool,
 }
 
 impl Optimizations {
-    /// Every optimization switched off.
+    /// Disable all optional optimizations.
     pub fn none() -> Self {
         Optimizations {
             stack_values: false,
@@ -243,52 +220,47 @@ impl std::fmt::Display for Name<'_> {
     }
 }
 
-/// The value of a `symbol_value`, or for `tls_value` the symbol's offset
-/// from the thread-local storage base.
+/// Resolved value of a `symbol_value` or TLS offset for `tls_value`.
 #[derive(Debug, Clone, Copy)]
 pub enum SymbolValue {
-    /// A link-time constant address.
+    /// Link-time constant address or offset.
     Const(u64),
-    /// An address held in a wasm global.
+    /// Address held in a wasm global.
     Global(GlobalIndex),
-    /// With [`ModuleLayout::relocatable`]: the address of the data symbol
-    /// with this index in the object's symbol table, filled in by the linker.
+    /// Data symbol index in the object's symbol table (for
+    /// [`ModuleLayout::relocatable`]).
     Symbol(u32),
 }
 
-/// The module environment: resolves references from a function to entities
-/// in the surrounding wasm module.
+/// Resolves external references from a function to entities in the surrounding
+/// wasm module.
 pub trait Env {
-    /// The wasm function index of a direct callee.
+    /// Wasm function index (or symbol index when relocatable) of a direct callee.
     fn func_index(&mut self, name: Name<'_>) -> Result<FuncIndex>;
 
-    /// The wasm type index of a signature, for `call_indirect`.
+    /// Wasm type index of a signature for `call_indirect`.
     fn type_index(&mut self, sig: &Signature) -> Result<TypeIndex> {
         let _ = sig;
         Err(Error::Env("call_indirect requires Env::type_index".into()))
     }
 
-    /// The value of `func_addr`: the function's slot in the indirect call
-    /// table. With [`ModuleLayout::relocatable`], the index of the
-    /// function's symbol instead.
+    /// Function table slot for `func_addr`, or function symbol index when
+    /// [`ModuleLayout::relocatable`] is set.
     fn func_table_slot(&mut self, name: Name<'_>) -> Result<u64> {
         Err(Error::Env(format!(
             "func_addr {name} requires Env::func_table_slot"
         )))
     }
 
-    /// The value of `symbol_value`.
+    /// Value of `symbol_value` (or TLS offset for `tls_value`).
     fn symbol_value(&mut self, name: Name<'_>) -> Result<SymbolValue> {
         Err(Error::Env(format!(
             "symbol_value {name} requires Env::symbol_value"
         )))
     }
 
-    /// The wasm tag index of a Cranelift exception tag, for the handlers of
-    /// `try_call`. The tag's parameters are the exception payload of the
-    /// callee's calling convention: two pointer-sized integers (`i64`, or
-    /// `i32` if the handlers' payload values are `i32`). Exceptions are
-    /// thrown by the embedder's runtime with wasm `throw`.
+    /// Wasm tag index for a `try_call` exception handler. The tag carries two
+    /// pointer-sized integers matching the calling convention's payload.
     fn exception_tag(&mut self, tag: ir::ExceptionTag) -> Result<TagIndex> {
         Err(Error::Env(format!(
             "exception tag {tag} requires Env::exception_tag"
@@ -296,35 +268,33 @@ pub trait Env {
     }
 }
 
-/// A compiled function: its wasm type, locals and encoded body.
+/// A compiled wasm function.
 #[derive(Debug, Clone)]
 pub struct CompiledFunction {
     pub params: Vec<ValType>,
     pub results: Vec<ValType>,
-    /// Declared locals (excluding parameters), run-length encoded.
+    /// Non-parameter locals, run-length encoded.
     pub locals: Vec<(u32, ValType)>,
-    /// The encoded instruction sequence, including the final `end`.
+    /// Encoded instruction bytes, including the trailing `end`.
     pub body: Vec<u8>,
-    /// With [`ModuleLayout::relocatable`], the relocations in `body`.
+    /// Code relocations within `body` when [`ModuleLayout::relocatable`] is set.
     pub relocs: Vec<Reloc>,
 }
 
-/// A relocation in a function body, for [`ModuleLayout::relocatable`].
-///
-/// The field is a padded LEB (5 bytes, or 10 for the 64-bit kinds) holding a
-/// placeholder.
+/// A relocation in [`CompiledFunction::body`] (5-byte or 10-byte padded LEB128,
+/// or fixed-width immediate).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reloc {
-    /// Byte offset of the field in [`CompiledFunction::body`].
+    /// Byte offset of the relocatee within [`CompiledFunction::body`].
     pub offset: u32,
     pub kind: RelocKind,
-    /// The symbol index, or for [`RelocKind::TypeIndexLeb`] the type index.
+    /// Symbol table index (or type section index for [`RelocKind::TypeIndexLeb`]).
     pub index: u32,
-    /// Added to the symbol's address (memory address kinds only).
+    /// Addend added to the symbol's address (memory-address kinds only).
     pub addend: i64,
 }
 
-/// Relocation types of the wasm tool conventions, with their numbers.
+/// Relocation type codes from the WebAssembly linking conventions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum RelocKind {
@@ -346,7 +316,7 @@ pub enum RelocKind {
 }
 
 impl RelocKind {
-    /// Whether the relocation has an addend.
+    /// Whether this relocation kind carries an addend in the binary format.
     pub fn has_addend(self) -> bool {
         use RelocKind::*;
         matches!(
@@ -362,7 +332,7 @@ impl RelocKind {
 }
 
 impl CompiledFunction {
-    /// Build a `wasm_encoder::Function` for the code section.
+    /// Convert into a `wasm_encoder::Function` for a code section.
     pub fn to_wasm_function(&self) -> wasm_encoder::Function {
         let mut f = wasm_encoder::Function::new(self.locals.iter().copied());
         f.raw(self.body.iter().copied());
@@ -370,15 +340,13 @@ impl CompiledFunction {
     }
 }
 
-/// Map a Cranelift scalar type to the wasm value type that represents it.
+/// Map a Cranelift type to its representing wasm value type.
 ///
-/// `i8` and `i16` values live in `i32`s and are kept zero-extended. Vectors
-/// are `v128`s; one narrower than 128 bits occupies the low bytes, and the
-/// other bytes are unspecified.
+/// `i8`, `i16`, and `f16` live zero-extended in `i32`. Vectors up to 128 bits
+/// map to `v128` (narrower vectors occupy the low bytes).
 pub fn wasm_type(ty: ir::Type) -> Result<ValType> {
     use cranelift_codegen::ir::types;
     Ok(match fixed_type(ty) {
-        // An f16 is its bits, like an i16.
         types::I8 | types::I16 | types::I32 | types::F16 => ValType::I32,
         types::I64 => ValType::I64,
         types::F32 => ValType::F32,
@@ -402,9 +370,8 @@ pub fn wasm_type(ty: ir::Type) -> Result<ValType> {
     })
 }
 
-/// The fixed-size type of a dynamic vector type such as `i32x4*gv0`, or
-/// `ty` itself. Dynamic vectors have a target-chosen multiple of a fixed
-/// size; here that multiple is 1, so they are plain vectors.
+/// Map a dynamic vector type (e.g. `i32x4*gv0`) to its fixed-size base vector
+/// (scale 1), or return `ty` unchanged.
 pub(crate) fn fixed_type(ty: ir::Type) -> ir::Type {
     if ty.is_dynamic_vector() {
         ty.dynamic_to_vector().unwrap_or(ty)
@@ -413,10 +380,8 @@ pub(crate) fn fixed_type(ty: ir::Type) -> ir::Type {
     }
 }
 
-/// The wasm signature of a Cranelift signature.
-///
-/// An `i128` or `f128` parameter or return value becomes two `i64`s, low half
-/// first.
+/// Map a Cranelift signature to wasm parameter and result types, splitting each
+/// `i128` or `f128` into two `i64`s (low half first).
 pub fn wasm_signature(sig: &Signature) -> Result<(Vec<ValType>, Vec<ValType>)> {
     let lower = |ps: &[ir::AbiParam]| -> Result<Vec<ValType>> {
         let mut out = Vec::with_capacity(ps.len());
@@ -432,9 +397,8 @@ pub fn wasm_signature(sig: &Signature) -> Result<(Vec<ValType>, Vec<ValType>)> {
     Ok((lower(&sig.params)?, lower(&sig.returns)?))
 }
 
-/// The wasm signature of a function with IR signature `sig` in a module laid
-/// out as `layout`: [`wasm_signature`], after moving multiple results into
-/// memory if [`ModuleLayout::demote_multi_results`] says so.
+/// Like [`wasm_signature`], also applying [`ModuleLayout::demote_multi_results`]
+/// when enabled in `layout`.
 pub fn wasm_signature_in(
     sig: &Signature,
     layout: &ModuleLayout,

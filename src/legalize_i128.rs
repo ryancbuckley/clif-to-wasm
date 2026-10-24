@@ -1,47 +1,31 @@
-//! Legalization of `i128` and `f128` into pairs of `i64`.
+//! Legalization of `i128` and `f128` into `(lo, hi)` pairs of `i64`.
 //!
-//! This is an IR-to-IR pass that runs before everything else, so the rest of
-//! the backend never sees `i128` or `f128`. Every 128-bit scalar value becomes
-//! a `(lo, hi)` pair of `i64` values: in signatures (an `i128` or `f128`
-//! parameter or return becomes two `i64`s, low half first; see
-//! [`crate::wasm_signature`]), block parameters, branch arguments, calls and
-//! returns.
+//! Runs as an IR-to-IR pass before the rest of the pipeline so later passes
+//! never see 128-bit scalars. Every `i128` or `f128` value becomes two `i64`s
+//! (low half first) across signatures (see [`crate::wasm_signature`]), block
+//! parameters, branch arguments, calls, and returns.
 //!
-//! ## Why `f128` is represented as two `i64`s
+//! ## `f128` representation
 //!
-//! Surprisingly, Cranelift's own `x64`, `aarch64`, and `riscv64` backends do
-//! not implement `f128` arithmetic (`fadd.f128`, `fmul.f128`, etc.) either —
-//! only `s390x` has hardware IEEE `binary128` instructions, while other targets
-//! rely on compiler-builtins libcalls (`__addtf3`, `__multf3`, ...) for math
-//! and only need Cranelift to move 128-bit floats around (`f128const`,
-//! `load`/`store`, `bitcast`, `select`, bitwise ops, `fneg`/`fabs`/`fcopysign`,
-//! and function/block arguments). Representing `f128` as a `(lo, hi)` pair of
-//! `i64`s (identical to `riscv64`'s `ty_reg_pair` representation) therefore
-//! supports the exact same `f128` operations as Cranelift's mainstream native
-//! backends while keeping the full 128-bit IEEE `binary128` bit pattern intact.
+//! Like Cranelift's `x64`, `aarch64`, and `riscv64` backends, this backend
+//! delegates IEEE `binary128` arithmetic to `compiler-builtins` libcalls
+//! (`__addtf3`, `__multf3`, etc.) and supports moving and inspecting `f128`
+//! values (`f128const`, `load`/`store`, `bitcast`, `select`, bitwise ops,
+//! `fneg`/`fabs`/`fcopysign`, and function/block arguments).
 //!
 //! ## `i128` operations
 //!
-//! Most `i128` operations expand into straight-line `i64` code:
-//!
-//! - add/sub propagate a carry computed with an unsigned compare;
-//! - multiply is `lo*lo` plus the cross products in the high half, using
-//!   `umulhi.i64`;
-//! - shifts and rotates select between the "amount < 64" and "amount >= 64"
-//!   results, so no branches are needed;
-//! - ordered comparisons compare the high halves, and the low halves
-//!   (unsigned) when the high halves are equal;
-//! - conversions from integers to floats round the top 64 significant bits
-//!   to odd (a sticky bit) before converting, which gives correct rounding.
-//!
-//! Division and remainder become a small shift-subtract loop: the block is
-//! split at the division and 128 iterations of a restoring division run in
-//! between.
-//!
-//! Atomic `i128` operations (`atomic_load`, `atomic_store`, `atomic_cas`,
-//! `atomic_rmw`) expand into a spinlock-protected sequence of two `i64` atomic
-//! accesses, hashing the target address into a 64-entry striped `i32` lock
-//! table at [`crate::ModuleLayout::atomic_lock_table_addr`].
+//! - **Arithmetic & logic:** add/sub propagate an unsigned-compare carry;
+//!   multiply combines `lo * lo`, `umulhi(lo, lo)`, and cross products; shifts
+//!   and rotates branchlessly `select` between `amt < 64` and `amt >= 64`;
+//!   ordered comparisons compare high halves first and low halves when equal.
+//! - **Float conversions:** integer-to-float normalizes the top 64 significant
+//!   bits and rounds lower bits to odd (sticky bit) before converting.
+//! - **Division / remainder:** splits the block around a 128-step restoring
+//!   shift-subtract loop.
+//! - **Atomics:** splits the block around a 64-entry striped `i32` spinlock
+//!   table at [`crate::ModuleLayout::atomic_lock_table_addr`] guarding the two
+//!   `i64` atomic accesses.
 
 use crate::{Result, unsupported};
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
@@ -880,24 +864,16 @@ impl Legalizer<'_> {
         }
     }
 
-    /// Expand an `i128` atomic operation into a spinlock-protected pair of
-    /// `i64` atomic accesses.
+    /// Expand an `i128` atomic operation into two `i64` atomic accesses guarded
+    /// by a striped spinlock in linear memory:
     ///
-    /// WebAssembly's threads proposal only provides atomic instructions up to
-    /// 64 bits (`i64.atomic.*`). To make 128-bit atomic loads, stores, RMWs,
-    /// and compare-exchanges linearizable with respect to each other, we split
-    /// the current block around a striped spinlock in linear memory:
-    ///
-    /// 1. In `orig`, compute the high-half address (`addr + 8`) and hash `addr`
-    ///    into one of 64 `i32` lock words (`table_base + ((addr >> 2) & 0xfc)`),
-    ///    then jump to `spin`.
-    /// 2. In `spin`, `atomic_cas.i32(lock_addr, 0, 1)`; loop back to `spin` if
-    ///    the old value was non-zero, otherwise enter `cont`.
-    /// 3. In `cont`, perform the two 64-bit halves using `atomic_load.i64` /
-    ///    `atomic_store.i64` (preserving the instruction's `MemFlags` so that
-    ///    `lower_atomic` byte-swaps each half on `big` endianness and traps on
-    ///    unaligned addresses), release the lock with `atomic_store.i32(0)`,
-    ///    and replace `inst` with the resulting `(lo, hi)` pair.
+    /// 1. In `orig`, compute `lo_addr`/`hi_addr` and hash `addr` to a lock word
+    ///    (`table_base + ((addr >> 2) & 0xfc)`), then jump to `spin`.
+    /// 2. In `spin`, loop on `atomic_cas.i32(lock_addr, 0, 1)` until 0 is
+    ///    observed, then branch to `cont`.
+    /// 3. In `cont`, perform the two `i64` atomic accesses (preserving
+    ///    `MemFlags`), release the lock with `atomic_store.i32(0)`, and replace
+    ///    `inst` with the resulting `(lo, hi)` pair.
     fn atomic(
         &mut self,
         inst: Inst,

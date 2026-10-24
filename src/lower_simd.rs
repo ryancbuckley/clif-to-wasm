@@ -1,24 +1,23 @@
-//! Lowering of 128-bit vector instructions to wasm SIMD.
+//! Lowering of vector instructions to wasm SIMD.
 //!
-//! Most Cranelift vector operations have a direct wasm counterpart. The
-//! others are emulated:
+//! Most Cranelift vector operations map directly to wasm SIMD. Operations
+//! without a direct counterpart are emulated:
 //!
 //! - `imul.i8x16` and `umulhi`/`smulhi`: widening multiplies (`extmul`) of
-//!   the low and high halves, then a shuffle that picks the low or high half
-//!   of each product.
-//! - `iadd_pairwise`: shuffles that gather the even and the odd lanes of
-//!   both inputs, then an add.
-//! - `i64x2` unsigned comparisons and min/max: flip the sign bits and use
-//!   the signed comparison; min/max then `bitselect` on the comparison.
-//! - `uunarrow`: clamp each lane with an unsigned min, then a narrowing
-//!   that would otherwise treat the input as signed.
-//! - `popcnt` of 16- and 32-bit lanes: byte popcounts summed pairwise.
+//!   the low and high halves, followed by a shuffle picking the low or high
+//!   half of each product.
+//! - `iadd_pairwise`: shuffles gathering the even and odd lanes of both inputs,
+//!   followed by an add.
+//! - `i64x2` unsigned comparisons and min/max: flip the sign bits and use the
+//!   signed comparison; min/max then `bitselect` on the comparison mask.
+//! - `uunarrow`: clamp each lane with an unsigned min before narrowing.
+//! - `popcnt` on 16-, 32-, and 64-bit lanes: byte popcounts summed pairwise.
 //!
-//! Vectors narrower than 128 bits (`i32x2`, `i8x4`, ...) live in the low
-//! bytes of a `v128`, and the other bytes are unspecified. Lane-wise
-//! operations ignore them; the few that look across lanes (`vall_true`,
-//! `vany_true`, `vhigh_bits`, `iadd_pairwise`, the `*widen_high` and
-//! narrowing operations), loads and stores account for the lane count.
+//! Vectors narrower than 128 bits (`i32x2`, `i8x4`, ...) occupy the low bytes
+//! of a `v128` with upper bytes unspecified. Lane-wise operations ignore the
+//! upper bytes; cross-lane operations (`vall_true`, `vany_true`, `vhigh_bits`,
+//! `iadd_pairwise`, `*widen_high`, and narrowing ops), loads, and stores
+//! account for the active lane count.
 
 use crate::emit::Emitter;
 use crate::locals::Local;

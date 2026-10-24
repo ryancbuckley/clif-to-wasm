@@ -1,26 +1,17 @@
-//! Structured control flow, following Norman Ramsey, "Beyond Relooper:
-//! recursive translation of unstructured control flow to structured control
-//! flow" (ICFP 2022).
+//! Control-flow structuring via Norman Ramsey's "Beyond Relooper" (ICFP 2022).
 //!
-//! The translation is driven by the dominator tree. A block `x` is emitted
-//! as:
+//! Translates the dominator tree into structured wasm control flow using an
+//! explicit task stack ([`Task`]). Each block `x` is emitted as:
 //!
-//! - wrapped in a `loop` if it is the target of a back edge;
-//! - with one nested `block` for each dominator-tree child of `x` that is a
-//!   *merge node* (has two or more forward in-edges). The children are
-//!   placed after the `end` of their block in reverse postorder, so a forward
-//!   branch to a merge node is a `br` out of the enclosing block;
-//! - other children, which have a single in-edge, are emitted inline at
-//!   their unique branch.
+//! - a `loop` wrapper if `x` is a back-edge target;
+//! - one nested `block` per dominator-tree child of `x` that is a *merge node*
+//!   (≥ 2 forward in-edges), ordered so each merge child follows the `end` of
+//!   its enclosing `block` in RPO;
+//! - single-predecessor children emitted inline at their unique incoming branch.
 //!
-//! All values crossing block boundaries are in locals, so every wasm `block`,
-//! `loop` and `if` has type `[] -> []`.
-//!
-//! The recursion in the paper is turned into an explicit task stack
-//! ([`Task`]) so that long chains of blocks cannot overflow the native stack.
-//!
-//! If the CFG is irreducible, the whole function is instead emitted as a
-//! loop around a `br_table` that dispatches on a label local.
+//! Values crossing block boundaries live in locals, so every `block`, `loop`,
+//! and `if` has type `[] -> []`. Irreducible CFGs fall back to a single
+//! `loop` + `br_table` dispatcher on a label local.
 
 use crate::analysis::{FuncInfo, same_call};
 use crate::emit::Emitter;
@@ -369,8 +360,8 @@ impl Structurer<'_> {
             })
             .collect();
 
-        // The payload: the calling convention's, with pointer-sized values
-        // as wide as the handlers say (i64 if none uses them).
+        // Exception payload types come from the calling convention, using the
+        // pointer width expected by the handlers (`i64` if none read it).
         let exn_ty = |call: &BlockCall| {
             let params = dfg.block_params(call.block(pool));
             call.args(pool)

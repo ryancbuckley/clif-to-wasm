@@ -1,13 +1,14 @@
-//! Differential testing on arbitrary control-flow graphs: unlike `fuzz.rs`,
-//! whose functions come from structured statements, these are built block by
-//! block, so they contain irreducible loops, branches whose two arms go to the
-//! same block with different arguments, and block arguments that permute the
-//! target's parameters (swaps, rotations). Results from Cranelift's
-//! interpreter and from wasmtime running this backend's output must agree.
+//! Differential testing on arbitrary control-flow graphs.
 //!
-//! Every block `H_i(fuel, p...)` checks a fuel counter before running its body
-//! `B_i`, and returns its parameters once fuel runs out, so every execution
-//! terminates.
+//! Unlike `fuzz.rs`, which generates structured statements, this test builds
+//! functions block by block—producing irreducible loops, conditional branches
+//! whose arms target the same block with different arguments, and block-argument
+//! permutations (swaps and rotations). Execution results must match between
+//! `cranelift-interpreter` and Wasmtime.
+//!
+//! Every block `H_i(fuel, p...)` decrements a fuel counter before entering its
+//! body `B_i` and returns its parameters once fuel reaches zero, guaranteeing
+//! termination.
 
 mod harness;
 

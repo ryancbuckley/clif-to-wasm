@@ -1,110 +1,79 @@
-//! Expression trees: which values are passed on wasm's operand stack instead
-//! of through locals.
+//! Expression tree building (*stack scheduling* / LLVM *RegStackify*).
 //!
-//! An expression tree is a root instruction plus the single-use definitions
-//! folded into it, emitted together so that each folded result is pushed
-//! right before the instruction that consumes it. This is what the
-//! literature calls *stack scheduling*, and what LLVM's WebAssembly backend
-//! calls *RegStackify* (`WebAssemblyRegStackify.cpp`).
-//!
-//! It is not the control-flow "stackifier" (LLVM's CFGStackify, or Yuri
-//! Iozzelli's Stackifier algorithm): placing `block`/`loop` markers is a
-//! different problem, solved here in `structure.rs` with Ramsey's
-//! algorithm.
-//!
-//! # Prior art
-//!
-//! - The overall shape (walk each block bottom-up, visit operands in
-//!   reverse, move single-use definitions next to their use) follows LLVM's
-//!   RegStackify. LLVM checks that a move is safe by scanning the
-//!   instructions in between.
-//! - Side-effect *colors* come from Cranelift's own lowering, where a load
-//!   may merge into its user only if no side effect lies between them (equal
-//!   colors).
-//! - The rule below, which lets one tree absorb several effectful
-//!   definitions with an O(1) check each, and the rule for conditional
-//!   operands, are specific to this crate. They are checked by differential
-//!   fuzzing against Cranelift's interpreter, not by a published proof.
+//! Folds single-use definitions into their consumer within a basic block so
+//! values flow on the wasm operand stack instead of through locals. (This is
+//! distinct from control-flow structuring such as *CFGStackify* / *Stackifier*,
+//! which is handled in `structure.rs`.)
 //!
 //! # Algorithm
 //!
-//! Each block is walked backwards. Every live instruction that is not a
-//! rematerialized constant starts as a *root* (`root_of[i] = Some(i)`). For
-//! each root, its operands are visited in reverse emission order (the operand
-//! stack is LIFO), depth-first, and an operand's defining instruction `d` is
-//! folded into the tree (`root_of[d] = Some(root)`) when:
+//! Walk each block bottom-up. Every live non-constant instruction starts as a
+//! *root* (`root_of[i] = Some(i)`). For each root, visit its operands in
+//! reverse push order (LIFO) depth-first, folding an operand's defining
+//! instruction `d` into the tree (`root_of[d] = Some(root)`) when:
 //!
-//! - `d` is in the same block, has a single result, and that result has a
-//!   single use;
-//! - `d` is not a rematerialized constant (those are emitted at every use
-//!   anyway); and
-//! - if `d` has a side effect (including trapping and reading memory), the
-//!   move does not reorder it with another side effect.
+//! 1. `d` is in the same block, has one result, and has `use_count == 1`;
+//! 2. `d` is not a rematerialized constant; and
+//! 3. if `d` is effectful (traps, loads, stores, calls, etc.), folding does not
+//!    reorder it across another effectful instruction.
 //!
-//! The last check is O(1). `color[i]` is the number of effectful instructions
-//! before `i` in its block. Folding effectful `d` into the tree rooted at `r`
-//! moves `d` to just before the part of the tree built so far. It is safe iff
-//! every effectful instruction between `d` and `r` has already been moved
-//! into this tree (and therefore sits after `d`'s new position, in the same
-//! relative order). Because trees are grown backwards, those are exactly the
-//! effectful instructions counted so far, so the condition is
-//! `color[r] - color[d] - 1 == moved`.
+//! Condition 3 is checked in O(1) using effect colors: `color[i]` counts the
+//! effectful instructions before `i` in its block. Folding effectful `d` into
+//! `r` is valid iff every effectful instruction between `d` and `r` has already
+//! been folded into `r`'s tree (`color[r] - color[d] - 1 == moved`).
 //!
-//! Operands that are only evaluated on some paths (block arguments of a
-//! conditional branch) only accept trees without side effects, since folding
-//! would make an unconditional effect conditional.
+//! Conditional operands (block arguments of multi-way branches or `try_call`)
+//! are evaluated only on the taken edge, so they reject effectful trees to
+//! avoid making unconditional effects conditional.
 
 use crate::analysis::{FuncInfo, has_lowering_side_effect, is_remat};
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::{Function, Inst, Opcode, Value, ValueDef};
 
-/// Emission recurses over trees, so bound their depth.
+/// Maximum tree depth (bounds recursion in `Emitter::value`).
 const MAX_TREE_DEPTH: u32 = 100;
 
 pub(crate) struct ExprTrees {
-    /// For every emitted instruction (roots and inlined nodes): the root of
-    /// the expression tree containing it. A root maps to `Some(itself)`;
-    /// dead instructions and rematerialized constants map to `None`.
+    /// Maps each emitted instruction to the root of its expression tree.
+    /// Roots map to `Some(self)`; dead and rematerialized instructions map to `None`.
     root_of: SecondaryMap<Inst, Option<Inst>>,
 }
 
 impl ExprTrees {
-    /// Is `inst` the root of an emitted expression tree?
+    /// Whether `inst` is the root of an emitted expression tree.
     pub fn is_root(&self, inst: Inst) -> bool {
         self.root_of[inst] == Some(inst)
     }
 
-    /// Is `inst` folded into another instruction's expression tree?
+    /// Whether `inst` is folded into another instruction's expression tree.
     pub fn is_inlined(&self, inst: Inst) -> bool {
         self.root_of[inst].is_some_and(|r| r != inst)
     }
 
-    /// The root of the tree containing `inst`, or `None` if `inst` is dead or
-    /// rematerialized.
+    /// Root of the tree containing `inst`, or `None` if dead or rematerialized.
     pub fn root(&self, inst: Inst) -> Option<Inst> {
         self.root_of[inst]
     }
 }
 
-/// An operand in emission order. `conditional` operands are only evaluated on
-/// some of the paths out of the instruction.
+/// An instruction operand in stack push order.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Operand {
     pub value: Value,
+    /// True if evaluated only on a subset of outgoing paths.
     pub conditional: bool,
 }
 
-/// The operands of `inst` in the order they are pushed. This is the single
-/// source of truth for evaluation order: tree building assumes it, and
-/// lowering takes its operands from this list one by one
-/// ([`crate::emit::Emitter::operand`]).
+/// Append `inst`'s operands to `out` in wasm stack push order.
 ///
-/// The exception is branches (`jump`, `brif`, `br_table`, `try_call`), which
-/// `structure.rs` emits itself: the condition, index or call arguments
-/// first, then each edge's arguments inside that edge's arm. Only those
-/// first operands can hold side effects, because the arguments of a
-/// multi-way branch or of a `try_call` (evaluated after the call) only
-/// accept pure trees, so the order among the arguments does not matter.
+/// This is the single source of truth for operand evaluation order: tree
+/// building and [`crate::emit::Emitter::operand`] both consume it.
+///
+/// Branches (`jump`, `brif`, `br_table`, `try_call`) are emitted directly by
+/// `structure.rs`: the condition/selector/call args are evaluated first, and
+/// each edge's block arguments are evaluated inside that edge's branch arm.
+/// Multi-way branch and `try_call` edge arguments are marked `conditional` so
+/// they only fold pure trees.
 pub(crate) fn operands(func: &Function, info: &FuncInfo, inst: Inst, out: &mut Vec<Operand>) {
     out.clear();
     let dfg = &func.dfg;

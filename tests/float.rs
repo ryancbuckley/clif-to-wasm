@@ -1,6 +1,6 @@
-//! The emulated floating point (`f16`, and `fma` via round-to-odd), checked
-//! against independent references: exhaustively where the inputs allow it,
-//! and on random and crafted inputs elsewhere.
+//! Tests for emulated floating-point operations (`f16` and `fma` on `f16`,
+//! `f32`, and `f64`) against independent reference implementations—exhaustively
+//! where feasible, and on random and targeted edge cases otherwise.
 
 mod harness;
 

@@ -1,20 +1,19 @@
-//! Relocatable wasm object files, as defined by the wasm [tool conventions]
-//! and consumed by `wasm-ld` and `wild`.
+//! Relocatable wasm object files, following the WebAssembly [linking conventions]
+//! consumed by `wasm-ld` and `wild`.
 //!
-//! An [`ObjectBuilder`] collects symbols — functions, data, and the globals
-//! and tables a linker provides (such as `__stack_pointer` and
-//! `__indirect_function_table`) — and the definitions of some of them.
-//! Functions are compiled with [`crate::ModuleLayout::relocatable`] set, with
-//! an [`crate::Env`] that answers with symbol indices; [`ObjectBuilder::finish`]
-//! then assigns the final indices, fills in the placeholders, and writes the
-//! `linking` and `reloc.*` sections. Undefined functions, globals and tables
-//! become imports from `env`, as LLVM writes them.
+//! [`ObjectBuilder`] collects symbols (functions, data, and linker-provided
+//! globals and tables such as `__stack_pointer` and
+//! `__indirect_function_table`) along with their definitions. Functions are
+//! compiled with [`crate::ModuleLayout::relocatable`] enabled and an
+//! [`crate::Env`] that returns symbol indices. [`ObjectBuilder::finish`] then
+//! assigns final indices, patches placeholders, and writes the `linking` and
+//! `reloc.*` custom sections. Undefined functions, globals, and tables become
+//! imports from `"env"` (unless overridden via [`ObjectBuilder::import_function`]).
 //!
-//! The data of an object lives in its own address space: segments are laid
-//! out one after the other from address 0, and relocated fields hold
-//! addresses in that space until the linker moves them.
+//! Data segments are laid out sequentially from address 0 in the object's own
+//! address space; relocated fields hold provisional addresses until linked.
 //!
-//! [tool conventions]: https://github.com/WebAssembly/tool-conventions/blob/main/Linking.md
+//! [linking conventions]: https://github.com/WebAssembly/tool-conventions/blob/main/Linking.md
 
 use crate::{CompiledFunction, RelocKind};
 use std::collections::HashMap;

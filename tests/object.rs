@@ -1,11 +1,10 @@
-//! Relocatable objects written through `WasmObjectModule`, linked with
-//! `wasm-ld` (rustup's `rust-lld`) and run in wasmtime.
+//! Tests relocatable objects emitted by [`WasmObjectModule`], linked with
+//! `wasm-ld` (`rust-lld`), and executed in Wasmtime.
 //!
-//! Two objects reference each other's functions and data; together they
-//! cover calls, `func_addr` + `call_indirect`, data relocations (data and
-//! function pointers), stack slots (`__stack_pointer`), demoted multi-value
-//! returns and argument extension. The test is skipped if `rust-lld` cannot
-//! be found (set `RUST_LLD` to point at it).
+//! Two objects reference each other's functions and data, covering direct and
+//! indirect calls, data and function-pointer relocations, stack slots
+//! (`__stack_pointer`), demoted multi-value returns, and argument extension.
+//! Linking is skipped if `rust-lld` is unavailable (set `RUST_LLD` to override).
 
 use cranelift_codegen::ir::{
     AbiParam, ArgumentExtension, InstBuilder, MemFlagsData, Signature, StackSlotData,

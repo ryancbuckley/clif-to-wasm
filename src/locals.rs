@@ -1,38 +1,35 @@
-//! Live-range analysis and local allocation for values that are not consumed
-//! directly from the operand stack.
+//! Live-range analysis and local allocation for non-inlined SSA values.
 //!
 //! # Live ranges
 //!
-//! Every root instruction gets a position in reverse postorder, with extra
-//! positions for each block's start and end. A value's live range is a sorted
-//! list of non-overlapping half-open [`Segment`]s (at most two per block),
-//! found by walking predecessors backwards from each use up to the definition.
+//! Each root instruction receives a position in RPO, with extra positions for
+//! block starts and ends. A value's live range is a sorted list of
+//! non-overlapping half-open [`Segment`]s (at most two per block), built by
+//! walking predecessors backward from each use to the definition.
 //!
-//! Two conventions make block-argument moves cheap to coalesce, and
-//! [`Locals::move_needed`] relies on them:
+//! Two conventions make block-argument moves cheap to coalesce (relied on by
+//! [`Locals::move_needed`]):
 //!
-//! - A block parameter is defined by the terminator of each predecessor:
-//!   there it is live from the terminator to the block end, not before.
-//! - Segments are half-open at a single instruction: a value whose last use
-//!   is at position `p` does not conflict with a value defined at `p`. An
-//!   instruction reads all its operands before writing its results, and
-//!   block-argument moves push every argument before setting any parameter.
+//! - A block parameter is defined at each predecessor's terminator, so in a
+//!   predecessor it is live only from the terminator to the block end.
+//! - Segments are half-open (`[lo, hi)`): a value whose last use is at `p`
+//!   does not overlap a value defined at `p`, because instructions and parallel
+//!   block-argument moves read all inputs before writing any outputs.
 //!
-//! Consequently, a value whose last use is a branch argument does not
-//! conflict with the parameter it is passed to, allowing both to share a
-//! single local.
+//! Thus a branch argument at its last use can share a local with the target
+//! block parameter.
 //!
 //! # Coloring
 //!
-//! Values are colored greedily in order of their first live position,
-//! separately for each wasm [`ValType`]. Each value tries, in order:
+//! Values are colored greedily by start position per wasm [`ValType`], trying
+//! in order:
 //!
-//! 1. the local of a *move partner* (an argument or parameter paired with it
-//!    in a block-argument move), so that the move disappears;
-//! 2. a local whose segments all end at or before this value's start, tracked
-//!    with a min-heap of end positions;
+//! 1. a *move partner*'s local (an argument or parameter paired with this value
+//!    in a block-argument move), eliminating the move;
+//! 2. an expired local whose segments all end at or before this value's start
+//!    (tracked via a min-heap);
 //! 3. up to [`SCAN_LIMIT`] recently allocated locals whose segments do not
-//!    overlap this value's segments (reusing holes in live ranges);
+//!    overlap this value's segments (reusing live-range holes);
 //! 4. a fresh local.
 
 use crate::analysis::FuncInfo;
@@ -88,13 +85,12 @@ impl Locals {
         self.num_params + self.decls.len() as u32
     }
 
-    /// Must the block-argument move `param := arg` be emitted?
+    /// Whether the block-argument move `param := arg` must be emitted.
     ///
-    /// Not when both are in the same local. That is safe because a branch
-    /// pushes all its (needed) arguments before setting any parameter, and
-    /// because two values in one local never overlap: no other argument of
-    /// the same branch can be in that local, and no other parameter of the
-    /// target either (they are all defined at the same terminator).
+    /// Returns false when both share a local. This is safe even in parallel
+    /// moves because all needed arguments are pushed before any parameter is
+    /// written, and non-overlapping live ranges guarantee that no other
+    /// argument or parameter of the same branch shares that local.
     pub fn move_needed(&self, arg: Value, param: Value) -> bool {
         let la = self.local_of[arg];
         la == Local::NONE || la != self.local_of[param]

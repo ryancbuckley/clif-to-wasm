@@ -1,32 +1,29 @@
-//! Floating-point operations that wasm lacks natively (`f16` and `fma`),
-//! plus shared floating-point comparison lowering for scalars and vectors.
+//! Lowering for floating-point operations that wasm lacks natively (`f16` and
+//! `fma`), plus shared scalar and vector floating-point comparison lowering.
 //!
-//! An `f16` is represented by its bits, zero-extended in an `i32`. Loads,
-//! stores, bitcasts and `select` handle it like an `i16`; `fneg`, `fabs`
-//! and `fcopysign` are bit operations. Everything else converts to `f32`,
-//! which holds every `f16` exactly, computes there and rounds back:
+//! An `f16` is stored as its bit pattern zero-extended in an `i32`. Loads,
+//! stores, bitcasts, and `select` treat it as an `i16`; `fneg`, `fabs`, and
+//! `fcopysign` are bit operations. All other operations promote to `f32`
+//! (which holds every `f16` value exactly), compute there, and round back:
 //!
-//! - Comparisons, `fmin`/`fmax` and the rounding operations give exact
-//!   results in `f32`.
-//! - For `+`, `-`, `*`, `/` and `sqrt`, rounding to `f32` and then to `f16`
-//!   gives the correctly rounded `f16` result, because `f32` has at least
+//! - Comparisons, `fmin`/`fmax`, and rounding operations are exact in `f32`.
+//! - For `+`, `-`, `*`, `/`, and `sqrt`, rounding to `f32` and then to `f16`
+//!   produces the single-rounded `f16` result because `f32` has at least
 //!   `2 * 11 + 2` significand bits (Figueroa, "When is double rounding
 //!   innocuous?", 1995).
 //!
-//! Rounding to `f16` starts from an `f64`, so that `fdemote.f16` of an
-//! `f64` rounds once.
+//! Rounding to `f16` operates on `f64` so `fdemote.f16` from `f64` rounds once.
 //!
-//! `fma` on `f32` and `f16` computes in `f64`: the product of two such
-//! values is exact there, and the sum is rounded *to odd* (truncated, with
-//! the last bit set if anything was lost). A round-to-odd result with at
-//! least two more bits than the target rounds to the correctly rounded
-//! target result (Boldo and Melquiond, "Emulation of FMA and correctly
-//! rounded sums: proved algorithms using rounding to odd", 2008).
+//! `fma` on `f32` and `f16` computes in `f64`: the product is exact there, and
+//! the sum is rounded *to odd* (truncated, with the LSB set if any bit was
+//! lost). A round-to-odd result with at least two extra precision bits rounds
+//! to the exact target result (Boldo and Melquiond, "Emulation of FMA and
+//! correctly rounded sums: proved algorithms using rounding to odd", 2008).
 //!
-//! `fma` on `f64` (and `f64x2`) unpacks finite non-zero operands into
-//! 53-bit integer significands, computes the exact 106-bit product in a
-//! 128-bit `(lo, hi)` pair, aligns and adds/subtracts the third operand with
-//! a sticky bit, and rounds once to nearest-even.
+//! `fma` on `f64` (and `f64x2`) unpacks finite non-zero operands into 53-bit
+//! integer significands, computes the exact 106-bit product in a 128-bit
+//! `(lo, hi)` pair, aligns and adds/subtracts the addend with a sticky bit,
+//! and rounds once to nearest-even.
 
 use crate::emit::Emitter;
 use crate::locals::Local;

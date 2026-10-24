@@ -1,60 +1,146 @@
 # clif-to-wasm
 
-A WebAssembly backend for [Cranelift](https://cranelift.dev): it compiles a
+A WebAssembly backend for [Cranelift](https://cranelift.dev) that compiles a
 Cranelift IR `Function` into a wasm function body.
 
-The motivating use case is a JIT that itself runs inside wasm and emits wasm
-for the host to compile again. Compile speed therefore matters more than code
-size. The host's optimizing tier undoes most local-heavy code anyway, and
-`wasm-opt` can shrink the output when size matters.
+The primary use case is a JIT running inside wasm that emits wasm for the host
+to compile. Compile speed matters more than code size: optimizing host tiers
+rebuild SSA from locals anyway, and `wasm-opt` can shrink the output when size
+matters.
 
-This is not a Cranelift `TargetIsa`. Cranelift's machine backends are built
-around register allocation, which a stack machine with unlimited locals does
-not need. The backend works directly on the IR instead.
+This is not a Cranelift `TargetIsa`. Cranelift's machine backends center on
+register allocation, which a stack machine with unlimited locals does not need.
+This backend operates directly on Cranelift IR.
 
 ## Pipeline
 
 | Pass | File | What it does | Switch |
 |------|------|--------------|--------|
-| Prepare & Legalize | `src/legalize_i128.rs` | Scans once for value aliases and `i128`/`f128`; when present, clones the function, resolves aliases, and rewrites 128-bit scalar values into `(lo, hi)` pairs of `i64` (signatures, block params, calls) before anything else runs | |
-| Analysis | `src/analysis.rs` | RPO, deduplicated CFG edges, dominators, loop headers, merge nodes, reducibility, and single-pass backwards value/instruction liveness + use counts | |
-| Expression trees | `src/expr_trees.rs` | Greedy backwards tree building: a single-use def in the same block is folded into its user unless that would reorder side effects. The check is O(1) using Cranelift-style side-effect colors. Constants are rematerialized at every use. `operands()` here defines evaluation order for every later pass | `stack_values` |
-| Locals | `src/locals.rs` | Builds per-block live-range segments for values that need a local, collects block-argument moves, and performs greedy coloring per wasm type. A value first tries its move partner's local (argument ↔ parameter), so most block-argument moves disappear | `coalesce` |
-| Structure | `src/structure.rs` | Ramsey's "Beyond Relooper" (ICFP 2022) over the dominator tree, run with an explicit task stack in `Structurer`. Irreducible CFGs fall back to a `loop` + `br_table` dispatcher | |
-| Emit | `src/emit.rs` | Function prologue/epilogue (shadow stack and narrow parameter masking), value emission, operand cursor, scoped LIFO scratch locals, and byte encoding with a `local.set x; local.get x` → `local.tee x` peephole | `use_tee` |
-| Lower | `src/lower.rs`, `src/lower_simd.rs`, `src/lower_atomic.rs`, `src/lower_float.rs` | One case per opcode. Vector operations, atomics, and emulated floating point (`f16`, `fma`, and shared scalar/vector `FloatCC` lowering) have their own modules | |
+| Prepare & Legalize | `src/legalize_i128.rs`, `src/legalize_abi.rs` | Scans once for value aliases, `i128`/`f128`, and multi-result ABI demotion; when needed, clones the function, resolves aliases, splits 128-bit scalars into `(lo, hi)` `i64` pairs, and rewrites multi-result signatures to use a return-area pointer | `demote_multi_results` |
+| Analysis | `src/analysis.rs` | Computes RPO, deduplicated CFG edges, dominators, loop headers, merge nodes, reducibility, and single-pass backward liveness and use counts | |
+| Expression trees | `src/expr_trees.rs` | Folds single-use defs into their user within a block when side-effect order is preserved (checked in O(1) via effect colors). Rematerializes constants at each use. `operands()` defines the evaluation order for all later passes | `stack_values` |
+| Locals | `src/locals.rs` | Builds per-block live-range segments for non-inlined values, collects block-argument moves, and greedily colors locals per wasm type. Move partners (argument ↔ parameter) try each other's local first to eliminate most moves | `coalesce` |
+| Structure | `src/structure.rs` | Runs Ramsey's "Beyond Relooper" (ICFP 2022) over the dominator tree using an explicit task stack. Irreducible CFGs fall back to a `loop` + `br_table` dispatcher | |
+| Emit | `src/emit.rs` | Emits the prologue/epilogue (shadow stack and narrow parameter masking), values, scoped LIFO scratch locals, and instructions with a `local.set x; local.get x` → `local.tee x` peephole | `use_tee` |
+| Lower | `src/lower.rs`, `src/lower_simd.rs`, `src/lower_atomic.rs`, `src/lower_float.rs` | Lowers each opcode to wasm. Vector ops, atomics, and emulated floats (`f16`, `fma`, and `FloatCC`) live in dedicated modules | |
 
-Cross-module contracts are each stated in one place:
+Cross-module contracts are each defined in one place:
 
-- **Evaluation order:** `expr_trees::operands` defines it, and lowering pulls
-  operands from it through `Emitter::operand`. Branches are the one
-  documented exception.
-- **When a block-argument move can be skipped:** `Locals::move_needed`
-  depends on the live-range conventions documented in `locals.rs`.
+- **Evaluation order:** `expr_trees::operands` defines it; lowering pulls
+  operands in order via `Emitter::operand` (branches are the one documented
+  exception).
+- **Skipping block-argument moves:** `Locals::move_needed` relies on the
+  live-range conventions documented in `locals.rs`.
 
-The safety condition for folding into a tree: `color[i]` counts the effectful
-instructions before `i` in its block. An effectful def `d` may join the tree
-rooted at `r` iff `color[r] - color[d] - 1` equals the number of effectful
-defs already moved into that tree. Block arguments of multi-way branches
-accept only pure trees, so an unconditional effect never becomes conditional.
+Tree-folding safety: `color[i]` counts effectful instructions before `i` in its
+block. An effectful def `d` may fold into the tree rooted at `r` iff
+`color[r] - color[d] - 1` equals the number of effectful defs already folded
+into that tree. Multi-target branches only fold pure trees into block arguments
+so unconditional effects never become conditional.
 
-### Representation choices
+### Example
 
-- `i8`/`i16` live in `i32` locals and are always kept zero-extended. Ops that
-  can dirty the high bits mask their result; signed ops sign-extend inputs.
-- `f16` lives in an `i32` as its bits, zero-extended like an `i16`.
-- Vectors narrower than 128 bits live in the low bytes of a `v128`; the other
-  bytes are unspecified. Dynamic vectors are treated as their fixed-size
-  type (a scale of 1).
-- Big-endian loads and stores reverse bytes, since wasm memory is
-  little-endian.
-- Every value that crosses a block boundary lives in a local. All
-  `block`/`loop`/`if` are `[] -> []`.
-- Block-argument moves push every argument before setting any parameter, so
-  parallel moves (swaps) need no temporaries.
-- Stack slots live on a shadow stack in linear memory, through a
-  stack-pointer global (`ModuleLayout::stack_pointer_global`).
-- Traps become `unreachable`; trap codes are not preserved.
+Given this CLIF function (`cargo run --example clif2wat -- file.clif`):
+
+```text
+function %dot_step(i32, i32, i32) -> i32 {
+block0(v0: i32, v1: i32, v2: i32):
+    v3 = iconst.i32 0
+    jump block1(v3, v2)                    ; acc = 0, n = v2
+
+block1(v4: i32, v5: i32):                  ; loop header: acc, n
+    brif v5, block2, block4(v4)
+
+block2:                                    ; loop body
+    v6 = load.i32 v0
+    v7 = load.i32 v1
+    v8 = imul v6, v7
+    v9 = iconst.i32 0
+    v10 = icmp slt v8, v9
+    brif v10, block3, block5(v8)
+
+block3:
+    v11 = ineg v8
+    jump block5(v11)
+
+block5(v12: i32):                          ; |v6 * v7|
+    v13 = iadd v4, v12
+    v14 = iconst.i32 1
+    v15 = isub v5, v14
+    jump block1(v13, v15)
+
+block4(v16: i32):
+    return v16
+}
+```
+
+the backend emits:
+
+```wasm
+(func (param i32 i32 i32) (result i32)
+  (local i32 i32 i32)
+  i32.const 0              ;; jump block1(v3, v2): push all args,
+  local.get 2              ;;   then set parameters in reverse.
+  local.set 3              ;;   n  := v2      (local 3)
+  local.set 2              ;;   acc := 0      (local 2, reusing dead param v2)
+  loop                     ;; block1 is a loop header
+    local.get 3
+    if                     ;; brif v5
+      block                ;; block5 is a merge node: a `block` ending before it
+        local.get 0
+        i32.load           ;; v6, v7, v8 fold into one expression tree
+        local.get 1
+        i32.load
+        i32.mul
+        local.tee 4        ;; v8 has multiple uses, so it gets a local
+        i32.const 0        ;; constant v9 is rematerialized inline
+        i32.lt_s
+        if                 ;; brif v10
+          local.get 4      ;; block3 has one predecessor: emitted inline
+          i32.const -1
+          i32.mul          ;; ineg
+          local.set 5      ;; v12 := v11
+          br 1             ;; branch to end of `block` = block5
+        else
+          local.get 4
+          local.set 5      ;; v12 := v8
+          br 1
+        end
+      end
+      local.get 2          ;; block5: v13 and v15 fold into the jump's
+      local.get 5          ;; arguments, needing no locals of their own
+      i32.add
+      local.get 3
+      i32.const 1
+      i32.sub
+      local.set 3          ;; n := v15 (coalesced in place)
+      local.set 2          ;; acc := v13
+      br 1                 ;; back edge to loop
+    else
+      local.get 2          ;; block4 inline
+      local.tee 4
+      return
+    end
+  end
+  unreachable
+)
+```
+
+### Representation
+
+- `i8` and `i16` live in `i32` locals, kept zero-extended. Operations that can
+  dirty upper bits mask their result; signed operations sign-extend inputs.
+- `f16` lives in an `i32` local as zero-extended raw bits.
+- Vectors narrower than 128 bits occupy the low bytes of a `v128`; upper bytes
+  are unspecified. Dynamic vectors are treated as fixed-size (scale 1).
+- Big-endian loads and stores byte-swap, as wasm memory is little-endian.
+- Values crossing block boundaries live in locals. Every `block`, `loop`, and
+  `if` has block type `[] -> []`.
+- Block-argument moves push all arguments before setting any parameter, so
+  parallel swaps need no temporaries.
+- Stack slots use a shadow stack in linear memory via
+  `ModuleLayout::stack_pointer_global`.
+- Traps emit `unreachable`; trap codes are dropped.
 
 ## Usage
 
@@ -76,22 +162,21 @@ let compiled = compile_function(&func, &Config::default(), &mut MyEnv)?;
 let wasm_fn: wasm_encoder::Function = compiled.to_wasm_function();
 ```
 
-`ModuleBuilder` (`src/module.rs`) assembles a complete module whose indices
-agree with your `Config` and `Env` answers. It handles both kinds of module:
-- **Self-contained** modules define their own memory and globals, plus a
-  funcref table where slot `i` holds function `i`. The tests use this.
-- **Modules linked into a running program**, as a JIT running inside wasm
-  needs. Such a module imports the program's memory, table and stack pointer
-  global, and `place_in_table` puts its functions in free slots of that table.
-  `tests/module.rs` walks through this case.
+`ModuleBuilder` (`src/module.rs`) assembles a complete wasm module whose
+indices match your `Config` and `Env`:
+- **Self-contained modules** define their own memory, globals, and a `funcref`
+  table where slot `i` holds function `i` (used by the test suite).
+- **Dynamically linked modules** (e.g., for an in-wasm JIT) import the host's
+  memory, table, and stack-pointer global, and use `place_in_table` to populate
+  free table slots. See `tests/module.rs`.
 
 `Config` has three groups of settings:
 
 | Group | Fields | Meaning |
 |---|---|---|
-| `module: ModuleLayout` | `memory64`, `memory_index`, `table_index`, `stack_pointer_global`, `pinned_reg_global`, `atomic_lock_table_addr` | Facts about the module the code goes in; they must match how the embedder builds it. |
-| `engine: EngineFeatures` | `tail_calls` | Wasm features the engine supports. Without tail calls, `return_call` falls back to call + return. |
-| `opts: Optimizations` | `stack_values`, `coalesce`, `use_tee` | Output-quality switches, all on by default; `Optimizations::none()` turns them all off. |
+| `module: ModuleLayout` | `memory64`, `memory_index`, `table_index`, `stack_pointer_global`, `tls_base_global`, `pinned_reg_global`, `atomic_lock_table_addr`, `relocatable`, `demote_multi_results` | Target module layout; must match the embedder's module definition. |
+| `engine: EngineFeatures` | `tail_calls` | Engine feature support. When false, `return_call` lowers to `call` + `return`. |
+| `opts: Optimizations` | `stack_values`, `coalesce`, `use_tee` | Codegen optimizations (all enabled by default; `Optimizations::none()` disables all). |
 
 For example, `config.module.stack_pointer_global = Some(sp)` enables stack
 slots, `config.module.table_index = Some(t)` enables `call_indirect`,
@@ -100,140 +185,127 @@ and `config.opts.coalesce = false` disables move coalescing.
 
 ### Relocatable objects and `cranelift-module`
 
-With `ModuleLayout::relocatable`, the backend emits code for a relocatable
-wasm object (the [tool conventions] that `wasm-ld` and `wild` link): `Env`
-answers with symbol indices, and every function index, global, table, type,
-data address, table slot and TLS offset is a padded LEB recorded in
-`CompiledFunction::relocs`. `object::ObjectBuilder` (`src/object.rs`) collects
-symbols and definitions and writes the object, with its `linking`,
-`reloc.CODE`/`reloc.DATA` and `target_features` sections, importing
-`__linear_memory`, `__stack_pointer`, `__indirect_function_table` and
-`__tls_base` from `env` as LLVM does.
+When `ModuleLayout::relocatable` is enabled, the backend emits code for a
+relocatable wasm object following the [WebAssembly linking conventions] used by
+`wasm-ld` and `wild`: `Env` returns symbol indices, and function, global, table,
+type, data-address, table-slot, and TLS-offset immediates are encoded as
+5-byte padded LEB128s recorded in `CompiledFunction::relocs`.
+`object::ObjectBuilder` (`src/object.rs`) collects symbols and definitions and
+writes the object file—including `linking`, `reloc.CODE`, `reloc.DATA`, and
+`target_features` sections—while importing `__linear_memory`,
+`__stack_pointer`, `__indirect_function_table`, and `__tls_base` from `env` to
+match LLVM.
 
-The `module` feature adds `object_module::WasmObjectModule`, a
-`cranelift_module::Module` that compiles each function it is given into such
-an object. `rustc_codegen_cranelift` uses it to compile Rust to wasm (see the
-playground in `../browser_rust_playground`). Cranelift has no wasm
-`TargetIsa`, and one cannot be implemented outside cranelift-codegen, so the
-frontend is given Pulley's ISA of the same pointer width
-(`object_module::frontend_isa`).
+The `module` Cargo feature adds `object_module::WasmObjectModule`, a
+`cranelift_module::Module` implementation that compiles functions into a
+relocatable wasm object (used by `rustc_codegen_cranelift` to compile Rust to
+wasm). Because Cranelift has no wasm `TargetIsa` and `TargetIsa` is sealed to
+`cranelift-codegen`, `object_module::frontend_isa` supplies a Pulley ISA of the
+matching pointer width for frontend queries.
 
-[tool conventions]: https://github.com/WebAssembly/tool-conventions/blob/main/Linking.md
+[WebAssembly linking conventions]: https://github.com/WebAssembly/tool-conventions/blob/main/Linking.md
 
 ### Calling convention
 
-To link with code compiled by LLVM (such as Rust's standard library), calls
-follow LLVM's wasm ABI:
+Calls follow LLVM's Basic C ABI for WebAssembly so output can link with
+LLVM-compiled code (such as Rust's standard library):
 
-- Narrow (`i8`/`i16`) arguments and returns marked `sext` are sign-extended
-  by the caller (arguments) or callee (returns); `uext` ones are already
-  zero-extended. Narrow call results are masked, since callees may return
-  garbage in the upper bits when the signature does not say otherwise.
-- By-value struct arguments (`ArgumentPurpose::StructArgument`) are copied
-  into the caller's frame and passed by address.
-- With `ModuleLayout::demote_multi_results`, a function with more than one
-  wasm result (after splitting `i128`/`f128`) instead takes a hidden first
-  parameter pointing to the results, laid out like a C struct, and returns
-  nothing (`src/legalize_abi.rs`). Without it, multiple results use
-  multi-value.
+- Narrow (`i8`/`i16`) arguments and returns marked `sext` are sign-extended by
+  the caller (arguments) or callee (returns); `uext` values are already
+  zero-extended. Narrow call results without `uext` are masked because callees
+  may leave garbage in high bits.
+- By-value struct arguments (`ArgumentPurpose::StructArgument`) are copied into
+  the caller's stack frame and passed by pointer.
+- With `ModuleLayout::demote_multi_results`, functions returning multiple wasm
+  values (after splitting `i128`/`f128`) instead take a hidden first pointer to
+  a C-layout return area and return nothing (`src/legalize_abi.rs`). Otherwise,
+  wasm multi-value returns are used.
 
-## Supported
+## Supported features
 
-Scalar `i8`–`i64`, `f32` and `f64`: integer and float arithmetic, bit ops
-(on floats too), shifts and rotates, comparisons, `select`/`bitselect`,
-conversions (including saturating ones to `i8`/`i16`), arithmetic with an
-overflow flag (`*_overflow`, with carry or borrow in), loads and stores (all
-widths, negative offsets, either byte order), stack slots, `call`,
-`call_indirect`, `return_call(_indirect)`, `func_addr`, `symbol_value`,
-`br_table`, traps, `get_stack_pointer`/`get_frame_pointer`, and the pinned
-register (as a global, `ModuleLayout::pinned_reg_global`).
+**Scalars (`i8`–`i64`, `f32`, `f64`):** integer and float arithmetic, bitwise
+ops (including on floats), shifts and rotates, comparisons, `select`/`bitselect`,
+conversions (including saturating `fcvt_to_{s,u}int_sat` to `i8`/`i16`),
+overflow-flag arithmetic (`*_overflow`, `*_overflow_cin`, `*_overflow_bin`,
+`*_overflow_trap`), loads and stores (all widths, negative offsets, little- and
+big-endian), stack slots, `call`, `call_indirect`, `return_call(_indirect)`,
+`func_addr`, `symbol_value`, `tls_value`, `br_table`, traps,
+`get_stack_pointer`/`get_frame_pointer`, and the pinned register (via
+`ModuleLayout::pinned_reg_global`).
 
-Atomics (`src/lower_atomic.rs`) use the wasm threads proposal's
-instructions: loads, stores, `fence`, compare-exchange, and the
-read-modify-writes that wasm has (`add`, `sub`, `and`, `or`, `xor`,
-`xchg`). `nand`, `umin`/`umax`/`smin`/`smax` and big-endian
-read-modify-writes become a compare-exchange loop. `i128` atomics
-(`atomic_load`, `atomic_store`, `atomic_cas`, `atomic_rmw`) expand in
-`src/legalize_i128.rs` into a spinlock-protected pair of `i64` atomic
-accesses using a 64-entry striped `i32` lock table at
+**Atomics (`src/lower_atomic.rs`):** uses wasm threads instructions for loads,
+stores, `fence`, compare-exchange, and native RMW ops (`add`, `sub`, `and`,
+`or`, `xor`, `xchg`). `nand`, `umin`/`umax`/`smin`/`smax`, and big-endian RMWs
+lower to a compare-exchange loop. `i128` atomics (`atomic_load`, `atomic_store`,
+`atomic_cas`, `atomic_rmw`) expand in `src/legalize_i128.rs` to two `i64`
+accesses guarded by a 64-entry striped `i32` spinlock table at
 `ModuleLayout::atomic_lock_table_addr`.
 
-`i128` and `f128` are supported by legalizing them into pairs of `i64`
-(`src/legalize_i128.rs`). At the wasm level an `i128` or `f128` parameter or
-result is two `i64`s, low half first. For `i128`, arithmetic, bitwise ops,
-shifts and rotates, comparisons, `select`, extensions and truncations,
-`clz`/`ctz`/`popcnt`/`cls`, `bswap`/`bitrev`, loads and stores, atomics,
-calls, block parameters, add and subtract with an overflow flag, and bitcasts
-to and from 128-bit vectors expand into `i64` code; division and remainder
-become a 128-iteration shift-subtract loop, and conversions from `i128` to
-floats are correctly rounded (round to odd, then convert). For `f128`, constants
-(`f128const`), loads, stores, calls, block parameters, `select`, bitwise ops,
-`fneg`/`fabs`/`fcopysign`, and bitcasts to and from `i128` and 128-bit vectors
-are supported — the same surface that Cranelift's own `x64`, `aarch64`, and
-`riscv64` backends implement (relying on compiler-rt libcalls for IEEE 754
-`binary128` arithmetic).
+**`i128` and `f128` (`src/legalize_i128.rs`):** legalized into `(lo, hi)` pairs
+of `i64`. For `i128`, arithmetic, bitwise ops, shifts, rotates, comparisons,
+`select`, extensions/truncations, `clz`/`ctz`/`popcnt`/`cls`, `bswap`/`bitrev`,
+loads/stores, atomics, calls, block parameters, overflow add/sub, and 128-bit
+vector bitcasts expand to `i64` ops; division and remainder use a 128-step
+shift-subtract loop; `i128`-to-float conversions round to odd in `i64` before
+converting to avoid double rounding. For `f128`, `f128const`, loads/stores,
+calls, block parameters, `select`, bitwise ops, `fneg`/`fabs`/`fcopysign`, and
+bitcasts to/from `i128` and 128-bit vectors are supported—matching Cranelift's
+`x64`, `aarch64`, and `riscv64` backends, which delegate `binary128` arithmetic
+to `compiler-rt` libcalls.
 
-Exceptions use wasm's exception handling. A `try_call` becomes a call
-inside a `try_table` whose `catch` clauses branch to one block per handler;
-`Env::exception_tag` maps each Cranelift exception tag to a wasm tag, whose
-payload is the calling convention's two pointer-sized values. A catch-all
-handler (`default`) cannot use the payload, since wasm's `catch_all` provides
-none. Throwing is up to the embedder's runtime (a wasm `throw`), as it is in
-Cranelift, where only a native unwinder can throw; so the upstream
-`throw.clif`, which uses that unwinder, is not supported.
+**Exceptions:** `try_call` and `try_call_indirect` lower to `try_table` blocks
+whose `catch` clauses target one block per handler. `Env::exception_tag` maps
+each CLIF exception tag to a wasm tag carrying two pointer-sized payload values.
+`default` (`catch_all`) handlers cannot access payloads because wasm's
+`catch_all` carries none. Throwing is performed by the embedder's runtime via
+wasm `throw` (so upstream `throw.clif`, which relies on Cranelift's native stack
+unwinder, is unsupported).
 
-`f16` and `fma` (`src/lower_float.rs`) are emulated, with correctly rounded
-results:
+**`f16` and `fma` (`src/lower_float.rs`):** emulated with exact IEEE 754
+rounding:
+- `f16` arithmetic promotes to `f32`, computes, and rounds back to `f16`
+  (provably free of double rounding for `+`, `-`, `*`, `/`, and `sqrt`).
+  `fneg`, `fabs`, and `fcopysign` manipulate bits directly.
+- `fma` on `f32` and `f16` (scalar and `f32x4`/`f32x2`) computes `a * b + c` in
+  `f64` using round-to-odd, then rounds once to the target type.
+- `fma` on `f64` (scalar and `f64x2`) unpacks finite non-zero operands into
+  53-bit significands, computes the exact 106-bit product as a 128-bit `(lo, hi)`
+  pair, aligns and adds `c` with a sticky bit, and rounds once to nearest-even.
 
-- `f16` arithmetic converts to `f32`, computes there and rounds back; for
-  `+`, `-`, `*`, `/` and `sqrt` that double rounding is provably harmless.
-  `fneg`, `fabs` and `fcopysign` are bit operations.
-- `fma` on `f32` and `f16` (scalar and `f32` vector lanes) computes the sum
-  in `f64` rounded to odd, then rounds once to the result type.
-- `fma` on `f64` (scalar and `f64x2` vector lanes) unpacks finite non-zero
-  operands into 53-bit integer significands, computes the exact 106-bit
-  product in a 128-bit `(lo, hi)` pair, aligns and adds/subtracts the third
-  operand with a sticky bit, and rounds once to nearest-even.
-
-Vectors of 128 bits (`i8x16`, `i16x8`, `i32x4`, `i64x2`, `f32x4`, `f64x2`)
-map to `v128` (`src/lower_simd.rs`); so do narrower ones (`i32x2`, `i8x8`,
-`f32x2`, `i16x2`, …) and dynamic ones. `f16x8` supports moving lanes
-around, not arithmetic. Most operations map to a single wasm SIMD
-instruction. These have no direct wasm counterpart and are emulated:
-
-- `imul.i8x16`, `umulhi`/`smulhi`: widening multiplies plus a shuffle; on
-  `i64x2`, the scalar algorithm per lane.
+**SIMD (`src/lower_simd.rs`):** 128-bit vectors (`i8x16`, `i16x8`, `i32x4`,
+`i64x2`, `f32x4`, `f64x2`), narrower vectors (`i32x2`, `i8x8`, `f32x2`, `i16x2`,
+etc.), and dynamic vectors map to `v128` (`f16x8` supports lane movement only).
+Operations without a direct 1-to-1 wasm instruction are emulated:
+- `imul.i8x16`, `umulhi`/`smulhi`: widening multiplies plus shuffles (or scalar
+  per lane on `i64x2`).
 - `iadd_pairwise`: two shuffles and an add.
-- `i64x2` unsigned comparisons and min/max: flip the sign bits.
-- Saturating add/subtract on 32/64-bit lanes: the wrapping result, with
-  overflowed lanes replaced. `avg_round` on them: `(a | b) - ((a ^ b) >> 1)`.
-  `sqmul_round_sat` on `i32x4`: 64-bit products.
-- `snarrow`/`unarrow`/`uunarrow`: clamp, then narrow (from `i64x2`, clamp
-  and shuffle).
-- `popcnt` of 16/32/64-bit lanes: byte popcounts summed pairwise.
+- `i64x2` unsigned comparisons and `umin`/`umax`: bias by flipping sign bits.
+- Saturating add/sub on 32/64-bit lanes: wrapping arithmetic with overflow
+  select. `avg_round`: `(a | b) - ((a ^ b) >> 1)`. `sqmul_round_sat.i32x4`:
+  widening 64-bit products.
+- `snarrow`/`unarrow`/`uunarrow`: clamp then narrow (or clamp and shuffle from
+  `i64x2`).
+- `popcnt` on 16/32/64-bit lanes: `i8x16.popcnt` summed pairwise.
 - `rotl`/`rotr`: two shifts and an `or`.
-- `i64x2` ↔ `f64x2` conversions: lane by lane through scalars.
-- Narrower vectors: the operations that see the unused bytes
-  (`vall_true`, `vany_true`, `vhigh_bits`, `iadd_pairwise`, widening the
-  high half, narrowing) account for the lane count.
+- `i64x2` ↔ `f64x2` conversions: scalar conversion per lane.
+- Narrow vectors: reductions and lane-combining ops (`vall_true`, `vany_true`,
+  `vhigh_bits`, `iadd_pairwise`, high-half widening, narrowing) mask or shift to
+  ignore unused upper lanes.
 
-Not yet supported (functions using these return `Error::Unsupported`):
-
-- `f128` arithmetic and conversions (matching Cranelift's x64/aarch64/riscv64
-  backends).
+**Unsupported** (returns `Error::Unsupported`):
+- `f128` arithmetic and conversions (handled via libcalls in Cranelift).
 - `umul_overflow`/`smul_overflow`/`umulhi`/`smulhi` on `i128`.
-- Big-endian vector loads and stores, and arithmetic on `f16` lanes.
-- `try_call` with `i128`/`f128` arguments, results or payloads; dynamic stack
+- Big-endian vector loads/stores and `f16` vector arithmetic.
+- `try_call` with `i128`/`f128` arguments, results, or payloads; dynamic stack
   slots; `get_return_address`.
-- In relocatable objects: `try_call` (exception tag relocations) and `i128`
-  atomics (the lock table needs an address); tail calls with by-value struct
-  arguments.
+- In relocatable objects: `try_call`, `i128` atomics, and tail calls with
+  by-value struct arguments.
 
 ## Testing
 
 ```sh
-cargo test --release                     # local CLIF runtests + differential fuzzing
-cargo test --release --features module   # also: relocatable objects linked with rust-lld
+cargo test --release                     # CLIF runtests + differential fuzzing
+cargo test --release --features module   # also tests relocatable objects with rust-lld
 FUZZ_ITERS=30000 cargo test --release --test fuzz -- --nocapture
 
 # Cranelift's upstream runtests (wasmtime v49.0.2 matches Cranelift 0.136.2):
@@ -247,112 +319,88 @@ cargo run --example clif2wat -- tests/clif/control.clif fib
 cargo run --example runclif  -- tests/clif/control.clif
 ```
 
-- `tests/clif/*.clif` are Cranelift filetests with `; run:` lines. Each one is
-  compiled, validated with `wasmparser` and executed in wasmtime under four
-  configs (default, no-tee, no-coalesce, memory64). As in Cranelift's own
-  runner, a run command calls the function it is attached to.
-- `tests/fuzz.rs` builds random functions with `cranelift-frontend`
-  (arithmetic, conversions, loads/stores, diamonds, loops, `br_table`,
-  traps, overflow flags) and runs them in `cranelift-interpreter` and as wasm, comparing
-  results or traps. Each seed gives three functions: scalar only, with
-  vector code, and with `i128` code.
-- `tests/simd_ops.rs` checks every vector operation on every vector type,
-  128-bit and narrower, with random inputs, against the interpreter.
-- `tests/float.rs` checks the emulated floating point against independent
-  references: `f16` conversions exhaustively (all 65,536 values, and every
-  rounding midpoint with its neighbors), `f16` arithmetic and `fma` against
-  exact arithmetic, and `f32` `fma` against `f32::mul_add`, including inputs
-  built to expose double rounding.
-- `tests/module.rs` links a JIT-style module into a host module, sharing the
-  host's memory, table and stack pointer, and calls across in both
-  directions.
-- `tests/object.rs` (`--features module`) writes two relocatable objects
-  through `WasmObjectModule`, links them with `rust-lld -flavor wasm` (found
-  through `rustc --print sysroot`, or `RUST_LLD`) and runs the result: calls
-  across objects, data and function pointer relocations, `call_indirect`,
-  stack slots, demoted multi-value returns and `sext` arguments.
-- The CLIF runtests also run with `demote_multi_results`.
-- The harness provides what upstream tests expect from an embedder:
-  libcalls (`CeilF32` and friends, compiled from CLIF), a pinned-register
-  global, atomics (wasmtime's `threads` feature), and exception tags. A
-  test throws by calling `%throw_tag<N>(i64, i64)`, which the harness
-  defines as a wasm `throw` (`tests/clif/exceptions.clif`).
-- Upstream runtests: 13,729 run commands pass and 0 fail; 393 of 395 files
-  are fully supported. The remaining two are `throw.clif` (which uses
-  Cranelift's native unwinder via `get_return_address`) and
-  `i128-conversion.clif`, an interpreter-only file (`test interpret` without
-  `test run`) that expects the interpreter's saturating float-to-`i128`
-  conversion where Cranelift's semantics (and this backend) give the exact
-  value or trap.
+- `tests/clif/*.clif`: Cranelift filetests with `; run:` directives, compiled,
+  validated with `wasmparser`, and executed in wasmtime across five configs
+  (default, no-tee, no-coalesce, memory64, and `demote_multi_results`).
+- `tests/fuzz.rs`: generates random functions with `cranelift-frontend`
+  (scalars, SIMD, and `i128`) and compares execution in `cranelift-interpreter`
+  against wasmtime. Reproduce or shrink a failure with `FUZZ_SEED=<n>`,
+  `FUZZ_BUDGET=<n>`, and `FUZZ_ONLY=scalar|simd|i128`.
+- `tests/cfg_fuzz.rs`: proptest suite that fuzzes `structure.rs` and `locals.rs`
+  on arbitrary reducible and irreducible CFGs with multi-parameter block
+  arguments, swaps, and unreachable blocks.
+- `tests/simd_ops.rs` and `tests/narrow_vectors.rs`: differential tests of all
+  vector operations across 128-bit and narrow vector types against the
+  interpreter, including with non-zero junk in unused upper bytes.
+- `tests/float.rs`: tests emulated `f16` conversions (exhaustively across all
+  65,536 bit patterns and rounding midpoints), `f16` arithmetic, and `f16`/`f32`/`f64`
+  `fma` against exact software references.
+- `tests/module.rs`: links a JIT module into a host module, sharing memory,
+  table, and stack pointer, and tests cross-module calls in both directions.
+- `tests/object.rs` (`--features module`): emits relocatable objects via
+  `WasmObjectModule`, links them with `rust-lld -flavor wasm`, and runs the
+  linked binary in wasmtime.
+- Upstream runtests: 13,729 run commands pass and 0 fail across 393 of 395
+  files. The two unsupported files are `throw.clif` (uses `get_return_address`
+  for native unwinding) and `i128-conversion.clif` (an interpreter-only test
+  expecting saturating float-to-`i128` behaviour where Cranelift specifies trap
+  on overflow).
 
-### Notes
+### Differential testing notes
 
-- The interpreter traps on `INT_MIN srem -1`, which Cranelift defines as 0.
-  The fuzzer avoids that case.
-- NaN bit patterns are nondeterministic in wasm, and the interpreter keeps
-  signaling NaNs that hardware quiets. Results compare all NaNs as equal,
-  per lane for float vectors. Wherever the fuzzer reinterprets float bits
-  as integers (stores, bitcasts, shuffles, bitwise ops), it canonicalizes
-  NaNs first.
-- The interpreter panics on `avg_round`, and on some operations on 16- and
-  32-bit vectors, so `simd_ops` skips those; `avg_round` is covered by the
-  upstream runtests. It also saturates float-to-`i128` conversions instead of
-  trapping, so the fuzzer does not generate those.
-- `iconst.i128` is not valid IR in this Cranelift version (the verifier
-  rejects it); generated `i128` constants are built with `iconcat`. The
-  backend still accepts `iconst.i128`, zero-extending the immediate like
-  Cranelift's x64 backend.
-- Tests originally ran on wasmi 2.0.0, which miscomputed one fuzz case that
-  V8 and the interpreter agree on. That is why execution now uses wasmtime.
+- `cranelift-interpreter` traps on `INT_MIN srem -1`, whereas Cranelift IR
+  defines it as `0`; the fuzzer avoids that input.
+- Wasm NaN payloads are nondeterministic and the interpreter preserves signaling
+  NaNs, so test comparisons treat all NaNs as equal (per lane for vectors) and
+  the fuzzer canonicalizes NaNs before bit-level operations.
+- The interpreter panics on `avg_round` and some 16/32-bit narrow vector ops,
+  and saturates trapping float-to-`i128` conversions, so differential tests skip
+  those cases (`avg_round` is tested by upstream runtests).
+- `iconst.i128` is rejected by Cranelift's verifier (tests use `iconcat`),
+  though the backend still supports it by zero-extending the immediate.
 
 ## Benchmarks
 
 ```sh
 cargo bench --bench codegen          # BENCH_QUICK=1 for a faster run
 UPSTREAM_RUNTESTS=wasmtime/cranelift/filetests/filetests/runtests cargo bench --bench codegen
-cargo run --release --example compile_loop   # compile the random corpus in a loop, for profiling
+cargo run --release --example compile_loop   # loop for profiling
 cargo run --example wasm2wat -- target/bench/kernels-default.wasm
 ```
 
-`benches/codegen.rs` compares a `naive` configuration (`opts.stack_values`
-and `opts.use_tee` off), a `no-coalesce` one and the default one on three
-corpora:
+`benches/codegen.rs` compares `naive` (`stack_values` and `use_tee` off),
+`no-coalesce`, and `default` configs across three corpora:
+- 9 kernels in `tests/harness/kernels.rs` (`fib_iter`, `sieve`, `matmul`,
+  `crc32`, `sort`, `mandel`, `collatz`, `dispatch`, `fib_rec`), verified against
+  the interpreter in `tests/kernels.rs`.
+- 1,000 random functions from `clifgen`.
+- Upstream Cranelift runtests (when `UPSTREAM_RUNTESTS` is set).
 
-- nine kernels in `tests/harness/kernels.rs` (fib, sieve, matmul, crc32,
-  insertion sort, mandelbrot, collatz, a `br_table` state machine, recursive
-  fib). They are built with `cranelift-frontend` the way a JIT would build
-  them. `tests/kernels.rs` checks them against the interpreter.
-- 1000 random functions from the fuzzer's generator.
-- Cranelift's upstream runtests, if `UPSTREAM_RUNTESTS` is set.
+It measures code size (bytes, locals, `local.*` counts), backend compile time,
+V8 compile time, and kernel execution time in wasmtime, V8 Liftoff
+(`--liftoff-only`), and V8 TurboFan (`--no-liftoff`).
 
-It reports:
+### Results (Node 26, wasmtime 49)
 
-- output size: bytes, locals and `local.*` ops;
-- the backend's own compile time;
-- kernel runtime in wasmtime, V8 Liftoff (`--liftoff-only`) and V8
-  TurboFan (`--no-liftoff`), the last two when `node` is on the `PATH`;
-- V8's compile time for the module.
+Output size across configurations (`naive` vs `no-coalesce` vs `default`):
 
-### Results (node 26, wasmtime 49)
+| corpus | variant | funcs | code bytes | locals | ops | `local.get` | `local.set` | `local.tee` |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| kernels | naive | 10 | 2,140 | 71 | 1,109 | 322 | 228 | 4 |
+| kernels | no-coalesce | 10 | 1,644 | 49 | 875 | 203 | 109 | 8 |
+| kernels | default | 10 | 1,636 | 49 | 871 | 201 | 107 | 8 |
+| random | naive | 1,000 | 1,567,654 | 18,497 | 788,081 | 202,839 | 136,274 | 12,562 |
+| random | no-coalesce | 1,000 | 1,240,502 | 13,524 | 628,425 | 122,788 | 56,223 | 13,008 |
+| random | default | 1,000 | 1,164,934 | 13,539 | 590,629 | 103,904 | 37,339 | 12,980 |
 
-Effect of precise live ranges plus move hints (default configuration,
-before → after):
+On the 1,000-function random corpus, `default` reduces code bytes by 26%,
+locals by 27%, `local.get` by 49%, and `local.set` by 73% compared to `naive`.
+Move coalescing alone (`no-coalesce` → `default`) eliminates 34% of `local.set`s
+and 6% of code bytes.
 
-| | random corpus | kernels |
-|---|---|---|
-| code bytes | 1,240,324 → 1,080,592 (−13%) | 1678 → 1636 |
-| locals | 26,968 → 12,282 (−54%) | 63 → 49 |
-| `local.get` | 128,546 → 92,772 (−28%) | 210 → 201 |
-| `local.set` | 70,171 → 34,397 (−51%) | 116 → 107 |
-| compile time | 57 → 64 µs/function (+12%) | |
+Kernel runtime (median ms):
 
-Of these gains, the move hints alone (`opts.coalesce` off vs. default, on 200 random
-functions) account for 33% fewer `local.set`s and 6% fewer bytes. The rest
-comes from the precise live ranges.
-
-Kernel runtime, median ms:
-
-| kernel | Liftoff naive | Liftoff default (before) | Liftoff default (now) | TurboFan default | wasmtime default |
+| kernel | Liftoff naive | Liftoff no-coalesce | Liftoff default | TurboFan default | wasmtime default |
 |---|---:|---:|---:|---:|---:|
 | fib_iter | 47.6 | 19.6 | 19.8 | 7.5 | 13.6 |
 | sieve | 4.9 | 3.7 | 3.8 | 1.9 | 2.6 |
@@ -364,27 +412,25 @@ Kernel runtime, median ms:
 | dispatch | 67.8 | 51.9 | 47.9 | 34.4 | 38.7 |
 | fib_rec | 5.2 | 5.3 | 5.3 | 2.8 | 2.8 |
 
-Findings:
-
-- Optimizing tiers (TurboFan, wasmtime/Cranelift) run naive and default
-  output at the same speed (within noise): they rebuild SSA from locals
-  anyway.
-- The baseline tier is where output quality matters. Expression trees make
-  Liftoff up to 2.4× faster than naive output (fib_iter), and coalescing
-  block-argument moves gives another 27% on collatz and 8% on dispatch.
-- The backend compiles about 4M CLIF instructions per second (≈250 ns per
-  instruction). Running binaryen.js `-O2` on the same small modules took
-  roughly 500–1000× longer than generating them.
-- Tried and dropped: sinking pure single-use values into later blocks so
-  they can join an expression tree. On these corpora it changed nothing
-  measurable.
+Key takeaways:
+- Optimizing tiers (TurboFan, wasmtime) run `naive` and `default` code at the
+  same speed because they reconstruct SSA from locals.
+- Baseline tiers (Liftoff) benefit heavily from output quality: expression trees
+  speed up `fib_iter` by 2.4×, and move coalescing cuts `collatz` runtime by
+  27% and `dispatch` by 8% (while eliminating 33% of `local.set`s across the
+  random corpus).
+- Compile throughput is ~4M CLIF instructions/s (~250 ns/instruction). Running
+  `binaryen.js -O2` on the same modules takes 500–1000× longer.
 
 ## Possible next steps
 
-- The unsupported operations listed above: `f64` `fma` (double-double
-  arithmetic), `f128` (software floating point).
-- Operand commutation and pre-passes that increase the number of
-  single-use values (as LLVM does).
-- Compile speed: the allocator, analysis and emission each take roughly a
-  third of the time. The main lever left is avoiding repeated
-  `operands()`/`value_def` work across passes.
+- Remaining unsupported operations (`i128` widening multiplies, `f128` software
+  arithmetic).
+- Operand commutation and pre-passes to expose more single-use expression trees.
+- Compile-speed tuning: local allocation, analysis, and emission each take ~1/3
+  of compile time; caching `operands()`/`value_def` lookups across passes is the
+  main remaining lever.
+
+## License
+
+Apache-2.0 WITH LLVM-exception, the same as Cranelift. See `LICENSE`.

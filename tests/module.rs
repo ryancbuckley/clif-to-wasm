@@ -1,7 +1,7 @@
-//! `ModuleBuilder` for a JIT running inside wasm: a "host" module owns the
-//! memory, the function table and the shadow stack pointer, and a "JIT"
-//! module compiled later imports them and adds its functions to free slots of
-//! the host's table.
+//! Tests [`ModuleBuilder`] in an in-wasm JIT layout: a "host" module defines
+//! linear memory, the function table, and the shadow stack pointer, while a
+//! separately compiled "JIT" module imports them and installs its functions
+//! into free slots of the host's table.
 
 mod harness;
 

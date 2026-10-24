@@ -114,7 +114,5 @@ fn main() {
 }
 
 fn truncate(s: &str) -> String {
-    // Collapse value numbers so that similar reasons group together.
-    let s: String = s.chars().take(90).collect();
-    s
+    s.chars().take(90).collect()
 }

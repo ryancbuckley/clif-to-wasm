@@ -1,19 +1,19 @@
 //! Code generation benchmarks.
 //!
-//! Reports, for the naive (no expression trees), no-coalesce and default
-//! configurations:
+//! Reports across the `naive` (no expression trees), `no-coalesce`, and
+//! `default` configurations:
 //!
-//! - static output metrics: code bytes, declared locals, `local.*` ops;
-//! - compile speed of this backend;
-//! - runtime of the kernels in wasmtime (Cranelift), and in V8's baseline
-//!   (Liftoff) and optimizing (TurboFan) tiers when `node` is available,
-//!   plus V8's compile time for the module.
+//! - static output metrics: code bytes, declared locals, and `local.*` ops;
+//! - compilation throughput of this backend;
+//! - kernel execution time in Wasmtime (Cranelift), and in V8's baseline
+//!   (Liftoff) and optimizing (TurboFan) tiers when `node` is installed,
+//!   along with V8 module compile time.
 //!
-//! Corpora: the kernels in `tests/harness/kernels.rs`, random functions
-//! from `tests/harness/clifgen.rs`, and Cranelift's upstream runtests if
-//! `UPSTREAM_RUNTESTS` points at them.
+//! Corpora: kernels from `tests/harness/kernels.rs`, random functions from
+//! `tests/harness/clifgen.rs`, and Cranelift's upstream runtests when
+//! `UPSTREAM_RUNTESTS` is set.
 //!
-//! `BENCH_QUICK=1` uses fewer repetitions and smaller corpora.
+//! Set `BENCH_QUICK=1` for fewer repetitions and smaller corpora.
 
 #[path = "../tests/harness/mod.rs"]
 mod harness;

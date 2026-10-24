@@ -32,23 +32,22 @@ pub(crate) struct FuncInfo {
     pub rpo: Vec<Block>,
     /// Position of each block in `rpo`, or [`RpoIndex::UNREACHABLE`].
     pub rpo_num: SecondaryMap<Block, RpoIndex>,
-    /// The distinct outgoing edges of each block's terminator. Two
-    /// `BlockCall`s are the same edge when they have the same target and the
-    /// same arguments; e.g. `brif v, b1(x), b1(x)` has one edge.
+    /// Distinct outgoing edges of each block's terminator (deduplicated by
+    /// target and arguments, e.g. `brif v, b1(x), b1(x)` is a single edge).
     pub dests: SecondaryMap<Block, Vec<BlockCall>>,
     /// Distinct reachable predecessor blocks.
     pub preds: SecondaryMap<Block, Vec<Block>>,
-    /// Number of forward edges (from a lower RPO number) into each block.
+    /// Number of forward edges (from a lower RPO index) into each block.
     pub forward_in: SecondaryMap<Block, u32>,
-    /// Does any back edge target this block?
+    /// Whether any back edge targets this block.
     pub loop_header: SecondaryMap<Block, bool>,
     pub domtree: DominatorTree,
-    /// Is every retreating edge a back edge to a dominator?
+    /// Whether every retreating edge targets a dominator.
     pub reducible: bool,
     /// Instructions that must be emitted.
     pub live_inst: SecondaryMap<Inst, bool>,
-    /// Number of uses of each value by live instructions and live block
-    /// parameters. A value is live iff `use_count[v] > 0`.
+    /// Uses of each value by live instructions and live block parameters
+    /// (`is_live(v)` iff `use_count[v] > 0`).
     pub use_count: SecondaryMap<Value, u32>,
 }
 
@@ -101,10 +100,9 @@ impl FuncInfo {
                 | Opcode::Trap => {}
                 op => return unsupported(format!("terminator {op}")),
             }
-            // A `try_call` keeps every edge, in exception-table order with
-            // the normal return last, because each becomes its own wasm
-            // label; its edges may pass call results (`ret0`) and exception
-            // payloads (`exn0`) instead of values.
+            // Keep every `try_call` edge (in exception-table order, normal
+            // return last) because each needs its own wasm catch label and may
+            // pass `retN`/`exnN` arguments.
             let is_try = matches!(data.opcode(), Opcode::TryCall | Opcode::TryCallIndirect);
             let mut ds: Vec<BlockCall> = Vec::new();
             for call in data.branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables) {
@@ -229,8 +227,8 @@ pub(crate) fn same_call(func: &Function, a: &BlockCall, b: &BlockCall) -> bool {
     a.block(pool) == b.block(pool) && a.args(pool).eq(b.args(pool))
 }
 
-/// Is this instruction a constant that is rematerialized at each use instead
-/// of being stored in a local?
+/// Whether `inst` is a constant rematerialized at each use rather than stored
+/// in a local.
 pub(crate) fn is_remat(func: &Function, inst: Inst) -> bool {
     match func.dfg.insts[inst] {
         InstructionData::UnaryImm {
@@ -249,8 +247,7 @@ pub(crate) fn is_remat(func: &Function, inst: Inst) -> bool {
             opcode: Opcode::F16const,
             ..
         } => true,
-        // Vectors of up to 128 bits fit a `v128.const`; others stay
-        // ordinary (and unsupported) instructions.
+        // Vectors up to 128 bits fit in `v128.const`.
         InstructionData::UnaryConst {
             opcode: Opcode::Vconst,
             ..
@@ -270,7 +267,7 @@ fn trivially_has_side_effects(op: Opcode) -> bool {
         || op.can_store()
 }
 
-/// Must the instruction be emitted even when its results are unused?
+/// Whether `inst` must be emitted even when its results are unused.
 pub(crate) fn must_lower_even_if_unused(func: &Function, inst: Inst) -> bool {
     let data = &func.dfg.insts[inst];
     let op = data.opcode();
@@ -286,13 +283,12 @@ pub(crate) fn must_lower_even_if_unused(func: &Function, inst: Inst) -> bool {
     }
 }
 
-/// Does the instruction have an effect that must not be reordered with
-/// another effect? This includes trapping and reading memory, and is what
-/// Cranelift's lowering uses to compute side-effect colors.
+/// Whether `inst` has an effect (trapping, memory read/write, or global state)
+/// that must not be reordered with other effects during tree building.
 pub(crate) fn has_lowering_side_effect(func: &Function, inst: Inst) -> bool {
     let op = func.dfg.insts[inst].opcode();
-    // Unlike Cranelift's version, `get_pinned_reg` counts: here it reads a
-    // global that `set_pinned_reg` writes, so the two must not be reordered.
+    // `get_pinned_reg` reads the global written by `set_pinned_reg`, so the
+    // two must not be reordered.
     must_lower_even_if_unused(func, inst) || op.can_load()
 }
 

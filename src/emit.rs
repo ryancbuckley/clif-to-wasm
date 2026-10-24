@@ -287,9 +287,8 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// A constant of type `ty` (`i32` or `i64`) that the linker fills in
-    /// from symbol `index`, with a relocation of the 32-bit kind `k32` or
-    /// the 64-bit kind `k64`.
+    /// Push a `ty` (`i32` or `i64`) constant relocated against symbol `index`
+    /// with relocation kind `k32` or `k64`.
     pub(crate) fn reloc_const(
         &mut self,
         ty: Type,
@@ -575,15 +574,13 @@ impl<'a> Emitter<'a> {
         self.env.func_index(Name::resolve(self.func, name))
     }
 
-    /// Push the first `n` arguments of a call with signature `sig`, the way
-    /// the callee expects them: narrow `sext` arguments sign-extended, and
-    /// by-value struct arguments copied into this frame (passing the copy's
-    /// address).
+    /// Push the first `n` call arguments for `sig`: sign-extending narrow `sext`
+    /// arguments and staging by-value struct arguments (`StructArgument`) for
+    /// copying into the caller's frame.
     ///
-    /// The copies are made by [`Self::byval_copies`], once the call's last
-    /// operand has been pushed: an operand evaluated later may write to a
-    /// struct being passed, or be a call that copies its own struct arguments
-    /// into the same area.
+    /// Actual `memory.copy` instructions are emitted by [`Self::byval_copies`]
+    /// after all call operands are evaluated, in case a later operand mutates
+    /// a passed struct or performs a nested call using the same frame area.
     pub(crate) fn call_args(
         &mut self,
         sig: &Signature,
@@ -655,9 +652,8 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// Restore the narrow-value invariant on a call's results: callees, LLVM
-    /// ones in particular, may leave garbage in the upper bits, and `sext`
-    /// returns arrive sign-extended.
+    /// Mask narrow call results to maintain the zero-extension invariant
+    /// (callees may leave upper bits undefined or sign-extended).
     pub(crate) fn call_result(&mut self, inst: Inst) -> Result<()> {
         let dfg = &self.func.dfg;
         let results = dfg.inst_results(inst);

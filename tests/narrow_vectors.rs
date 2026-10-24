@@ -1,8 +1,9 @@
-//! Vectors narrower than 128 bits live in the low bytes of a `v128`, and the
-//! other bytes are unspecified. Here every operand has junk in those bytes
-//! (a `splat` of a junk value, with the real lanes then inserted), so an
-//! operation that looks at them gives a result different from Cranelift's
-//! interpreter.
+//! Tests that vectors narrower than 128 bits (`i32x2`, `i8x4`, ...) ignore
+//! junk bits in the unused upper bytes of their `v128` representation.
+//!
+//! Each operand is constructed by splatting a junk lane across all 128 bits and
+//! then inserting the active lanes, ensuring any operation that reads the upper
+//! bytes diverges from `cranelift-interpreter`.
 
 mod harness;
 

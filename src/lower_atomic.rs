@@ -1,23 +1,20 @@
-//! Lowering of atomic memory operations to the atomic instructions of the
-//! wasm threads proposal.
+//! Atomic memory operation lowering (wasm threads proposal).
 //!
-//! Wasm has atomic loads and stores, read-modify-write `add`, `sub`, `and`,
-//! `or`, `xor` and `xchg`, and compare-exchange, on 8- to 64-bit values. The
-//! other read-modify-write operations (`nand`, `umin`/`umax`,
-//! `smin`/`smax`) become a compare-exchange loop:
+//! Wasm provides 8- to 64-bit atomic loads, stores, compare-exchange, and RMW
+//! `add`, `sub`, `and`, `or`, `xor`, and `xchg`. Remaining RMW operations
+//! (`nand`, `umin`/`umax`, `smin`/`smax`) and multi-byte big-endian RMWs lower
+//! to a `cmpxchg` loop:
 //!
 //! ```text
 //! loop
 //!   old = atomic.load p
 //!   seen = cmpxchg p, old, f(old, x)
-//!   br_if 0 (seen != old)     ;; another thread wrote in between
+//!   br_if 0 (seen != old)
 //! end
 //! ```
 //!
-//! Big-endian accesses reverse the bytes of the values they load and store.
-//! For read-modify-write that only works with a loop (an addition on
-//! byte-reversed values carries the wrong way), so they use it too, except
-//! for single bytes, where byte order does not matter.
+//! Big-endian atomic loads, stores, and CAS byte-swap values around the native
+//! little-endian wasm atomic instructions.
 
 use crate::emit::{Emitter, is64, w};
 use crate::locals::Local;

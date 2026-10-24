@@ -1,17 +1,16 @@
-//! A [`cranelift_module::Module`] that writes a relocatable wasm object, so
-//! that frontends written against `cranelift-module` (such as
-//! `rustc_codegen_cranelift`) can target wasm and have their output linked
-//! with `wasm-ld` or `wild`, together with objects from other compilers.
+//! A [`cranelift_module::Module`] implementation that emits relocatable wasm
+//! objects, allowing `cranelift-module` frontends (such as
+//! `rustc_codegen_cranelift`) to target wasm and link with `wasm-ld` or `wild`.
 //!
-//! Functions are compiled when they are defined, with
-//! [`crate::ModuleLayout::relocatable`] set. The object imports
-//! `__stack_pointer`, `__indirect_function_table` and (for threads)
-//! `__tls_base` from the linker, as LLVM-compiled objects do.
+//! Functions are compiled as they are defined with
+//! [`crate::ModuleLayout::relocatable`] enabled. Like LLVM objects, the output
+//! imports `__stack_pointer`, `__indirect_function_table`, and (when threads
+//! are enabled) `__tls_base` from the linker.
 //!
-//! Cranelift has no wasm `TargetIsa`, and outside crates cannot implement
-//! one, so the module presents the Pulley ISA of the same pointer width to
-//! the frontend ([`frontend_isa`]): frontends use the ISA for the pointer
-//! type, byte order and shared settings, which match.
+//! Because Cranelift has no built-in wasm `TargetIsa` and external crates
+//! cannot implement one, [`frontend_isa`] provides the Pulley ISA of matching
+//! pointer width so frontends can query pointer size, endianness, and shared
+//! flags.
 
 use crate::object::{Binding, DataDef, DataReloc, ObjectBuilder, SymbolFlags, SymbolId};
 use crate::{

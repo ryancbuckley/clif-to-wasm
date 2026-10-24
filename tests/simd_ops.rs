@@ -1,6 +1,5 @@
-//! Differential test of single vector operations: every operation on every
-//! 128-bit vector type it accepts, with random inputs, against Cranelift's
-//! interpreter.
+//! Differential tests for individual vector operations across all supported
+//! 128-bit and narrow vector types against `cranelift-interpreter`.
 
 mod harness;
 

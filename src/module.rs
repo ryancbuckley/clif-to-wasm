@@ -1,22 +1,19 @@
-//! A small module assembler for compiled functions.
+//! A minimal WebAssembly module assembler for compiled functions.
 //!
-//! It covers two kinds of module:
+//! Supports two module layouts:
 //!
-//! - **Self-contained**: the module defines its own memory, a funcref table
-//!   holding every function at its own index ([`ModuleBuilder::function_table`],
-//!   so a function's table slot is its function index) and globals. The tests
-//!   build modules like this.
-//! - **Linked into a running program**, as a JIT running inside wasm needs:
-//!   the module imports the program's memory, function table and stack
-//!   pointer global, and places its functions in free slots of that table
-//!   ([`ModuleBuilder::place_in_table`]).
+//! - **Self-contained**: defines its own memory, globals, and a `funcref`
+//!   table holding every function at its own index
+//!   ([`ModuleBuilder::function_table`]). Used by tests and standalone outputs.
+//! - **Linked into a host program** (e.g., an in-wasm JIT): imports memory,
+//!   the function table, and the stack-pointer global, and places functions in
+//!   free slots of the imported table ([`ModuleBuilder::place_in_table`]).
 //!
-//! Either kind can also define or import exception tags, for functions that
-//! catch exceptions (`try_call`).
+//! Either layout can also define or import exception tags for `try_call`.
 //!
-//! The indices this returns are the ones to put in [`crate::Config`] and to
-//! answer [`crate::Env`] queries with. Embedders with other needs can use
-//! `wasm_encoder` directly with [`CompiledFunction::to_wasm_function`].
+//! Returned indices plug directly into [`crate::Config`] and [`crate::Env`].
+//! Embedders with custom section needs can use `wasm_encoder` directly with
+//! [`CompiledFunction::to_wasm_function`].
 
 use crate::CompiledFunction;
 use std::marker::PhantomData;

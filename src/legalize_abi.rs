@@ -1,14 +1,10 @@
-//! Returning several values through memory, as LLVM's wasm backend does
-//! ([`crate::ModuleLayout::demote_multi_results`]).
+//! Multi-result return demotion ([`crate::ModuleLayout::demote_multi_results`]).
 //!
-//! LLVM's default wasm ABI returns at most one value. A function with more
-//! results (counting an `i128` or `f128` as two `i64`s) gets a hidden first
-//! parameter pointing to space the caller provides, writes its results there
-//! laid out like a C struct (each one at the next multiple of its size), and
-//! returns nothing. This pass rewrites the function's own signature and
-//! returns, and every call to such a signature: the caller passes the address
-//! of a stack slot and loads the results after the call. It runs on the IR
-//! before `i128` legalization, which then splits the 128-bit loads and stores.
+//! Under LLVM's Basic C ABI for WebAssembly, functions returning more than one
+//! wasm value (counting `i128`/`f128` as two `i64`s) instead take a hidden
+//! first pointer parameter to caller-allocated space, store their results at
+//! C-struct-aligned offsets there, and return nothing. This pass rewrites both
+//! function definitions and call sites before `i128` legalization.
 
 use crate::{Result, unsupported};
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
@@ -17,7 +13,7 @@ use cranelift_codegen::ir::{
     Signature, StackSlotData, StackSlotKind, Type, Value, types,
 };
 
-/// The number of wasm values a list of IR parameters or returns becomes.
+/// Number of wasm scalar values needed to represent `ps`.
 fn wasm_len(ps: &[AbiParam]) -> usize {
     ps.iter()
         .map(|p| match p.value_type {
@@ -31,12 +27,12 @@ pub(crate) fn needs_demotion(sig: &Signature) -> bool {
     wasm_len(&sig.returns) > 1
 }
 
-/// Does any signature in `func` return more than one wasm value?
+/// Whether `func` or any signature it references returns multiple wasm values.
 pub(crate) fn scan(func: &Function) -> bool {
     needs_demotion(&func.signature) || func.dfg.signatures.values().any(needs_demotion)
 }
 
-/// The offset of each result in the return area, and the area's size.
+/// Byte offset of each result in the return area and total byte size.
 fn layout(types: impl Iterator<Item = Type>) -> (Vec<u32>, u32) {
     let mut size = 0u32;
     let offsets = types

@@ -1,6 +1,7 @@
 #![allow(dead_code)]
-//! Runs CLIF filetests (`; run:` directives) through the wasm backend and
-//! executes the result with wasmtime.
+//! Test harness for compiling CLIF functions and `.clif` filetests (`; run:`
+//! directives) to WebAssembly and executing them with Wasmtime or
+//! `cranelift-interpreter`.
 
 pub mod clifgen;
 pub mod kernels;

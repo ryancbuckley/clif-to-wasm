@@ -9,8 +9,7 @@ wasm-encoder = "0.245"
 cranelift-module = { version = "=0.136.2", optional = true }
 
 [features]
-# A `cranelift_module::Module` that writes relocatable wasm objects, for
-# frontends such as rustc_codegen_cranelift.
+# `cranelift_module::Module` implementation emitting relocatable wasm objects.
 module = ["dep:cranelift-module", "cranelift-codegen/pulley"]
 
 [dev-dependencies]

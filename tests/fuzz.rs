@@ -1,11 +1,12 @@
-//! Differential testing: random CLIF functions are run in Cranelift's
-//! interpreter and, compiled by this backend, in wasmtime. Results (or the fact
-//! that both trap) must agree.
+//! Differential testing: random CLIF functions are executed in
+//! `cranelift-interpreter` and in Wasmtime after compiling with this backend.
+//! Return values (or traps) must match.
 //!
-//! Each seed gives three functions: scalar only, with vector code, and with
-//! `i128` code. `FUZZ_ITERS` sets the number of seeds (default 150),
-//! `FUZZ_SEED` the first seed, and `FUZZ_ONLY=scalar|simd|i128` restricts
-//! the kind.
+//! Each seed generates three functions: scalar-only, SIMD, and `i128`.
+//! Environment variables:
+//! - `FUZZ_ITERS`: number of seeds (default `150`)
+//! - `FUZZ_SEED`: starting seed (default `1`)
+//! - `FUZZ_ONLY=scalar|simd|i128`: restrict to one category
 
 mod harness;
 
