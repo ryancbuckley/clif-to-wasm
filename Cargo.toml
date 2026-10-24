@@ -2,6 +2,7 @@
 name = "clif-to-wasm"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0 WITH LLVM-exception"
 
 [dependencies]
 cranelift-codegen = { version = "=0.136.2", default-features = false, features = ["std", "unwind"] }

@@ -382,22 +382,6 @@ V8 compile time, and kernel execution time in wasmtime, V8 Liftoff
 
 ### Results (Node 26, wasmtime 49)
 
-Output size across configurations (`naive` vs `no-coalesce` vs `default`):
-
-| corpus | variant | funcs | code bytes | locals | ops | `local.get` | `local.set` | `local.tee` |
-|---|---|---:|---:|---:|---:|---:|---:|---:|
-| kernels | naive | 10 | 2,140 | 71 | 1,109 | 322 | 228 | 4 |
-| kernels | no-coalesce | 10 | 1,644 | 49 | 875 | 203 | 109 | 8 |
-| kernels | default | 10 | 1,636 | 49 | 871 | 201 | 107 | 8 |
-| random | naive | 1,000 | 1,567,654 | 18,497 | 788,081 | 202,839 | 136,274 | 12,562 |
-| random | no-coalesce | 1,000 | 1,240,502 | 13,524 | 628,425 | 122,788 | 56,223 | 13,008 |
-| random | default | 1,000 | 1,164,934 | 13,539 | 590,629 | 103,904 | 37,339 | 12,980 |
-
-On the 1,000-function random corpus, `default` reduces code bytes by 26%,
-locals by 27%, `local.get` by 49%, and `local.set` by 73% compared to `naive`.
-Move coalescing alone (`no-coalesce` → `default`) eliminates 34% of `local.set`s
-and 6% of code bytes.
-
 Kernel runtime (median ms):
 
 | kernel | Liftoff naive | Liftoff no-coalesce | Liftoff default | TurboFan default | wasmtime default |
