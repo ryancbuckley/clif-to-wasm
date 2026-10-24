@@ -369,3 +369,126 @@ fn imports_from_other_modules() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Object P takes function addresses (`get_seven() = &seven`, data
+/// `EIGHT = [eight]`) but never calls through the table, so its unused
+/// `__indirect_function_table` symbol is pruned.
+fn object_pointers() -> Vec<u8> {
+    let mut m = new_module();
+    let i32t = types::I32;
+    let seven = m
+        .declare_function("seven", Linkage::Local, &sig(&[], &[i32t]))
+        .unwrap();
+    let eight = m
+        .declare_function("eight", Linkage::Local, &sig(&[], &[i32t]))
+        .unwrap();
+    let get_seven = m
+        .declare_function("get_seven", Linkage::Export, &sig(&[], &[i32t]))
+        .unwrap();
+    let eight_ptr = m
+        .declare_data("EIGHT", Linkage::Export, false, false)
+        .unwrap();
+    let mut d = DataDescription::new();
+    d.define(vec![0; 4].into_boxed_slice());
+    d.set_align(4);
+    let f = m.declare_func_in_data(eight, &mut d);
+    d.write_function_addr(0, f);
+    m.define_data(eight_ptr, &d).unwrap();
+    for (id, v) in [(seven, 7), (eight, 8)] {
+        define(&mut m, id, sig(&[], &[i32t]), |_, b| {
+            let v = b.ins().iconst(i32t, v);
+            b.ins().return_(&[v]);
+        });
+    }
+    define(&mut m, get_seven, sig(&[], &[i32t]), |m, b| {
+        let f = m.declare_func_in_func(seven, b.func);
+        let p = b.ins().func_addr(i32t, f);
+        b.ins().return_(&[p]);
+    });
+    m.finish()
+}
+
+/// Object Q: `run() = 10 * get_seven()() + EIGHT[0]()`, through the table.
+fn object_indirect_caller() -> Vec<u8> {
+    let mut m = new_module();
+    let i32t = types::I32;
+    let get_seven = m
+        .declare_function("get_seven", Linkage::Import, &sig(&[], &[i32t]))
+        .unwrap();
+    let eight_ptr = m
+        .declare_data("EIGHT", Linkage::Import, false, false)
+        .unwrap();
+    let run = m
+        .declare_function("run", Linkage::Export, &sig(&[], &[i32t]))
+        .unwrap();
+    define(&mut m, run, sig(&[], &[i32t]), |m, b| {
+        let sref = b.import_signature(sig(&[], &[i32t]));
+        let gf = m.declare_func_in_func(get_seven, b.func);
+        let call = b.ins().call(gf, &[]);
+        let p = b.inst_results(call)[0];
+        let call = b.ins().call_indirect(sref, p, &[]);
+        let x = b.inst_results(call)[0];
+        let x = b.ins().imul_imm_s(x, 10);
+        let gv = m.declare_data_in_func(eight_ptr, b.func);
+        let a = b.ins().symbol_value(i32t, gv);
+        let p = b.ins().load(i32t, MemFlagsData::trusted(), a, 0);
+        let call = b.ins().call_indirect(sref, p, &[]);
+        let y = b.inst_results(call)[0];
+        let s = b.ins().iadd(x, y);
+        b.ins().return_(&[s]);
+    });
+    m.finish()
+}
+
+fn imports_table(wasm: &[u8]) -> bool {
+    wasmparser::Parser::new(0).parse_all(wasm).any(|payload| {
+        let wasmparser::Payload::ImportSection(s) = payload.unwrap() else {
+            return false;
+        };
+        s.into_imports()
+            .any(|imp| matches!(imp.unwrap().ty, wasmparser::TypeRef::Table(_)))
+    })
+}
+
+#[test]
+fn function_pointers_without_table_symbol() {
+    let p = object_pointers();
+    let q = object_indirect_caller();
+    for obj in [&p, &q] {
+        wasmparser::Validator::new().validate_all(obj).unwrap();
+    }
+    assert!(!imports_table(&p), "unused table not pruned");
+    assert!(imports_table(&q));
+
+    // The linker still gives P's functions slots in Q's table.
+    let Some(lld) = rust_lld() else {
+        eprintln!("skipping the link: rust-lld not found (set RUST_LLD)");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("cwb-pointers-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let po = dir.join("p.o");
+    let qo = dir.join("q.o");
+    let out = dir.join("linked.wasm");
+    std::fs::write(&po, &p).unwrap();
+    std::fs::write(&qo, &q).unwrap();
+    let status = Command::new(&lld)
+        .args(["-flavor", "wasm", "--no-entry", "--export=run", "-o"])
+        .arg(&out)
+        .arg(&po)
+        .arg(&qo)
+        .status()
+        .unwrap();
+    assert!(status.success(), "wasm-ld failed");
+    let wasm = std::fs::read(&out).unwrap();
+
+    let engine = wasmtime::Engine::default();
+    let module = wasmtime::Module::new(&engine, &wasm).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
+    assert_eq!(run.call(&mut store, ()).unwrap(), 78);
+    let _ = std::fs::remove_dir_all(&dir);
+}
