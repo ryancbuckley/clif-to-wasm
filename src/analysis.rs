@@ -71,6 +71,9 @@ impl FuncInfo {
         let cfg = ControlFlowGraph::with_function(func);
         let domtree = DominatorTree::with_function(func, &cfg);
         let rpo: Vec<Block> = domtree.cfg_rpo().copied().collect();
+        if rpo.is_empty() {
+            return unsupported("function without a body");
+        }
         let mut rpo_num = SecondaryMap::with_default(RpoIndex::UNREACHABLE);
         for (i, &b) in rpo.iter().enumerate() {
             rpo_num[b] = RpoIndex(i as u32);
@@ -317,6 +320,14 @@ pub(crate) mod tests {
         // with other effects (Cranelift's lowering excludes it from both).
         assert!(must_lower_even_if_unused(&func, get_inst));
         assert!(has_lowering_side_effect(&func, get_inst));
+    }
+
+    #[test]
+    fn function_without_blocks_is_unsupported() {
+        assert!(matches!(
+            FuncInfo::compute(&Function::new()),
+            Err(crate::Error::Unsupported(_))
+        ));
     }
 
     /// Independent BFS reachability from `entry`, optionally forbidding `avoid`.
