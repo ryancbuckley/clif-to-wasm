@@ -131,6 +131,24 @@ block0(v0: i32):
 ; run: %f16_from_int(2051) == 0x1.008p11
 ; run: %f16_from_int(70000) == +Inf
 
+function %f16_bitwise(f16, f16, f16) -> i16, i16, i16, i32, i16 {
+block0(v0: f16, v1: f16, v2: f16):
+    v3 = band v0, v1
+    v4 = bor v0, v1
+    v5 = bxor v0, v1
+    v6 = bnot v0
+    v7 = bitselect v2, v0, v1
+    v8 = bitcast.i16 v3
+    v9 = bitcast.i16 v4
+    v10 = bitcast.i16 v5
+    v11 = bitcast.i16 v6
+    v12 = uextend.i32 v11
+    v13 = bitcast.i16 v7
+    return v8, v9, v10, v12, v13
+}
+; 1.5 is 0x3e00, -3.0 is 0xc200, and -0.0 (0x8000) selects only the sign.
+; run: %f16_bitwise(0x1.8p0, -0x1.8p1, -0x0.0) == [0x0200, 0xfe00, 0xfc00, 0xc1ff, 0x4200]
+
 function %fma_f32(f32, f32, f32) -> f32 {
 block0(v0: f32, v1: f32, v2: f32):
     v3 = fma v0, v1, v2

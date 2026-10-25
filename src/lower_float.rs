@@ -282,6 +282,35 @@ impl Emitter<'_> {
                 })?;
                 self.f64_to_f16();
             }
+            // Bitwise operations act on the bits, which stay zero-extended.
+            Opcode::Band | Opcode::Bor | Opcode::Bxor => {
+                self.operand()?;
+                self.operand()?;
+                self.ins(match op {
+                    Opcode::Band => I::I32And,
+                    Opcode::Bor => I::I32Or,
+                    _ => I::I32Xor,
+                });
+            }
+            Opcode::Bnot => {
+                self.operand()?;
+                self.ins(I::I32Const(0xffff));
+                self.ins(I::I32Xor);
+            }
+            Opcode::Bitselect => {
+                // (c & x) | (~c & y)
+                let c = self.scratch(ValType::I32);
+                self.operand()?;
+                self.local_tee(c);
+                self.operand()?;
+                self.ins(I::I32And);
+                self.operand()?;
+                self.local_get(c);
+                self.ins(I::I32Const(0xffff));
+                self.ins(I::I32Xor);
+                self.ins(I::I32And);
+                self.ins(I::I32Or);
+            }
             _ => return Ok(false),
         }
         Ok(true)
