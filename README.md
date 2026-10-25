@@ -308,8 +308,8 @@ cargo test --release                     # CLIF runtests + differential fuzzing
 cargo test --release --features module   # also tests relocatable objects with rust-lld
 FUZZ_ITERS=30000 cargo test --release --test fuzz -- --nocapture
 
-# Cranelift's upstream runtests (wasmtime v49.0.2 matches Cranelift 0.136.2):
-git clone --depth 1 --branch v49.0.2 --filter=blob:none --sparse \
+# Cranelift's upstream runtests (wasmtime v50.0.0 matches Cranelift 0.137.0):
+git clone --depth 1 --branch v50.0.0 --filter=blob:none --sparse \
     https://github.com/bytecodealliance/wasmtime
 (cd wasmtime && git sparse-checkout set cranelift/filetests/filetests/runtests)
 cargo run --release --example upstream -- wasmtime/cranelift/filetests/filetests/runtests
@@ -340,7 +340,7 @@ cargo run --example runclif  -- tests/clif/control.clif
 - `tests/object.rs` (`--features module`): emits relocatable objects via
   `WasmObjectModule`, links them with `rust-lld -flavor wasm`, and runs the
   linked binary in wasmtime.
-- Upstream runtests: 13,729 run commands pass and 0 fail across 393 of 395
+- Upstream runtests: 14,043 run commands pass and 0 fail across 396 of 398
   files. The two unsupported files are `throw.clif` (uses `get_return_address`
   for native unwinding) and `i128-conversion.clif` (an interpreter-only test
   expecting saturating float-to-`i128` behaviour where Cranelift specifies trap
