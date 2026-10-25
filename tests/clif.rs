@@ -8,7 +8,10 @@ fn configs() -> Vec<(&'static str, Config)> {
         ("default", Config::default()),
         ("no-tee", harness::config(|c| c.opts.use_tee = false)),
         ("no-coalesce", harness::config(|c| c.opts.coalesce = false)),
-        ("memory64", harness::config(|c| c.module.memory64 = true)),
+        (
+            "memory64",
+            harness::config(|c| c.module.address_type = clif_to_wasm::AddressType::I64),
+        ),
         (
             "demote",
             harness::config(|c| c.module.demote_multi_results = true),

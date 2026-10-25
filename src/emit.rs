@@ -25,8 +25,8 @@ use crate::analysis::{FuncInfo, is_remat};
 use crate::expr_trees::{ExprTrees, Operand, operands};
 use crate::locals::{Local, Locals};
 use crate::{
-    CompiledFunction, Config, Env, FuncIndex, GlobalIndex, Name, Reloc, RelocKind, Result,
-    TableIndex, TypeIndex, unsupported, wasm_signature,
+    AddressType, CompiledFunction, Config, Env, FuncIndex, GlobalIndex, Name, Reloc, RelocKind,
+    Result, TableIndex, TypeIndex, unsupported, wasm_signature,
 };
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::{
@@ -184,10 +184,9 @@ impl<'a> Emitter<'a> {
             self.frame = Some((fp, size));
             self.global_get(sp);
             self.ptr_const(size as i64);
-            self.ins(if config.module.memory64 {
-                I::I64Sub
-            } else {
-                I::I32Sub
+            self.ins(match config.module.address_type {
+                AddressType::I32 => I::I32Sub,
+                AddressType::I64 => I::I64Sub,
             });
             self.local_tee(fp);
             self.global_set(sp);
@@ -429,18 +428,16 @@ impl<'a> Emitter<'a> {
     }
 
     pub(crate) fn ptr_const(&mut self, v: i64) {
-        if self.config.module.memory64 {
-            self.ins(I::I64Const(v))
-        } else {
-            self.ins(I::I32Const(v as i32))
+        match self.config.module.address_type {
+            AddressType::I32 => self.ins(I::I32Const(v as i32)),
+            AddressType::I64 => self.ins(I::I64Const(v)),
         }
     }
 
     pub(crate) fn ptr_add(&mut self) {
-        self.ins(if self.config.module.memory64 {
-            I::I64Add
-        } else {
-            I::I32Add
+        self.ins(match self.config.module.address_type {
+            AddressType::I32 => I::I32Add,
+            AddressType::I64 => I::I64Add,
         })
     }
 
@@ -472,11 +469,11 @@ impl<'a> Emitter<'a> {
     /// Push the next operand, an address, converted to the wasm address type.
     pub(crate) fn address(&mut self) -> Result<()> {
         let v = self.operand()?;
-        match (self.ty(v), self.config.module.memory64) {
-            (types::I64, false) => self.ins(I::I32WrapI64),
-            (types::I64, true) => {}
-            (types::I32, true) => self.ins(I::I64ExtendI32U),
-            (types::I32, false) => {}
+        match (self.ty(v), self.config.module.address_type) {
+            (types::I64, AddressType::I32) => self.ins(I::I32WrapI64),
+            (types::I64, AddressType::I64) => {}
+            (types::I32, AddressType::I64) => self.ins(I::I64ExtendI32U),
+            (types::I32, AddressType::I32) => {}
             (ty, _) => return unsupported(format!("address of type {ty}")),
         }
         Ok(())
@@ -557,10 +554,10 @@ impl<'a> Emitter<'a> {
 
     /// Convert a pointer-typed value on the stack to `ty`.
     pub(crate) fn ptr_to(&mut self, ty: Type) -> Result<()> {
-        match (self.config.module.memory64, ty) {
-            (false, types::I32) | (true, types::I64) => {}
-            (false, types::I64) => self.ins(I::I64ExtendI32U),
-            (true, types::I32) => self.ins(I::I32WrapI64),
+        match (self.config.module.address_type, ty) {
+            (AddressType::I32, types::I32) | (AddressType::I64, types::I64) => {}
+            (AddressType::I32, types::I64) => self.ins(I::I64ExtendI32U),
+            (AddressType::I64, types::I32) => self.ins(I::I32WrapI64),
             _ => return unsupported(format!("pointer of type {ty}")),
         }
         Ok(())
@@ -608,9 +605,9 @@ impl<'a> Emitter<'a> {
                 }
                 let (fp, _) = self.frame.expect("frame for by-value arguments");
                 // The address in the memory's address type.
-                match (self.config.module.memory64, value_type) {
-                    (false, types::I64) => self.ins(I::I32WrapI64),
-                    (true, types::I32) => self.ins(I::I64ExtendI32U),
+                match (self.config.module.address_type, value_type) {
+                    (AddressType::I32, types::I64) => self.ins(I::I32WrapI64),
+                    (AddressType::I64, types::I32) => self.ins(I::I64ExtendI32U),
                     _ => {}
                 }
                 let src = self.scratch(self.config.module.ptr_ty());

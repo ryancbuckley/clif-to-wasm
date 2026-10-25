@@ -174,7 +174,7 @@ indices match your `Config` and `Env`:
 
 | Group | Fields | Meaning |
 |---|---|---|
-| `module: ModuleLayout` | `memory64`, `memory_index`, `table_index`, `stack_pointer_global`, `tls_base_global`, `pinned_reg_global`, `atomic_lock_table_addr`, `relocatable`, `demote_multi_results` | Target module layout; must match the embedder's module definition. |
+| `module: ModuleLayout` | `address_type`, `memory_index`, `table_index`, `stack_pointer_global`, `tls_base_global`, `pinned_reg_global`, `atomic_lock_table_addr`, `relocatable`, `demote_multi_results` | Target module layout; must match the embedder's module definition. |
 | `engine: EngineFeatures` | `tail_calls` | Engine feature support. When false, `return_call` lowers to `call` + `return`. |
 | `opts: Optimizations` | `stack_values`, `coalesce`, `use_tee` | Codegen optimizations (all enabled by default; `Optimizations::none()` disables all). |
 

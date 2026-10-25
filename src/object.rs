@@ -15,7 +15,7 @@
 //!
 //! [linking conventions]: https://github.com/WebAssembly/tool-conventions/blob/main/Linking.md
 
-use crate::{CompiledFunction, RelocKind, TypeIndex};
+use crate::{AddressType, CompiledFunction, RelocKind, TypeIndex};
 use std::collections::HashMap;
 use wasm_encoder::{Encode, ValType};
 
@@ -42,7 +42,7 @@ impl From<SymbolId> for crate::TableIndex {
 }
 
 /// How a symbol binds across objects.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum Binding {
     /// Visible to other objects; one definition wins.
     #[default]
@@ -55,8 +55,9 @@ pub enum Binding {
 }
 
 /// The attributes of a symbol.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub struct SymbolFlags {
+    /// How the symbol binds across objects.
     pub binding: Binding,
     /// Not exported from a shared library (`WASM_SYM_VISIBILITY_HIDDEN`).
     pub hidden: bool,
@@ -92,19 +93,39 @@ const FLAG_TLS: u32 = 0x100;
 const SEG_FLAG_TLS: u32 = 0x2;
 const SEG_FLAG_RETAIN: u32 = 0x4;
 
+/// Where a data symbol lives.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum DataStorage {
+    /// Once in the program, at a fixed address.
+    #[default]
+    Static,
+    /// Once per thread, at an offset from `__tls_base`.
+    ThreadLocal,
+}
+
+/// Whether a global can be written.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Mutability {
+    /// The global is read-only.
+    Immutable,
+    /// The global can be written with `global.set`.
+    Mutable,
+}
+
 /// A relocated field in a data object: a pointer-sized address.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct DataReloc {
     /// Byte offset of the field in the object.
     pub offset: u32,
     /// The function (its table slot is written) or data symbol (its address
     /// plus `addend` is written).
     pub symbol: SymbolId,
+    /// Added to the address of a data symbol; ignored for functions.
     pub addend: i64,
 }
 
 /// The contents of a data object.
-#[derive(Clone, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct DataDef {
     /// The initial bytes; for zero-initialized data, all zeros.
     pub bytes: Vec<u8>,
@@ -112,10 +133,12 @@ pub struct DataDef {
     pub align: u32,
     /// Whether the program may write to it (`.data`/`.bss` rather than
     /// `.rodata`).
-    pub writable: bool,
+    pub mutability: Mutability,
+    /// The fields of `bytes` that hold addresses.
     pub relocs: Vec<DataReloc>,
 }
 
+#[derive(Debug)]
 enum SymKind {
     Func {
         ty: TypeIndex,
@@ -123,17 +146,18 @@ enum SymKind {
         def: Option<usize>,
     },
     Data {
-        tls: bool,
+        storage: DataStorage,
         /// Index into `ObjectBuilder::segments` once defined.
         def: Option<usize>,
     },
     Global {
         ty: ValType,
-        mutable: bool,
+        mutability: Mutability,
     },
     Table,
 }
 
+#[derive(Debug)]
 struct Symbol {
     name: String,
     flags: SymbolFlags,
@@ -143,14 +167,39 @@ struct Symbol {
     import: Option<(String, String)>,
 }
 
+#[derive(Debug)]
 struct Segment {
     symbol: SymbolId,
     def: DataDef,
 }
 
 /// Builds a relocatable object file. See the [module documentation](self).
+///
+/// # Example
+///
+/// An object defining a string constant:
+///
+/// ```
+/// use clif_to_wasm::AddressType;
+/// use clif_to_wasm::object::{DataDef, DataStorage, Mutability, ObjectBuilder, SymbolFlags};
+///
+/// let mut obj = ObjectBuilder::new(AddressType::I32);
+/// let greeting = obj.declare_data("greeting", SymbolFlags::default(), DataStorage::Static);
+/// obj.define_data(
+///     greeting,
+///     DataDef {
+///         bytes: b"hello\0".to_vec(),
+///         align: 1,
+///         mutability: Mutability::Immutable,
+///         relocs: Vec::new(),
+///     },
+/// );
+/// let object_file = obj.finish();
+/// # wasmparser::validate(&object_file).unwrap();
+/// ```
+#[derive(Debug)]
 pub struct ObjectBuilder {
-    memory64: bool,
+    address_type: AddressType,
     types: Vec<(Vec<ValType>, Vec<ValType>)>,
     type_map: HashMap<(Vec<ValType>, Vec<ValType>), TypeIndex>,
     symbols: Vec<Symbol>,
@@ -161,10 +210,11 @@ pub struct ObjectBuilder {
 }
 
 impl ObjectBuilder {
-    /// An empty object for a 32-bit or 64-bit (memory64) linear memory.
-    pub fn new(memory64: bool) -> Self {
+    /// An empty object for a linear memory with addresses of type
+    /// `address_type`.
+    pub fn new(address_type: AddressType) -> Self {
         ObjectBuilder {
-            memory64,
+            address_type,
             types: Vec::new(),
             type_map: HashMap::new(),
             symbols: Vec::new(),
@@ -201,7 +251,7 @@ impl ObjectBuilder {
 
     /// Declare a function symbol. It is imported unless defined with
     /// [`Self::define_function`].
-    pub fn function(
+    pub fn declare_function(
         &mut self,
         name: &str,
         flags: SymbolFlags,
@@ -214,7 +264,7 @@ impl ObjectBuilder {
 
     /// Declare a function imported as `field` from the wasm module `module`
     /// (Rust's `#[link(wasm_import_module = "...")]`), under the symbol name
-    /// `name`. Functions declared with [`Self::function`] and not defined
+    /// `name`. Functions declared with [`Self::declare_function`] and not defined
     /// are imported from `env` under their symbol name instead.
     pub fn import_function(
         &mut self,
@@ -225,28 +275,33 @@ impl ObjectBuilder {
         params: &[ValType],
         results: &[ValType],
     ) -> SymbolId {
-        let s = self.function(name, flags, params, results);
+        let s = self.declare_function(name, flags, params, results);
         self.symbols[s.0 as usize].import = Some((module.to_owned(), field.to_owned()));
         s
     }
 
-    /// Declare a data symbol, thread-local if `tls`. It is undefined unless
-    /// defined with [`Self::define_data`].
-    pub fn data(&mut self, name: &str, flags: SymbolFlags, tls: bool) -> SymbolId {
-        self.symbol(name, flags, SymKind::Data { tls, def: None })
+    /// Declare a data symbol. It is undefined unless defined with
+    /// [`Self::define_data`].
+    pub fn declare_data(
+        &mut self,
+        name: &str,
+        flags: SymbolFlags,
+        storage: DataStorage,
+    ) -> SymbolId {
+        self.symbol(name, flags, SymKind::Data { storage, def: None })
     }
 
     /// Declare a global the linker provides, such as `__stack_pointer`.
-    pub fn global(&mut self, name: &str, ty: ValType, mutable: bool) -> SymbolId {
+    pub fn declare_global(&mut self, name: &str, ty: ValType, mutability: Mutability) -> SymbolId {
         self.symbol(
             name,
             SymbolFlags::default(),
-            SymKind::Global { ty, mutable },
+            SymKind::Global { ty, mutability },
         )
     }
 
     /// Declare a table the linker provides: `__indirect_function_table`.
-    pub fn table(&mut self, name: &str) -> SymbolId {
+    pub fn declare_table(&mut self, name: &str) -> SymbolId {
         let flags = SymbolFlags {
             no_strip: true,
             ..SymbolFlags::default()
@@ -255,6 +310,11 @@ impl ObjectBuilder {
     }
 
     /// Define a declared function with code compiled for this object.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `sym` is not a function symbol of this object, or is already
+    /// defined.
     pub fn define_function(&mut self, sym: SymbolId, func: CompiledFunction) {
         let n = self.funcs.len();
         match &mut self.symbols[sym.0 as usize].kind {
@@ -268,6 +328,11 @@ impl ObjectBuilder {
     }
 
     /// Define a declared data symbol.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `data.align` is not a power of two, or if `sym` is not a data
+    /// symbol of this object or is already defined.
     pub fn define_data(&mut self, sym: SymbolId, data: DataDef) {
         assert!(data.align.is_power_of_two());
         let n = self.segments.len();
@@ -293,7 +358,7 @@ impl ObjectBuilder {
     /// Record a wasm feature the code uses (`target_features` section), such
     /// as `"atomics"` or `"bulk-memory"`. Linkers check these: shared memory
     /// requires every object to declare `atomics` and `bulk-memory`.
-    pub fn feature(&mut self, name: &str) {
+    pub fn add_feature(&mut self, name: &str) {
         if !self.features.iter().any(|f| f == name) {
             self.features.push(name.to_owned());
         }
@@ -304,6 +369,7 @@ impl ObjectBuilder {
         self.symbols[sym.0 as usize].flags = flags;
     }
 
+    /// The name of a symbol.
     pub fn symbol_name(&self, sym: SymbolId) -> &str {
         &self.symbols[sym.0 as usize].name
     }
@@ -312,10 +378,14 @@ impl ObjectBuilder {
     pub fn is_tls(&self, sym: SymbolId) -> bool {
         matches!(
             self.symbols[sym.0 as usize].kind,
-            SymKind::Data { tls: true, .. }
+            SymKind::Data {
+                storage: DataStorage::ThreadLocal,
+                ..
+            }
         )
     }
 
+    /// Whether a symbol is a function.
     pub fn is_function(&self, sym: SymbolId) -> bool {
         matches!(self.symbols[sym.0 as usize].kind, SymKind::Func { .. })
     }
@@ -434,7 +504,7 @@ impl ObjectBuilder {
         let mem_ty = wasm_encoder::MemoryType {
             minimum: 0,
             maximum: None,
-            memory64: self.memory64,
+            memory64: self.address_type == AddressType::I64,
             shared: false,
             page_size_log2: None,
         };
@@ -452,12 +522,12 @@ impl ObjectBuilder {
         }
         for &i in &global_imports {
             let s = &self.symbols[i];
-            let SymKind::Global { ty, mutable } = s.kind else {
+            let SymKind::Global { ty, mutability } = s.kind else {
                 unreachable!()
             };
             let gt = wasm_encoder::GlobalType {
                 val_type: ty,
-                mutable,
+                mutable: mutability == Mutability::Mutable,
                 shared: false,
             };
             imports.import("env", &s.name, gt);
@@ -526,12 +596,15 @@ impl ObjectBuilder {
         let mut data_relocs = Vec::new();
         for (seg, &addr) in self.segments.iter().zip(&seg_addr) {
             data.push(0); // active, memory 0
-            if self.memory64 {
-                data.push(0x42);
-                (addr as i64).encode(&mut data);
-            } else {
-                data.push(0x41);
-                (addr as i32).encode(&mut data);
+            match self.address_type {
+                AddressType::I32 => {
+                    data.push(0x41);
+                    (addr as i32).encode(&mut data);
+                }
+                AddressType::I64 => {
+                    data.push(0x42);
+                    (addr as i64).encode(&mut data);
+                }
             }
             data.push(0x0b);
             (seg.def.bytes.len() as u32).encode(&mut data);
@@ -539,11 +612,11 @@ impl ObjectBuilder {
             let mut bytes = seg.def.bytes.clone();
             for r in &seg.def.relocs {
                 let func = matches!(self.symbols[r.symbol.0 as usize].kind, SymKind::Func { .. });
-                let kind = match (func, self.memory64) {
-                    (true, false) => RelocKind::TableIndexI32,
-                    (true, true) => RelocKind::TableIndexI64,
-                    (false, false) => RelocKind::MemoryAddrI32,
-                    (false, true) => RelocKind::MemoryAddrI64,
+                let kind = match (func, self.address_type) {
+                    (true, AddressType::I32) => RelocKind::TableIndexI32,
+                    (true, AddressType::I64) => RelocKind::TableIndexI64,
+                    (false, AddressType::I32) => RelocKind::MemoryAddrI32,
+                    (false, AddressType::I64) => RelocKind::MemoryAddrI64,
                 };
                 let value = if func {
                     0
@@ -574,16 +647,17 @@ impl ObjectBuilder {
             (self.segments.len() as u32).encode(&mut sub);
             for seg in &self.segments {
                 let sym = &self.symbols[seg.symbol.0 as usize];
-                let SymKind::Data { tls, .. } = sym.kind else {
+                let SymKind::Data { storage, .. } = sym.kind else {
                     unreachable!()
                 };
+                let tls = storage == DataStorage::ThreadLocal;
                 let zero = seg.def.bytes.iter().all(|&b| b == 0) && seg.def.relocs.is_empty();
-                let prefix = match (tls, seg.def.writable, zero) {
-                    (true, _, false) => ".tdata.",
-                    (true, _, true) => ".tbss.",
-                    (false, false, _) => ".rodata.",
-                    (false, true, false) => ".data.",
-                    (false, true, true) => ".bss.",
+                let prefix = match (storage, seg.def.mutability, zero) {
+                    (DataStorage::ThreadLocal, _, false) => ".tdata.",
+                    (DataStorage::ThreadLocal, _, true) => ".tbss.",
+                    (DataStorage::Static, Mutability::Immutable, _) => ".rodata.",
+                    (DataStorage::Static, Mutability::Mutable, false) => ".data.",
+                    (DataStorage::Static, Mutability::Mutable, true) => ".bss.",
                 };
                 format!("{prefix}{}", sym.name).as_str().encode(&mut sub);
                 seg.def.align.trailing_zeros().encode(&mut sub);
@@ -630,8 +704,8 @@ impl ObjectBuilder {
                             s.name.as_str().encode(&mut sub);
                         }
                     }
-                    SymKind::Data { tls, def } => {
-                        if tls {
+                    SymKind::Data { storage, def } => {
+                        if storage == DataStorage::ThreadLocal {
                             flags |= FLAG_TLS;
                         }
                         if def.is_none() {

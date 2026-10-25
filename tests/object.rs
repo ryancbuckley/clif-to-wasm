@@ -6,8 +6,8 @@
 //! (`__stack_pointer`), demoted multi-value returns, and argument extension.
 //! Linking is skipped if `rust-lld` is unavailable (set `RUST_LLD` to override).
 
-use clif_to_wasm::Config;
 use clif_to_wasm::object_module::{ObjectOptions, WasmObjectModule, frontend_isa};
+use clif_to_wasm::{AddressType, Config};
 use cranelift_codegen::ir::{
     AbiParam, ArgumentExtension, InstBuilder, MemFlagsData, Signature, StackSlotData,
     StackSlotKind, types,
@@ -28,7 +28,7 @@ fn module_with_imports(
     import_names: Box<dyn Fn(&str) -> Option<(String, String)> + Send + Sync>,
 ) -> WasmObjectModule {
     let flags = settings::Flags::new(settings::builder());
-    let isa = frontend_isa(flags, false).unwrap();
+    let isa = frontend_isa(flags, AddressType::I32).unwrap();
     let mut config = Config::default();
     config.module.demote_multi_results = true;
     WasmObjectModule::new(

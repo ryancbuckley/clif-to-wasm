@@ -1084,7 +1084,10 @@ fn configs() -> Vec<(&'static str, Config)> {
             "no-stack-values",
             harness::config(|c| c.opts.stack_values = false),
         ),
-        ("memory64", harness::config(|c| c.module.memory64 = true)),
+        (
+            "memory64",
+            harness::config(|c| c.module.address_type = clif_to_wasm::AddressType::I64),
+        ),
         (
             "demote",
             harness::config(|c| c.module.demote_multi_results = true),

@@ -14,10 +14,12 @@
 
 #![allow(clippy::result_large_err, clippy::type_complexity)]
 
-use crate::object::{Binding, DataDef, DataReloc, ObjectBuilder, SymbolFlags, SymbolId};
+use crate::object::{
+    Binding, DataDef, DataReloc, DataStorage, Mutability, ObjectBuilder, SymbolFlags, SymbolId,
+};
 use crate::{
-    CompiledFunction, Config, Env, Error, FuncIndex, Name, Result, SymbolValue, TypeIndex,
-    compile_function, wasm_signature,
+    AddressType, CompiledFunction, Config, Env, Error, FuncIndex, Name, Result, SymbolValue,
+    TypeIndex, compile_function, wasm_signature,
 };
 use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::entity::SecondaryMap;
@@ -46,9 +48,19 @@ pub const THREADS_FEATURES: &[&str] = &[
 ];
 
 /// The ISA to give a frontend that builds IR for this module: Pulley with
-/// the pointer width of wasm32 (or wasm64 if `memory64`).
-pub fn frontend_isa(flags: settings::Flags, memory64: bool) -> ModuleResult<OwnedTargetIsa> {
-    let name = if memory64 { "pulley64" } else { "pulley32" };
+/// the pointer width of `address_type`.
+///
+/// # Errors
+///
+/// Returns [`ModuleError::Compilation`] if Pulley rejects `flags`.
+pub fn frontend_isa(
+    flags: settings::Flags,
+    address_type: AddressType,
+) -> ModuleResult<OwnedTargetIsa> {
+    let name = match address_type {
+        AddressType::I32 => "pulley32",
+        AddressType::I64 => "pulley64",
+    };
     let builder = cranelift_codegen::isa::lookup_by_name(name)
         .map_err(|e| ModuleError::Compilation(CodegenError::Unsupported(e.to_string())))?;
     builder.finish(flags).map_err(ModuleError::Compilation)
@@ -77,6 +89,17 @@ pub struct ObjectOptions {
     pub import_names: Box<dyn Fn(&str) -> Option<(String, String)> + Send + Sync>,
 }
 
+impl std::fmt::Debug for ObjectOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectOptions")
+            .field("config", &self.config)
+            .field("threads", &self.threads)
+            .field("features", &self.features)
+            .field("stub_unsupported", &self.stub_unsupported)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A `cranelift_module::Module` writing a relocatable wasm object.
 pub struct WasmObjectModule {
     isa: OwnedTargetIsa,
@@ -94,6 +117,19 @@ pub struct WasmObjectModule {
     used_data: SecondaryMap<DataId, bool>,
     libcalls: HashMap<LibCall, SymbolId>,
     warnings: Vec<String>,
+}
+
+impl std::fmt::Debug for WasmObjectModule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WasmObjectModule")
+            .field("isa", &self.isa.name())
+            .field("obj", &self.obj)
+            .field("config", &self.config)
+            .field("threads", &self.threads)
+            .field("stub_unsupported", &self.stub_unsupported)
+            .field("warnings", &self.warnings)
+            .finish_non_exhaustive()
+    }
 }
 
 fn unsupported_err(msg: impl Into<String>) -> ModuleError {
@@ -122,24 +158,24 @@ impl WasmObjectModule {
     /// A module whose frontend uses `isa` (see [`frontend_isa`]).
     pub fn new(isa: OwnedTargetIsa, options: ObjectOptions) -> Self {
         let mut config = options.config;
-        let memory64 = config.module.memory64;
-        let ptr = if memory64 { ValType::I64 } else { ValType::I32 };
-        let mut obj = ObjectBuilder::new(memory64);
+        let address_type = config.module.address_type;
+        let ptr = address_type.val_type();
+        let mut obj = ObjectBuilder::new(address_type);
         // Unused ones are dropped when the object is written.
-        let sp = obj.global("__stack_pointer", ptr, true);
-        let table = obj.table("__indirect_function_table");
+        let sp = obj.declare_global("__stack_pointer", ptr, Mutability::Mutable);
+        let table = obj.declare_table("__indirect_function_table");
         config.module.relocatable = true;
         config.module.stack_pointer_global = Some(sp.into());
         config.module.table_index = Some(table.into());
         config.module.tls_base_global = None;
         if options.threads {
-            let tls = obj.global("__tls_base", ptr, true);
+            let tls = obj.declare_global("__tls_base", ptr, Mutability::Mutable);
             config.module.tls_base_global = Some(tls.into());
         }
         config.module.pinned_reg_global = None;
         config.module.atomic_lock_table_addr = None;
         for f in &options.features {
-            obj.feature(f);
+            obj.add_feature(f);
         }
         WasmObjectModule {
             isa,
@@ -186,7 +222,7 @@ impl WasmObjectModule {
             Some((module, field)) => self
                 .obj
                 .import_function(&name, flags, &module, &field, &p, &r),
-            None => self.obj.function(&name, flags, &p, &r),
+            None => self.obj.declare_function(&name, flags, &p, &r),
         };
         self.funcs[id] = Some(s);
         Ok(s)
@@ -199,8 +235,12 @@ impl WasmObjectModule {
         let decl = self.declarations.get_data_decl(id);
         let name = decl.linkage_name(id).into_owned();
         let flags = flags_for(decl.linkage);
-        let tls = decl.tls && self.threads;
-        let s = self.obj.data(&name, flags, tls);
+        let storage = if decl.tls && self.threads {
+            DataStorage::ThreadLocal
+        } else {
+            DataStorage::Static
+        };
+        let s = self.obj.declare_data(&name, flags, storage);
         self.data[id] = Some(s);
         s
     }
@@ -211,7 +251,9 @@ impl WasmObjectModule {
         }
         let name = (self.libcall_names)(lc);
         let (p, r) = self.wasm_sig(sig)?;
-        let s = self.obj.function(&name, SymbolFlags::default(), &p, &r);
+        let s = self
+            .obj
+            .declare_function(&name, SymbolFlags::default(), &p, &r);
         self.libcalls.insert(lc, s);
         Ok(s)
     }
@@ -453,7 +495,11 @@ impl Module for WasmObjectModule {
             )));
         }
         self.defined_data[data_id] = true;
-        let writable = decl.writable;
+        let mutability = if decl.writable {
+            Mutability::Mutable
+        } else {
+            Mutability::Immutable
+        };
         let bytes = match &data.init {
             Init::Uninitialized => panic!("data {name} is not initialized"),
             Init::Zeros { size } => vec![0; *size],
@@ -484,7 +530,7 @@ impl Module for WasmObjectModule {
             DataDef {
                 bytes,
                 align,
-                writable,
+                mutability,
                 relocs,
             },
         );

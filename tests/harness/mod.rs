@@ -7,8 +7,8 @@ pub mod clifgen;
 pub mod kernels;
 
 use clif_to_wasm::{
-    Config, Env, Error, FuncIndex, ModuleBuilder, Name, TagIndex, TypeIndex, compile_function,
-    wasm_signature,
+    AddressType, Config, Env, Error, FuncIndex, ModuleBuilder, Name, TagIndex, TypeIndex,
+    compile_function, wasm_signature,
 };
 use cranelift_codegen::data_value::DataValue;
 use cranelift_codegen::ir::{
@@ -171,7 +171,7 @@ pub fn compile_module(funcs: &[Function], config: &Config) -> (Vec<u8>, Vec<Stri
     let payload = [ValType::I64, ValType::I64];
     let tags: HashMap<u32, TagIndex> = used_tags
         .into_iter()
-        .map(|n| (n, builder.tag(&payload)))
+        .map(|n| (n, builder.define_tag(&payload)))
         .collect();
     for (name, n) in &throwers {
         let idx = builder.declare_function(&payload, &[]);
@@ -196,22 +196,17 @@ pub fn compile_module(funcs: &[Function], config: &Config) -> (Vec<u8>, Vec<Stri
             },
         );
     }
-    let memory = builder.memory(MEMORY_PAGES, config.module.memory64);
+    let memory = builder.define_memory(MEMORY_PAGES, config.module.address_type);
     builder.export("memory", memory);
     let table = builder.function_table();
-    let sp = builder.global(
-        if config.module.memory64 {
-            ValType::I64
-        } else {
-            ValType::I32
-        },
-        if config.module.memory64 {
-            ConstExpr::i64_const(STACK_TOP as i64)
-        } else {
-            ConstExpr::i32_const(STACK_TOP)
+    let sp = builder.define_global(
+        config.module.address_type.val_type(),
+        match config.module.address_type {
+            AddressType::I32 => ConstExpr::i32_const(STACK_TOP),
+            AddressType::I64 => ConstExpr::i64_const(STACK_TOP as i64),
         },
     );
-    let pinned = builder.global(ValType::I64, ConstExpr::i64_const(0));
+    let pinned = builder.define_global(ValType::I64, ConstExpr::i64_const(0));
     let mut config = config.clone();
     config.module.pinned_reg_global = Some(pinned);
     config.module.table_index = Some(table);

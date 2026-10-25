@@ -62,7 +62,10 @@ pub(crate) fn prepare<'a>(
     }
     let mut f = func.clone();
     if demote {
-        let ptr = if layout.memory64 { I64 } else { I32 };
+        let ptr = match layout.address_type {
+            crate::AddressType::I32 => I32,
+            crate::AddressType::I64 => I64,
+        };
         crate::legalize_abi::demote(&mut f, ptr)?;
     }
     f.dfg.resolve_all_aliases();

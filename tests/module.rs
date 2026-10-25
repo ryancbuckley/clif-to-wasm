@@ -6,8 +6,8 @@
 mod harness;
 
 use clif_to_wasm::{
-    CompiledFunction, Config, Env, Error, FuncIndex, ModuleBuilder, Name, TableIndex, TypeIndex,
-    compile_function, wasm_signature,
+    AddressType, CompiledFunction, Config, Env, Error, FuncIndex, ModuleBuilder, Name, TableIndex,
+    TypeIndex, compile_function, wasm_signature,
 };
 use cranelift_codegen::ir::Function;
 use cranelift_reader::parse_functions;
@@ -131,9 +131,9 @@ fn jit_module_links_into_host() {
     // The host: defines memory, table and stack pointer, and exports them.
     let host_funcs = parse_functions(HOST).unwrap();
     let mut host = ModuleBuilder::new();
-    let mem = host.memory(1, false);
+    let mem = host.define_memory(1, AddressType::I32);
     let table = host.function_table();
-    let sp = host.global(ValType::I32, ConstExpr::i32_const(STACK_TOP));
+    let sp = host.define_global(ValType::I32, ConstExpr::i32_const(STACK_TOP));
     host.export("memory", mem);
     host.export("table", table);
     host.export("sp", sp);

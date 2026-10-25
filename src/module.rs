@@ -15,7 +15,7 @@
 //! Embedders with custom section needs can use `wasm_encoder` directly with
 //! [`CompiledFunction::to_wasm_function`].
 
-use crate::CompiledFunction;
+use crate::{AddressType, CompiledFunction};
 use std::marker::PhantomData;
 use wasm_encoder::{
     CodeSection, ConstExpr, ElementSection, Elements, EntityType, ExportKind, ExportSection,
@@ -76,9 +76,11 @@ define_index!(
 
 /// Any WebAssembly module entity that can be exported (`FuncIndex`,
 /// `TableIndex`, `MemoryIndex`, `GlobalIndex`, or `TagIndex`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Export {
+    /// The kind of entity.
     pub kind: ExportKind,
+    /// Its index in the index space of that kind.
     pub index: u32,
 }
 
@@ -101,7 +103,31 @@ impl_export!(MemoryIndex, Memory);
 impl_export!(GlobalIndex, Global);
 impl_export!(TagIndex, Tag);
 
-#[derive(Default)]
+/// Assembles compiled functions into a WebAssembly module. See the [module
+/// documentation](self), and the [crate documentation](crate) for an example.
+///
+/// # Example
+///
+/// A module that defines and exports a memory and a stack pointer for the
+/// functions it will hold:
+///
+/// ```
+/// use clif_to_wasm::wasm_encoder::{ConstExpr, ValType};
+/// use clif_to_wasm::{AddressType, Config, ModuleBuilder};
+///
+/// let mut builder = ModuleBuilder::new();
+/// let memory = builder.define_memory(1, AddressType::I32);
+/// let sp = builder.define_global(ValType::I32, ConstExpr::i32_const(65536));
+/// builder.export("memory", memory);
+///
+/// let mut config = Config::default();
+/// config.module.memory_index = memory;
+/// config.module.stack_pointer_global = Some(sp);
+/// // ... compile functions with `config`, then declare and define them.
+/// let wasm = builder.finish();
+/// # wasmparser::validate(&wasm).unwrap();
+/// ```
+#[derive(Debug, Default)]
 pub struct ModuleBuilder {
     types: Vec<(Vec<ValType>, Vec<ValType>)>,
     imports: Vec<(String, String, EntityType)>,
@@ -124,6 +150,7 @@ pub struct ModuleBuilder {
 /// In every WebAssembly index space, imports precede definitions, so all
 /// imports of a given kind must be registered before any definition of that
 /// kind; otherwise indices already handed out would shift.
+#[derive(Debug)]
 struct IndexSpace<Idx, D, I = ()> {
     imported: Vec<I>,
     defined: Vec<D>,
@@ -181,6 +208,7 @@ impl<Idx: Into<u32>, T> IndexSpace<Idx, T, T> {
 }
 
 impl ModuleBuilder {
+    /// An empty module.
     pub fn new() -> Self {
         Self::default()
     }
@@ -201,6 +229,10 @@ impl ModuleBuilder {
     // ---- Imports ------------------------------------------------------------
 
     /// Import a function. Returns its function index.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a function has already been declared.
     pub fn import_function(
         &mut self,
         module: &str,
@@ -221,6 +253,10 @@ impl ModuleBuilder {
     /// The declared limits are a lower bound on what the provided memory must
     /// have: `minimum: 0, maximum: None` accepts any memory of the right
     /// address width (and sharedness).
+    ///
+    /// # Panics
+    ///
+    /// Panics if a memory has already been defined.
     pub fn import_memory(&mut self, module: &str, name: &str, ty: MemoryType) -> MemoryIndex {
         let idx = self
             .memories
@@ -231,6 +267,10 @@ impl ModuleBuilder {
 
     /// Import a global, such as the shadow stack pointer (which must be
     /// mutable). Returns its global index.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a global has already been defined.
     pub fn import_global(&mut self, module: &str, name: &str, ty: GlobalType) -> GlobalIndex {
         let idx = self
             .globals
@@ -242,6 +282,10 @@ impl ModuleBuilder {
     /// Import a table, such as the program's table of function references.
     /// Returns its table index. Like memories, the declared limits are a
     /// lower bound.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a table has already been defined.
     pub fn import_table(&mut self, module: &str, name: &str, ty: TableType) -> TableIndex {
         let idx = self
             .tables
@@ -252,6 +296,10 @@ impl ModuleBuilder {
 
     /// Import an exception tag whose payload has the given types. Returns
     /// its tag index.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a tag has already been defined.
     pub fn import_tag(&mut self, module: &str, name: &str, params: &[ValType]) -> TagIndex {
         let idx = self
             .tags
@@ -281,6 +329,11 @@ impl ModuleBuilder {
     }
 
     /// Provide the body of a declared function.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is not a declared function, or if the signature of
+    /// `func` differs from the declared one.
     pub fn define_function(&mut self, index: FuncIndex, func: CompiledFunction) {
         let (ty, body) = self.funcs.defined_mut(index);
         assert_eq!(
@@ -291,18 +344,18 @@ impl ModuleBuilder {
     }
 
     /// Define a linear memory. Returns its memory index.
-    pub fn memory(&mut self, min_pages: u64, memory64: bool) -> MemoryIndex {
+    pub fn define_memory(&mut self, min_pages: u64, address_type: AddressType) -> MemoryIndex {
         self.memories.define(MemoryType {
             minimum: min_pages,
             maximum: None,
-            memory64,
+            memory64: address_type == AddressType::I64,
             shared: false,
             page_size_log2: None,
         })
     }
 
     /// Define a mutable global. Returns its global index.
-    pub fn global(&mut self, ty: ValType, init: ConstExpr) -> GlobalIndex {
+    pub fn define_global(&mut self, ty: ValType, init: ConstExpr) -> GlobalIndex {
         self.globals.define((
             GlobalType {
                 val_type: ty,
@@ -315,7 +368,7 @@ impl ModuleBuilder {
 
     /// Define an exception tag whose payload has the given types. Returns its
     /// tag index.
-    pub fn tag(&mut self, params: &[ValType]) -> TagIndex {
+    pub fn define_tag(&mut self, params: &[ValType]) -> TagIndex {
         let ty = self.type_index(params, &[]);
         self.tags.define(ty)
     }
@@ -324,6 +377,10 @@ impl ModuleBuilder {
     /// function in the module, imported or defined. Returns its table index.
     /// The table has no maximum, so the embedder can grow it later, for
     /// example to make room for functions of other modules.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called more than once.
     pub fn function_table(&mut self) -> TableIndex {
         assert!(self.function_table.is_none(), "function_table called twice");
         // The size is filled in by `finish`, once all functions are known.
@@ -342,6 +399,10 @@ impl ModuleBuilder {
     /// when the module is instantiated. The slot of `funcs[i]` is
     /// `first_slot + i`, which is what `Env::func_table_slot` should return
     /// for it. Instantiation fails if the slots are out of bounds.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `table` is not a table of this module.
     pub fn place_in_table(&mut self, table: TableIndex, first_slot: u64, funcs: &[FuncIndex]) {
         assert!(self.tables.get(table).is_some(), "no table {table}");
         self.elements.push((table, first_slot, funcs.to_vec()));
@@ -349,6 +410,7 @@ impl ModuleBuilder {
 
     // ---- Exports ------------------------------------------------------------
 
+    /// Export a function. Same as [`Self::export`].
     pub fn export_function(&mut self, name: &str, index: FuncIndex) {
         self.export(name, index);
     }
@@ -359,6 +421,12 @@ impl ModuleBuilder {
         self.exports.push((name.into(), item.into()));
     }
 
+    /// Write the module.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a declared function was never defined, or if a slot given
+    /// to [`Self::place_in_table`] does not fit in a 32-bit table.
     pub fn finish(mut self) -> Vec<u8> {
         let total = self.funcs.total();
         if let Some(t) = self.function_table {
@@ -551,7 +619,7 @@ mod tests {
                 prop_assert_eq!(m, MemoryIndex(0));
             }
             if def_mem {
-                let m = b.memory(1, mem64);
+                let m = b.define_memory(1, if mem64 { AddressType::I64 } else { AddressType::I32 });
                 prop_assert_eq!(m, MemoryIndex(import_mem as u32));
                 b.export("mem_export", m);
             }
@@ -577,7 +645,7 @@ mod tests {
                     ValType::V128 => ConstExpr::v128_const(0),
                     _ => unreachable!(),
                 };
-                let g = b.global(vt, init);
+                let g = b.define_global(vt, init);
                 prop_assert_eq!(g, GlobalIndex((imported_globals.len() + i) as u32));
                 b.export(&format!("eglob_{i}"), g);
             }
@@ -587,7 +655,7 @@ mod tests {
                 prop_assert_eq!(t, TagIndex(i as u32));
             }
             for (i, params) in defined_tags.iter().enumerate() {
-                let t = b.tag(params);
+                let t = b.define_tag(params);
                 prop_assert_eq!(t, TagIndex((imported_tags.len() + i) as u32));
                 b.export(&format!("etag_{i}"), t);
             }
