@@ -47,6 +47,7 @@ mod structure;
 pub use module::{
     Export, FuncIndex, GlobalIndex, MemoryIndex, ModuleBuilder, TableIndex, TagIndex, TypeIndex,
 };
+pub use object::SymbolId;
 
 /// Errors that can occur during compilation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,9 +228,9 @@ pub enum SymbolValue {
     Const(u64),
     /// Address held in a wasm global.
     Global(GlobalIndex),
-    /// Data symbol index in the object's symbol table (for
+    /// Data symbol in the object's symbol table (for
     /// [`ModuleLayout::relocatable`]).
-    Symbol(u32),
+    Symbol(SymbolId),
 }
 
 /// Resolves external references from a function to entities in the surrounding
@@ -238,9 +239,9 @@ pub trait Env {
     /// Wasm function index (or symbol index when relocatable) of a direct callee.
     fn func_index(&mut self, name: Name<'_>) -> Result<FuncIndex>;
 
-    /// Wasm type index of a signature for `call_indirect`.
-    fn type_index(&mut self, sig: &Signature) -> Result<TypeIndex> {
-        let _ = sig;
+    /// Wasm type index of a function or block type (`params -> results`).
+    fn type_index(&mut self, params: &[ValType], results: &[ValType]) -> Result<TypeIndex> {
+        let _ = (params, results);
         Err(Error::Env("call_indirect requires Env::type_index".into()))
     }
 
@@ -381,8 +382,12 @@ pub(crate) fn fixed_type(ty: ir::Type) -> ir::Type {
 }
 
 /// Map a Cranelift signature to wasm parameter and result types, splitting each
-/// `i128` or `f128` into two `i64`s (low half first).
-pub fn wasm_signature(sig: &Signature) -> Result<(Vec<ValType>, Vec<ValType>)> {
+/// `i128` or `f128` into two `i64`s (low half first) and applying
+/// [`ModuleLayout::demote_multi_results`] when enabled in `layout`.
+pub fn wasm_signature(
+    sig: &Signature,
+    layout: &ModuleLayout,
+) -> Result<(Vec<ValType>, Vec<ValType>)> {
     let lower = |ps: &[ir::AbiParam]| -> Result<Vec<ValType>> {
         let mut out = Vec::with_capacity(ps.len());
         for p in ps {
@@ -394,16 +399,7 @@ pub fn wasm_signature(sig: &Signature) -> Result<(Vec<ValType>, Vec<ValType>)> {
         }
         Ok(out)
     };
-    Ok((lower(&sig.params)?, lower(&sig.returns)?))
-}
-
-/// Like [`wasm_signature`], also applying [`ModuleLayout::demote_multi_results`]
-/// when enabled in `layout`.
-pub fn wasm_signature_in(
-    sig: &Signature,
-    layout: &ModuleLayout,
-) -> Result<(Vec<ValType>, Vec<ValType>)> {
-    let (mut params, mut results) = wasm_signature(sig)?;
+    let (mut params, mut results) = (lower(&sig.params)?, lower(&sig.returns)?);
     if layout.demote_multi_results && results.len() > 1 {
         params.insert(0, layout.ptr_ty());
         results.clear();

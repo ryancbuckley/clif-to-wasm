@@ -90,7 +90,11 @@ impl Emitter<'_> {
                     e.ins(w!(ty, I32ReinterpretF32, I64ReinterpretF64));
                     Ok(())
                 };
-                let ones = if wide { I::I64Const(-1) } else { I::I32Const(-1) };
+                let ones = if wide {
+                    I::I64Const(-1)
+                } else {
+                    I::I32Const(-1)
+                };
                 match op {
                     Opcode::Bnot => {
                         bits(self)?;
@@ -659,10 +663,7 @@ impl Emitter<'_> {
                     stack_slot, offset, ..
                 },
             ) => self.stack_addr(stack_slot, offset.into(), ty)?,
-            (
-                Opcode::SymbolValue | Opcode::TlsValue,
-                D::UnaryGlobalValue { global_value, .. },
-            ) => {
+            (Opcode::SymbolValue | Opcode::TlsValue, D::UnaryGlobalValue { global_value, .. }) => {
                 let gv = &func.global_values[global_value];
                 let cranelift_codegen::ir::GlobalValueData::Symbol { name, offset, .. } = gv else {
                     return unsupported(format!("global value {gv}"));
@@ -692,7 +693,7 @@ impl Emitter<'_> {
                         } else {
                             (R::MemoryAddrSleb, R::MemoryAddrSleb64)
                         };
-                        self.reloc_const(ty, k32, k64, sym, offset);
+                        self.reloc_const(ty, k32, k64, sym.0, offset);
                     }
                 }
                 if tls {

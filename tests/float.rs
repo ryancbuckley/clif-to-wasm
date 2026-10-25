@@ -115,7 +115,10 @@ block0(v0: f16):
             if f16_is_nan(h) {
                 // A NaN stays a NaN with its sign; its payload survives
                 // as far as the conversions keep it.
-                assert!(f16_is_nan(back) && back & 0x8000 == h & 0x8000, "{h:#x} -> {back:#x}");
+                assert!(
+                    f16_is_nan(back) && back & 0x8000 == h & 0x8000,
+                    "{h:#x} -> {back:#x}"
+                );
             } else {
                 assert_eq!(back, h, "{h:#x}");
             }
@@ -123,7 +126,14 @@ block0(v0: f16):
         if f16_is_nan(h) {
             assert!(x.is_nan());
         } else if h & 0x7fff == 0x7c00 {
-            assert_eq!(x, if h & 0x8000 != 0 { f64::NEG_INFINITY } else { f64::INFINITY });
+            assert_eq!(
+                x,
+                if h & 0x8000 != 0 {
+                    f64::NEG_INFINITY
+                } else {
+                    f64::INFINITY
+                }
+            );
         } else {
             assert_eq!(x.to_bits(), f16_value(h).to_bits(), "{h:#x}");
         }
@@ -159,11 +169,7 @@ block0(v0: f32):
         };
         let mid = (lo + hi) / 2.0;
         let even = if h % 2 == 0 { h } else { h + 1 };
-        let cases64 = [
-            (mid, even),
-            (mid.next_up(), h + 1),
-            (mid.next_down(), h),
-        ];
+        let cases64 = [(mid, even), (mid.next_up(), h + 1), (mid.next_down(), h)];
         let mid32 = mid as f32;
         assert_eq!(mid32 as f64, mid);
         let cases32 = [
@@ -283,7 +289,11 @@ block0(v0: f32, v1: f32, v2: f32):
         let a = (rng.next() as u32 % 2_000_000) as f32 / 1024.0 - 900.0;
         let b = (rng.next() as u32 % 2_000_000) as f32 / 1024.0 - 900.0;
         let near = -(a * b);
-        let c = f32::from_bits(near.to_bits().wrapping_add(rng.next() as u32 % 5).wrapping_sub(2));
+        let c = f32::from_bits(
+            near.to_bits()
+                .wrapping_add(rng.next() as u32 % 5)
+                .wrapping_sub(2),
+        );
         check(&mut store, a, b, c);
         // Products near a halfway point of the result.
         let c = (rng.next() as u32 % 1000) as f32 * 2f32.powi(-30);
@@ -419,12 +429,14 @@ block0(v0: f64, v1: f64, v2: f64):
     // Finite product that would overflow f64.mul to +Inf, plus -Inf, must be -Inf (not NaN).
     check(&mut store, 1e200, 1e200, f64::NEG_INFINITY);
     assert_eq!(
-        fma.call(&mut store, (1e200, 1e200, f64::NEG_INFINITY)).unwrap(),
+        fma.call(&mut store, (1e200, 1e200, f64::NEG_INFINITY))
+            .unwrap(),
         f64::NEG_INFINITY
     );
     check(&mut store, -1e200, 1e200, f64::INFINITY);
     assert_eq!(
-        fma.call(&mut store, (-1e200, 1e200, f64::INFINITY)).unwrap(),
+        fma.call(&mut store, (-1e200, 1e200, f64::INFINITY))
+            .unwrap(),
         f64::INFINITY
     );
 
@@ -432,7 +444,9 @@ block0(v0: f64, v1: f64, v2: f64):
     // 1) Underflowing negative product + (+0.0) must preserve -0.0.
     check(&mut store, -1e-300, 1e-300, 0.0);
     assert_eq!(
-        fma.call(&mut store, (-1e-300, 1e-300, 0.0)).unwrap().to_bits(),
+        fma.call(&mut store, (-1e-300, 1e-300, 0.0))
+            .unwrap()
+            .to_bits(),
         (-0.0f64).to_bits()
     );
     // 2) Non-zero difference of finite non-zero operands that underflows below 2^-1075
@@ -442,12 +456,16 @@ block0(v0: f64, v1: f64, v2: f64):
     let min_sub = f64::from_bits(1); // 2^-1074
     check(&mut store, tiny_a, tiny_b, -min_sub);
     assert_eq!(
-        fma.call(&mut store, (tiny_a, tiny_b, -min_sub)).unwrap().to_bits(),
+        fma.call(&mut store, (tiny_a, tiny_b, -min_sub))
+            .unwrap()
+            .to_bits(),
         (-0.0f64).to_bits()
     );
     check(&mut store, -tiny_a, tiny_b, min_sub);
     assert_eq!(
-        fma.call(&mut store, (-tiny_a, tiny_b, min_sub)).unwrap().to_bits(),
+        fma.call(&mut store, (-tiny_a, tiny_b, min_sub))
+            .unwrap()
+            .to_bits(),
         0.0f64.to_bits()
     );
 
@@ -459,7 +477,10 @@ block0(v0: f64, v1: f64, v2: f64):
     let db = 2f64.powi(-27) * (1.0 - f64::EPSILON);
     for (da, c) in [(da, c), (-da, -c)] {
         check(&mut store, da, db, c);
-        assert_eq!(fma.call(&mut store, (da, db, c)).unwrap().to_bits(), c.to_bits());
+        assert_eq!(
+            fma.call(&mut store, (da, db, c)).unwrap().to_bits(),
+            c.to_bits()
+        );
     }
 
     // Subnormal-to-normal rounding carry: largest subnormal + 0.5 * min_subnormal
@@ -467,7 +488,9 @@ block0(v0: f64, v1: f64, v2: f64):
     let max_sub = f64::from_bits(0x000f_ffff_ffff_ffff);
     check(&mut store, min_sub, 0.5, max_sub);
     assert_eq!(
-        fma.call(&mut store, (min_sub, 0.5, max_sub)).unwrap().to_bits(),
+        fma.call(&mut store, (min_sub, 0.5, max_sub))
+            .unwrap()
+            .to_bits(),
         f64::MIN_POSITIVE.to_bits()
     );
 
@@ -482,7 +505,8 @@ block0(v0: f64, v1: f64, v2: f64):
     );
     check(&mut store, half_ulp_max, 1.0 - f64::EPSILON, f64::MAX);
     assert_eq!(
-        fma.call(&mut store, (half_ulp_max, 1.0 - f64::EPSILON, f64::MAX)).unwrap(),
+        fma.call(&mut store, (half_ulp_max, 1.0 - f64::EPSILON, f64::MAX))
+            .unwrap(),
         f64::MAX
     );
 
@@ -533,7 +557,9 @@ block0(v0: f16, v1: f16, v2: f16):
     for _ in 0..100_000 {
         let (a, b, c) = (finite(&mut rng), finite(&mut rng), finite(&mut rng));
         let exact = scaled(a) * scaled(b) + (scaled(c) << 24);
-        let got = fma.call(&mut store, (a.into(), b.into(), c.into())).unwrap() as u16;
+        let got = fma
+            .call(&mut store, (a.into(), b.into(), c.into()))
+            .unwrap() as u16;
         let want = if exact == 0 {
             // An exact zero is +0, unless both terms are -0 or the
             // product's and c's zeros are both negative.

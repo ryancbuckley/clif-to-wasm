@@ -487,9 +487,7 @@ fn new_slot(slots: &mut Vec<Slot>, classes: &mut Vec<Class>, ty: ValType) -> Loc
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cranelift_codegen::cursor::{Cursor, FuncCursor};
-    use cranelift_codegen::ir::{AbiParam, BlockArg, BlockCall, InstBuilder, Signature, types};
-    use cranelift_codegen::isa::CallConv;
+    use crate::analysis::tests::arb_function;
     use proptest::prelude::*;
     use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -498,7 +496,10 @@ mod tests {
         for &(lo, hi) in segs {
             assert!(lo.0 < hi.0, "invalid segment ({lo:?}, {hi:?})");
             for p in lo.0..hi.0 {
-                assert!(pts.insert(p), "overlapping segments in single list: {segs:?}");
+                assert!(
+                    pts.insert(p),
+                    "overlapping segments in single list: {segs:?}"
+                );
             }
         }
         pts
@@ -525,144 +526,6 @@ mod tests {
         NewSlot,
         TakeFree { delta_lo: u32, duration: u32 },
         ExtendExisting { slot_seed: usize, extra: u32 },
-    }
-
-    /// Strategy generating a random multi-block Cranelift `Function` with
-    /// loops, diamond merges, block parameters, and multi-result instructions.
-    fn cfg_func_strategy() -> impl Strategy<Value = Function> {
-        (
-            1usize..=6,
-            prop::collection::vec(0usize..=3, 1..=6),
-            prop::collection::vec(
-                prop::collection::vec((0u8..7, 0usize..16, 0usize..16), 0..=6),
-                1..=6,
-            ),
-            prop::collection::vec((0u8..4, 0usize..6, 0usize..6, 0usize..16), 1..=6),
-        )
-            .prop_map(|(num_blocks, param_counts, block_insts, terms)| {
-                let mut sig = Signature::new(CallConv::SystemV);
-                sig.params.push(AbiParam::new(types::I32));
-                sig.params.push(AbiParam::new(types::I64));
-                sig.returns.push(AbiParam::new(types::I32));
-                let mut func = Function::with_name_signature( Default::default(), sig);
-
-                let blocks: Vec<Block> = (0..num_blocks).map(|_| func.dfg.make_block()).collect();
-                for (bi, &b) in blocks.iter().enumerate() {
-                    func.layout.append_block(b);
-                    if bi == 0 {
-                        func.dfg.append_block_param(b, types::I32);
-                        func.dfg.append_block_param(b, types::I64);
-                    } else {
-                        let np = param_counts.get(bi).copied().unwrap_or(0);
-                        for pi in 0..np {
-                            let ty = if pi % 2 == 0 { types::I32 } else { types::I64 };
-                            func.dfg.append_block_param(b, ty);
-                        }
-                    }
-                }
-
-                // Track values defined in each block so uses inside that block
-                // (or in blocks dominated by entry) are always valid SSA.
-                let entry_i32 = func.dfg.block_params(blocks[0])[0];
-                let entry_i64 = func.dfg.block_params(blocks[0])[1];
-                let mut block_vals: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(num_blocks);
-
-                for bi in 0..num_blocks {
-                    let b = blocks[bi];
-                    let mut i32s = vec![entry_i32];
-                    let mut i64s = vec![entry_i64];
-                    if bi > 0 {
-                        for &p in func.dfg.block_params(b) {
-                            if func.dfg.value_type(p) == types::I32 {
-                                i32s.push(p);
-                            } else {
-                                i64s.push(p);
-                            }
-                        }
-                    }
-                    let mut pos = FuncCursor::new(&mut func).at_bottom(b);
-                    if let Some(ops) = block_insts.get(bi) {
-                        for &(kind, a_idx, b_idx) in ops {
-                            let a32 = i32s[a_idx % i32s.len()];
-                            let b32 = i32s[b_idx % i32s.len()];
-                            let a64 = i64s[a_idx % i64s.len()];
-                            let b64 = i64s[b_idx % i64s.len()];
-                            match kind {
-                                0 => i32s.push(pos.ins().iadd(a32, b32)),
-                                1 => i32s.push(pos.ins().isub(a32, b32)),
-                                2 => i64s.push(pos.ins().iadd(a64, b64)),
-                                3 => i64s.push(pos.ins().imul(a64, b64)),
-                                4 => {
-                                    let c = pos.ins().iconst(types::I32, (a_idx as i64) - 3);
-                                    i32s.push(c);
-                                }
-                                5 => {
-                                    let (sum, carry) = pos.ins().uadd_overflow(a32, b32);
-                                    i32s.push(sum);
-                                    let ext = pos.ins().uextend(types::I32, carry);
-                                    i32s.push(ext);
-                                }
-                                _ => {
-                                    let s = pos.ins().select(a32, b64, a64);
-                                    i64s.push(s);
-                                }
-                            }
-                        }
-                    }
-                    block_vals.push((i32s, i64s));
-                }
-
-                let make_call = |func: &mut Function,
-                                 target: Block,
-                                 i32s: &[Value],
-                                 i64s: &[Value],
-                                 seed: usize|
-                 -> BlockCall {
-                    let params: Vec<Value> = func.dfg.block_params(target).to_vec();
-                    let mut args = Vec::with_capacity(params.len());
-                    for (pi, p) in params.into_iter().enumerate() {
-                        let v = if func.dfg.value_type(p) == types::I32 {
-                            i32s[(seed + pi) % i32s.len()]
-                        } else {
-                            i64s[(seed + pi) % i64s.len()]
-                        };
-                        args.push(BlockArg::Value(v));
-                    }
-                    func.dfg.block_call(target, &args)
-                };
-
-                for bi in 0..num_blocks {
-                    let b = blocks[bi];
-                    let (ref i32s, ref i64s) = block_vals[bi];
-                    let &(tkind, t1, t2, vseed) = terms.get(bi).unwrap_or(&(0, 0, 0, 0));
-                    let cond = i32s[vseed % i32s.len()];
-                    let ret_val = i32s[(vseed + 1) % i32s.len()];
-                    // Entry block cannot be branched to because it has entry parameters.
-                    if num_blocks == 1 || tkind == 0 {
-                        let mut pos = FuncCursor::new(&mut func).at_bottom(b);
-                        pos.ins().return_(&[ret_val]);
-                    } else {
-                        let target1 = blocks[1 + (t1 % (num_blocks - 1))];
-                        let target2 = blocks[1 + (t2 % (num_blocks - 1))];
-                        if tkind == 1 {
-                            let call = make_call(&mut func, target1, i32s, i64s, vseed);
-                            let mut pos = FuncCursor::new(&mut func).at_bottom(b);
-                            let args: Vec<BlockArg> =
-                                call.args(&pos.func.dfg.value_lists).collect();
-                            pos.ins().jump(target1, &args);
-                        } else {
-                            let c1 = make_call(&mut func, target1, i32s, i64s, vseed);
-                            let c2 = make_call(&mut func, target2, i32s, i64s, vseed + 1);
-                            let mut pos = FuncCursor::new(&mut func).at_bottom(b);
-                            let a1: Vec<BlockArg> = c1.args(&pos.func.dfg.value_lists).collect();
-                            let a2: Vec<BlockArg> = c2.args(&pos.func.dfg.value_lists).collect();
-                            pos.ins().brif(cond, target1, &a1, target2, &a2);
-                        }
-                    }
-                }
-
-                func
-            })
     }
 
     proptest! {
@@ -790,7 +653,7 @@ mod tests {
 
         #[test]
         fn live_ranges_and_allocation_soundness(
-            func in cfg_func_strategy(),
+            func in arb_function(),
             stack_values in any::<bool>(),
         ) {
             let info = FuncInfo::compute(&func).unwrap();
@@ -971,4 +834,3 @@ mod tests {
         }
     }
 }
-

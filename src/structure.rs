@@ -20,9 +20,8 @@ use crate::locals::{Local, Locals};
 use crate::{CompiledFunction, Config, Env, Result, unsupported, wasm_signature, wasm_type};
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::{
-    ArgumentPurpose,
-    AbiParam, Block, BlockArg, BlockCall, ExceptionTableItem, ExceptionTag, Function, Inst,
-    InstructionData, Opcode, Signature, types,
+    ArgumentPurpose, Block, BlockArg, BlockCall, ExceptionTableItem, ExceptionTag, Function, Inst,
+    InstructionData, Opcode, types,
 };
 use std::borrow::Cow;
 use wasm_encoder::{BlockType, Catch, Instruction as I, ValType};
@@ -43,7 +42,10 @@ enum Task {
     /// Emit a dominator subtree.
     Tree(Block),
     /// Move block arguments and transfer control along an edge.
-    Branch { src: Block, call: BlockCall },
+    Branch {
+        src: Block,
+        call: BlockCall,
+    },
     Else,
     /// Close the innermost label.
     End,
@@ -268,12 +270,8 @@ impl Structurer<'_> {
             unreachable!()
         };
         let jt = &dfg.jump_tables[table];
-        let pos = |call: &BlockCall| {
-            dests
-                .iter()
-                .position(|d| same_call(func, d, call))
-                .unwrap() as u32
-        };
+        let pos =
+            |call: &BlockCall| dests.iter().position(|d| same_call(func, d, call)).unwrap() as u32;
         let targets: Vec<u32> = jt.as_slice().iter().map(pos).collect();
         let default = pos(&jt.default_block());
 
@@ -349,7 +347,7 @@ impl Structurer<'_> {
         let table = &dfg.exception_tables[et];
         let sig_ref = table.signature();
         let sig = &dfg.signatures[sig_ref];
-        let (_, results) = wasm_signature(sig)?;
+        let (_, results) = wasm_signature(sig, &self.e.config.module)?;
         let normal = *table.normal_return();
         let entries: Vec<(Option<ExceptionTag>, BlockCall)> = table
             .items()
@@ -391,11 +389,7 @@ impl Structurer<'_> {
         let payload_block = match payload[..] {
             [] => BlockType::Empty,
             [t] => BlockType::Result(t),
-            _ => {
-                let mut s = Signature::new(sig.call_conv);
-                s.returns.extend(payload_ir.iter().map(|&t| AbiParam::new(t)));
-                BlockType::FunctionType(self.e.env.type_index(&s)?.0)
-            }
+            _ => BlockType::FunctionType(self.e.env.type_index(&[], &payload)?.0),
         };
 
         // One label per entry, entry 0 innermost.
@@ -421,7 +415,8 @@ impl Structurer<'_> {
 
         let result_locals: Vec<Local> = results.iter().map(|&t| self.e.new_local(t)).collect();
         let payload_locals: Vec<Local> = payload.iter().map(|&t| self.e.new_local(t)).collect();
-        self.e.ins(I::TryTable(BlockType::Empty, Cow::Owned(catches)));
+        self.e
+            .ins(I::TryTable(BlockType::Empty, Cow::Owned(catches)));
         self.labels.push(Label::Other);
         let args = dfg.inst_args(term);
         if self.e.config.module.relocatable {
@@ -471,7 +466,10 @@ impl Structurer<'_> {
             });
             self.tasks.push(Task::End);
         }
-        self.tasks.push(Task::Branch { src: b, call: normal });
+        self.tasks.push(Task::Branch {
+            src: b,
+            call: normal,
+        });
         Ok(())
     }
 

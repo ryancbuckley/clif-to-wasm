@@ -12,17 +12,18 @@
 
 mod harness;
 
+use clif_to_wasm::{Config, Optimizations};
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::data_value::DataValue;
-use cranelift_codegen::ir::{AtomicRmwOp, Endianness};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::{Ieee32, Ieee64};
 use cranelift_codegen::ir::{
-    AbiParam, Block, BlockArg, BlockCall, ExtFuncData, ExternalName, FuncRef, Function, SigRef, InstBuilder, JumpTableData,
-    MemFlagsData, Signature, StackSlot, StackSlotData, StackSlotKind, Type, UserFuncName, Value, types,
+    AbiParam, Block, BlockArg, BlockCall, ExtFuncData, ExternalName, FuncRef, Function,
+    InstBuilder, JumpTableData, MemFlagsData, SigRef, Signature, StackSlot, StackSlotData,
+    StackSlotKind, Type, UserFuncName, Value, types,
 };
+use cranelift_codegen::ir::{AtomicRmwOp, Endianness};
 use cranelift_codegen::isa::CallConv;
-use clif_to_wasm::{Config, Optimizations};
 use proptest::prelude::*;
 
 /// Scalar types first (the first five are the integers), then vectors,
@@ -147,29 +148,124 @@ fn edge(nblocks: usize, nparams: usize) -> impl Strategy<Value = Edge> {
 fn op_kinds() -> Vec<(u32, BoxedStrategy<Op>)> {
     let i = || 0usize..32;
     vec![
-        (1, (0..TYS.len(), any::<i64>()).prop_map(|(t, c)| Op::Const(t, c)).boxed()),
-        (4, (0u8..10, i(), i()).prop_map(|(k, a, b)| Op::Bin(k, a, b)).boxed()),
-        (1, (0u8..10, i(), i()).prop_map(|(k, a, b)| Op::Icmp(k, a, b)).boxed()),
-        (1, (i(), i(), i()).prop_map(|(c, a, b)| Op::Select(c, a, b)).boxed()),
-        (1, (i(), 0..TYS.len()).prop_map(|(a, t)| Op::Convert(a, t)).boxed()),
-        (1, (any::<bool>(), i(), i()).prop_map(|(s, a, b)| Op::Div(s, a, b)).boxed()),
-        (2, (i(), 0u8..4, any::<bool>()).prop_map(|(a, o, d)| Op::Store(a, o, d)).boxed()),
-        (2, (0..TYS.len(), 0u8..4, any::<bool>()).prop_map(|(t, o, d)| Op::Load(t, o, d)).boxed()),
+        (
+            1,
+            (0..TYS.len(), any::<i64>())
+                .prop_map(|(t, c)| Op::Const(t, c))
+                .boxed(),
+        ),
+        (
+            4,
+            (0u8..10, i(), i())
+                .prop_map(|(k, a, b)| Op::Bin(k, a, b))
+                .boxed(),
+        ),
+        (
+            1,
+            (0u8..10, i(), i())
+                .prop_map(|(k, a, b)| Op::Icmp(k, a, b))
+                .boxed(),
+        ),
+        (
+            1,
+            (i(), i(), i())
+                .prop_map(|(c, a, b)| Op::Select(c, a, b))
+                .boxed(),
+        ),
+        (
+            1,
+            (i(), 0..TYS.len())
+                .prop_map(|(a, t)| Op::Convert(a, t))
+                .boxed(),
+        ),
+        (
+            1,
+            (any::<bool>(), i(), i())
+                .prop_map(|(s, a, b)| Op::Div(s, a, b))
+                .boxed(),
+        ),
+        (
+            2,
+            (i(), 0u8..4, any::<bool>())
+                .prop_map(|(a, o, d)| Op::Store(a, o, d))
+                .boxed(),
+        ),
+        (
+            2,
+            (0..TYS.len(), 0u8..4, any::<bool>())
+                .prop_map(|(t, o, d)| Op::Load(t, o, d))
+                .boxed(),
+        ),
         (1, (i(), i()).prop_map(|(a, b)| Op::Call(a, b)).boxed()),
-        (2, (0u8..11, i(), any::<u8>()).prop_map(|(k, a, o)| Op::AtomicRmw(k, a, o)).boxed()),
-        (1, (i(), i(), any::<u8>()).prop_map(|(a, b, o)| Op::AtomicCas(a, b, o)).boxed()),
-        (1, (0usize..5, any::<u8>()).prop_map(|(t, o)| Op::AtomicLoad(t, o)).boxed()),
-        (1, (i(), any::<u8>()).prop_map(|(a, o)| Op::AtomicStore(a, o)).boxed()),
-        (1, (0u8..10, i(), i()).prop_map(|(k, a, b)| Op::VCmp(k, a, b)).boxed()),
-        (2, (any::<u8>(), i()).prop_map(|(k, a)| Op::VReduce(k, a)).boxed()),
-        (1, (NUM_SCALARS..TYS.len(), i()).prop_map(|(t, a)| Op::VSplat(t, a)).boxed()),
+        (
+            2,
+            (0u8..11, i(), any::<u8>())
+                .prop_map(|(k, a, o)| Op::AtomicRmw(k, a, o))
+                .boxed(),
+        ),
+        (
+            1,
+            (i(), i(), any::<u8>())
+                .prop_map(|(a, b, o)| Op::AtomicCas(a, b, o))
+                .boxed(),
+        ),
+        (
+            1,
+            (0usize..5, any::<u8>())
+                .prop_map(|(t, o)| Op::AtomicLoad(t, o))
+                .boxed(),
+        ),
+        (
+            1,
+            (i(), any::<u8>())
+                .prop_map(|(a, o)| Op::AtomicStore(a, o))
+                .boxed(),
+        ),
+        (
+            1,
+            (0u8..10, i(), i())
+                .prop_map(|(k, a, b)| Op::VCmp(k, a, b))
+                .boxed(),
+        ),
+        (
+            2,
+            (any::<u8>(), i())
+                .prop_map(|(k, a)| Op::VReduce(k, a))
+                .boxed(),
+        ),
+        (
+            1,
+            (NUM_SCALARS..TYS.len(), i())
+                .prop_map(|(t, a)| Op::VSplat(t, a))
+                .boxed(),
+        ),
         (1, (0u8..4, i()).prop_map(|(k, a)| Op::VWiden(k, a)).boxed()),
-        (1, (0u8..3, i(), i()).prop_map(|(k, a, b)| Op::VNarrow(k, a, b)).boxed()),
+        (
+            1,
+            (0u8..3, i(), i())
+                .prop_map(|(k, a, b)| Op::VNarrow(k, a, b))
+                .boxed(),
+        ),
         (1, (i(), i()).prop_map(|(a, b)| Op::VPairwise(a, b)).boxed()),
         (1, i().prop_map(Op::VBitcast).boxed()),
-        (2, (i(), any::<u8>(), any::<bool>()).prop_map(|(a, o, ind)| Op::CallByval(a, o, ind)).boxed()),
-        (1, (i(), any::<u8>()).prop_map(|(a, o)| Op::CallWrite(a, o)).boxed()),
-        (2, (any::<u8>(), i(), i()).prop_map(|(k, a, b)| Op::VInsert(k, a, b)).boxed()),
+        (
+            2,
+            (i(), any::<u8>(), any::<bool>())
+                .prop_map(|(a, o, ind)| Op::CallByval(a, o, ind))
+                .boxed(),
+        ),
+        (
+            1,
+            (i(), any::<u8>())
+                .prop_map(|(a, o)| Op::CallWrite(a, o))
+                .boxed(),
+        ),
+        (
+            2,
+            (any::<u8>(), i(), i())
+                .prop_map(|(k, a, b)| Op::VInsert(k, a, b))
+                .boxed(),
+        ),
         (
             1,
             (0..NARROW_CALLEES.len(), i(), i(), any::<bool>())
@@ -261,7 +357,9 @@ fn is_narrow_int(t: Type) -> bool {
 fn digest(pos: &mut FuncCursor, slot: StackSlot) -> Value {
     let mut d = pos.ins().iconst(types::I64, 0);
     for off in (0..SLOT_SIZE).step_by(8) {
-        let w = pos.ins().stack_load(types::I64, types::I64, slot, off as i32);
+        let w = pos
+            .ins()
+            .stack_load(types::I64, types::I64, slot, off as i32);
         let r = pos.ins().rotl_imm_u(d, 7);
         d = pos.ins().bxor(r, w);
     }
@@ -277,6 +375,7 @@ fn atomic_addr(pos: &mut FuncCursor, slot: StackSlot, ty: Type, o: u8) -> Value 
 
 /// Lower `op` at `pos`, returning its result if it has one. Ops whose
 /// operands have no suitable value are skipped.
+#[allow(clippy::too_many_arguments)]
 fn lower_op(
     pos: &mut FuncCursor,
     pool: &mut Pool,
@@ -439,7 +538,8 @@ fn lower_op(
             let a = pool.pick(pos.func, None, a)?;
             if direct {
                 let p = pos.ins().stack_addr(types::I64, slot, 0);
-                pos.ins().store(MemFlagsData::new().with_notrap(), a, p, o as i32 * 8);
+                pos.ins()
+                    .store(MemFlagsData::new().with_notrap(), a, p, o as i32 * 8);
             } else {
                 pos.ins().stack_store(types::I64, a, slot, o as i32 * 8);
             }
@@ -448,7 +548,8 @@ fn lower_op(
         Op::Load(t, o, direct) => {
             if direct {
                 let p = pos.ins().stack_addr(types::I64, slot, 0);
-                pos.ins().load(TYS[t], MemFlagsData::new().with_notrap(), p, o as i32 * 8)
+                pos.ins()
+                    .load(TYS[t], MemFlagsData::new().with_notrap(), p, o as i32 * 8)
             } else {
                 pos.ins().stack_load(types::I64, TYS[t], slot, o as i32 * 8)
             }
@@ -519,7 +620,9 @@ fn lower_op(
                     let r = if k & 4 == 0 { types::I32 } else { types::I64 };
                     pos.ins().vhigh_bits(r, a)
                 }
-                _ => pos.ins().extractlane(a, (k as u32 / 4 % ty.lane_count()) as u8),
+                _ => pos
+                    .ins()
+                    .extractlane(a, (k as u32 / 4 % ty.lane_count()) as u8),
             }
         }
         Op::VSplat(t, a) => {
@@ -530,7 +633,12 @@ fn lower_op(
         Op::VWiden(k, a) => {
             let a = pool.pick_where(
                 pos.func,
-                |t| t.is_vector() && t.lane_type().is_int() && t.lane_bits() < 64 && t.lane_count() >= 4,
+                |t| {
+                    t.is_vector()
+                        && t.lane_type().is_int()
+                        && t.lane_bits() < 64
+                        && t.lane_count() >= 4
+                },
                 a,
             )?;
             let ins = pos.ins();
@@ -570,7 +678,8 @@ fn lower_op(
             let a = pool.pick_where(pos.func, |t| t.is_vector(), a)?;
             let ty = ty_of(pos, a);
             let b = pool.pick(pos.func, Some(ty.lane_type()), b)?;
-            pos.ins().insertlane(a, b, (k as u32 % ty.lane_count()) as u8)
+            pos.ins()
+                .insertlane(a, b, (k as u32 % ty.lane_count()) as u8)
         }
         Op::VBitcast(a) => {
             // Only from vectors of at most 64 bits to integers:
@@ -590,7 +699,11 @@ fn lower_op(
         }
         Op::CallByval(a, o, indirect) => {
             let a = pool.pick(pos.func, Some(types::I64), a)?;
-            if let cranelift_codegen::ir::ValueDef::Result(d, _) = pos.func.dfg.value_def(a) && pos.func.dfg.insts[d].opcode().is_call() { stat("nested-call-arg"); }
+            if let cranelift_codegen::ir::ValueDef::Result(d, _) = pos.func.dfg.value_def(a)
+                && pos.func.dfg.insts[d].opcode().is_call()
+            {
+                stat("nested-call-arg");
+            }
             let off = (o as u32 % (SLOT_SIZE / 8 - 1)) * 8;
             let p = pos.ins().stack_addr(types::I64, slot, off as i32);
             let out_off = (o as u32 / 8 % (SLOT_SIZE / 8)) * 8;
@@ -709,7 +822,8 @@ fn build(spec: &Spec) -> Function {
     let mut gsig = Signature::new(CallConv::SystemV);
     gsig.params
         .extend([types::I64, types::I32, types::I64].map(AbiParam::new));
-    gsig.returns.extend([types::I32, types::I64].map(AbiParam::new));
+    gsig.returns
+        .extend([types::I32, types::I64].map(AbiParam::new));
     let gsig = func.import_signature(gsig);
     let g = func.import_function(ExtFuncData {
         name: ExternalName::testcase("g"),
@@ -734,7 +848,9 @@ fn build(spec: &Spec) -> Function {
         .collect();
 
     let byval = {
-        let callee = cranelift_reader::parse_functions(BYVAL_CALLEE).unwrap().remove(0);
+        let callee = cranelift_reader::parse_functions(BYVAL_CALLEE)
+            .unwrap()
+            .remove(0);
         let sig = func.import_signature(callee.signature.clone());
         let f = func.import_function(ExtFuncData {
             name: ExternalName::testcase("s"),
@@ -771,7 +887,9 @@ fn build(spec: &Spec) -> Function {
     // A different word at each offset, so that reading the wrong part of
     // the slot shows.
     for off in (0..SLOT_SIZE).step_by(8) {
-        let w = pos.ins().iconst(types::I64, (off as i64 + 1) * 0x0101_0101_0101);
+        let w = pos
+            .ins()
+            .iconst(types::I64, (off as i64 + 1) * 0x0101_0101_0101);
         pos.ins().stack_store(types::I64, w, slot, off as i32);
     }
     let fuel = pos.ins().band_imm_u(fuel, 63);
@@ -823,7 +941,9 @@ fn build(spec: &Spec) -> Function {
         let call = |pos: &mut FuncCursor, e: &Edge| -> BlockCall {
             let mut args = vec![BlockArg::Value(fuel)];
             for (j, &t) in tys.iter().enumerate() {
-                args.push(BlockArg::Value(pool.pick(pos.func, Some(t), e.args[j]).unwrap()));
+                args.push(BlockArg::Value(
+                    pool.pick(pos.func, Some(t), e.args[j]).unwrap(),
+                ));
             }
             pos.func.dfg.block_call(heads[e.target], &args)
         };
@@ -838,7 +958,8 @@ fn build(spec: &Spec) -> Function {
                 let (cx, cy) = (call(&mut pos, x), call(&mut pos, y));
                 let ax: Vec<BlockArg> = cx.args(&pos.func.dfg.value_lists).collect();
                 let ay: Vec<BlockArg> = cy.args(&pos.func.dfg.value_lists).collect();
-                pos.ins().brif(c, heads[x.target], &ax, heads[y.target], &ay);
+                pos.ins()
+                    .brif(c, heads[x.target], &ax, heads[y.target], &ay);
             }
             Term::BrTable(c, d, ts) => {
                 let mut c = pool.pick_where(pos.func, is_int, *c).unwrap_or(fuel);
@@ -959,7 +1080,10 @@ fn configs() -> Vec<(&'static str, Config)> {
         ("none", harness::config(|c| c.opts = Optimizations::none())),
         ("no-tee", harness::config(|c| c.opts.use_tee = false)),
         ("no-coalesce", harness::config(|c| c.opts.coalesce = false)),
-        ("no-stack-values", harness::config(|c| c.opts.stack_values = false)),
+        (
+            "no-stack-values",
+            harness::config(|c| c.opts.stack_values = false),
+        ),
         ("memory64", harness::config(|c| c.module.memory64 = true)),
         (
             "demote",
@@ -970,7 +1094,9 @@ fn configs() -> Vec<(&'static str, Config)> {
 
 fn arg_strategy(tys: Vec<Type>) -> impl Strategy<Value = Vec<DataValue>> {
     // Fuel: how many blocks run before every block returns.
-    let fuel = prop_oneof![1i32..8, 8i32..64].prop_map(DataValue::I32).boxed();
+    let fuel = prop_oneof![1i32..8, 8i32..64]
+        .prop_map(DataValue::I32)
+        .boxed();
     let vals: Vec<BoxedStrategy<DataValue>> = std::iter::once(fuel)
         .chain(tys.into_iter().map(|t| {
             let small = || prop_oneof![Just(0i64), Just(1), Just(-1), -4i64..64, any::<i64>()];
@@ -1038,7 +1164,12 @@ fn check(func: &Function, args: &[DataValue]) -> Result<(), String> {
         &cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder()),
     )
     .map_err(|e| format!("generator made invalid IR: {e}\n{func}"))?;
-    let returns: Vec<Type> = func.signature.returns.iter().map(|p| p.value_type).collect();
+    let returns: Vec<Type> = func
+        .signature
+        .returns
+        .iter()
+        .map(|p| p.value_type)
+        .collect();
     let callee = cranelift_reader::parse_functions(CALLEE).unwrap().remove(0);
     let mut funcs = vec![func.clone(), callee];
     funcs.extend(cranelift_reader::parse_functions(BYVAL_CALLEE).unwrap());
@@ -1058,14 +1189,18 @@ fn check(func: &Function, args: &[DataValue]) -> Result<(), String> {
     // cranelift-interpreter sometimes returns a value of the wrong type
     // (see `Op::VBitcast`); such a result says nothing about the backend.
     if let Some(e) = &expected
-        && e.iter().zip(&returns).any(|(v, t)| {
-            v.ty().bits() != t.bits() || v.ty().is_vector() != t.is_vector()
-        })
+        && e.iter()
+            .zip(&returns)
+            .any(|(v, t)| v.ty().bits() != t.bits() || v.ty().is_vector() != t.is_vector())
     {
         stat("ill-typed-oracle");
         return Ok(());
     }
-    stat(if expected.is_some() { "returned" } else { "trapped" });
+    stat(if expected.is_some() {
+        "returned"
+    } else {
+        "trapped"
+    });
     for (name, config) in configs() {
         let (wasm, unsupported) = harness::compile_module(&funcs, &config);
         if !unsupported.is_empty() {

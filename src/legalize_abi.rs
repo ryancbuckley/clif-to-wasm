@@ -37,7 +37,7 @@ fn layout(types: impl Iterator<Item = Type>) -> (Vec<u32>, u32) {
     let mut size = 0u32;
     let offsets = types
         .map(|ty| {
-            let align = ty.bytes().min(16).max(1);
+            let align = ty.bytes().clamp(1, 16);
             let off = size.next_multiple_of(align);
             size = off + ty.bytes();
             off

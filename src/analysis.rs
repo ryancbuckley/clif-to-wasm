@@ -293,7 +293,7 @@ pub(crate) fn has_lowering_side_effect(func: &Function, inst: Inst) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use cranelift_codegen::cursor::{Cursor, FuncCursor};
     use cranelift_codegen::entity::EntityRef;
@@ -319,7 +319,7 @@ mod tests {
         assert!(has_lowering_side_effect(&func, get_inst));
     }
 
-    /// Independent BFS reachability from `start`, optionally forbidding `avoid`.
+    /// Independent BFS reachability from `entry`, optionally forbidding `avoid`.
     fn reachable_without(
         entry: Block,
         succs: &HashMap<Block, Vec<Block>>,
@@ -344,12 +344,15 @@ mod tests {
         visited
     }
 
-    fn analysis_func_strategy() -> impl Strategy<Value = Function> {
+    /// Strategy generating a random multi-block Cranelift `Function` with
+    /// loops, diamond merges, unreachable blocks, block parameters, and
+    /// multi-result and side-effecting instructions.
+    pub(crate) fn arb_function() -> impl Strategy<Value = Function> {
         (
             1usize..=7,
             prop::collection::vec(0usize..=3, 1..=7),
             prop::collection::vec(
-                prop::collection::vec((0u8..8, 0usize..16, 0usize..16), 0..=5),
+                prop::collection::vec((0u8..11, 0usize..16, 0usize..16), 0..=6),
                 1..=7,
             ),
             prop::collection::vec((0u8..5, 0usize..7, 0usize..7, 0usize..16), 1..=7),
@@ -357,6 +360,7 @@ mod tests {
             .prop_map(|(num_blocks, param_counts, block_insts, terms)| {
                 let mut sig = Signature::new(CallConv::SystemV);
                 sig.params.push(AbiParam::new(types::I32));
+                sig.params.push(AbiParam::new(types::I64));
                 sig.returns.push(AbiParam::new(types::I32));
                 let mut func = Function::with_name_signature(Default::default(), sig);
 
@@ -365,65 +369,100 @@ mod tests {
                     func.layout.append_block(b);
                     if bi == 0 {
                         func.dfg.append_block_param(b, types::I32);
+                        func.dfg.append_block_param(b, types::I64);
                     } else {
                         let np = param_counts.get(bi).copied().unwrap_or(0);
-                        for _ in 0..np {
-                            func.dfg.append_block_param(b, types::I32);
+                        for pi in 0..np {
+                            let ty = if pi % 2 == 0 { types::I32 } else { types::I64 };
+                            func.dfg.append_block_param(b, ty);
                         }
                     }
                 }
 
-                let entry_p = func.dfg.block_params(blocks[0])[0];
-                let mut vals_per_block = Vec::with_capacity(num_blocks);
+                let entry_i32 = func.dfg.block_params(blocks[0])[0];
+                let entry_i64 = func.dfg.block_params(blocks[0])[1];
+                let mut block_vals: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(num_blocks);
 
-                for bi in 0..num_blocks {
-                    let b = blocks[bi];
-                    let mut vals = vec![entry_p];
+                for (bi, &b) in blocks.iter().enumerate() {
+                    let mut i32s = vec![entry_i32];
+                    let mut i64s = vec![entry_i64];
                     if bi > 0 {
-                        vals.extend_from_slice(func.dfg.block_params(b));
+                        for &p in func.dfg.block_params(b) {
+                            if func.dfg.value_type(p) == types::I32 {
+                                i32s.push(p);
+                            } else {
+                                i64s.push(p);
+                            }
+                        }
                     }
                     let mut pos = FuncCursor::new(&mut func).at_bottom(b);
                     if let Some(insts) = block_insts.get(bi) {
                         for &(kind, ia, ib) in insts {
-                            let va = vals[ia % vals.len()];
-                            let vb = vals[ib % vals.len()];
-                            let r = match kind {
-                                0 => pos.ins().iadd(va, vb),
-                                1 => pos.ins().isub(va, vb),
-                                2 => pos.ins().imul(va, vb),
-                                3 => pos.ins().iconst(types::I32, ia as i64),
-                                4 => pos.ins().load(types::I32, MemFlagsData::trusted(), va, 0),
-                                5 => pos.ins().load(types::I32, MemFlagsData::new(), va, 0),
-                                6 => {
-                                    pos.ins().store(MemFlagsData::new(), va, vb, 0);
-                                    continue;
+                            let a32 = i32s[ia % i32s.len()];
+                            let b32 = i32s[ib % i32s.len()];
+                            let a64 = i64s[ia % i64s.len()];
+                            let b64 = i64s[ib % i64s.len()];
+                            match kind {
+                                0 => i32s.push(pos.ins().iadd(a32, b32)),
+                                1 => i32s.push(pos.ins().isub(a32, b32)),
+                                2 => i64s.push(pos.ins().iadd(a64, b64)),
+                                3 => i64s.push(pos.ins().imul(a64, b64)),
+                                4 => i32s.push(pos.ins().iconst(types::I32, (ia as i64) - 3)),
+                                5 => {
+                                    let (sum, carry) = pos.ins().uadd_overflow(a32, b32);
+                                    i32s.push(sum);
+                                    i32s.push(pos.ins().uextend(types::I32, carry));
                                 }
-                                _ => pos.ins().udiv(va, vb),
-                            };
-                            vals.push(r);
+                                6 => i64s.push(pos.ins().select(a32, b64, a64)),
+                                7 => i32s.push(pos.ins().load(
+                                    types::I32,
+                                    MemFlagsData::trusted(),
+                                    a32,
+                                    0,
+                                )),
+                                8 => i32s.push(pos.ins().load(
+                                    types::I32,
+                                    MemFlagsData::new(),
+                                    a32,
+                                    0,
+                                )),
+                                9 => {
+                                    pos.ins().store(MemFlagsData::new(), a32, b32, 0);
+                                }
+                                _ => i32s.push(pos.ins().udiv(a32, b32)),
+                            }
                         }
                     }
-                    vals_per_block.push(vals);
+                    block_vals.push((i32s, i64s));
                 }
 
                 let make_call = |func: &mut Function,
                                  target: Block,
-                                 vals: &[Value],
+                                 i32s: &[Value],
+                                 i64s: &[Value],
                                  seed: usize|
                  -> BlockCall {
-                    let np = func.dfg.block_params(target).len();
-                    let args: Vec<BlockArg> = (0..np)
-                        .map(|i| BlockArg::Value(vals[(seed + i) % vals.len()]))
+                    let params: Vec<Value> = func.dfg.block_params(target).to_vec();
+                    let args: Vec<BlockArg> = params
+                        .into_iter()
+                        .enumerate()
+                        .map(|(pi, p)| {
+                            let v = if func.dfg.value_type(p) == types::I32 {
+                                i32s[(seed + pi) % i32s.len()]
+                            } else {
+                                i64s[(seed + pi) % i64s.len()]
+                            };
+                            BlockArg::Value(v)
+                        })
                         .collect();
                     func.dfg.block_call(target, &args)
                 };
 
-                for bi in 0..num_blocks {
-                    let b = blocks[bi];
-                    let vals = &vals_per_block[bi];
+                for (bi, &b) in blocks.iter().enumerate() {
+                    let (ref i32s, ref i64s) = block_vals[bi];
                     let &(tkind, t1, t2, seed) = terms.get(bi).unwrap_or(&(0, 0, 0, 0));
-                    let cond = vals[seed % vals.len()];
-                    let ret_v = vals[(seed + 1) % vals.len()];
+                    let cond = i32s[seed % i32s.len()];
+                    let ret_v = i32s[(seed + 1) % i32s.len()];
                     if num_blocks == 1 || tkind == 0 {
                         let mut pos = FuncCursor::new(&mut func).at_bottom(b);
                         pos.ins().return_(&[ret_v]);
@@ -435,15 +474,15 @@ mod tests {
                         let target2 = blocks[1 + (t2 % (num_blocks - 1))];
                         match tkind {
                             1 => {
-                                let c = make_call(&mut func, target1, vals, seed);
+                                let c = make_call(&mut func, target1, i32s, i64s, seed);
                                 let mut pos = FuncCursor::new(&mut func).at_bottom(b);
                                 let args: Vec<BlockArg> =
                                     c.args(&pos.func.dfg.value_lists).collect();
                                 pos.ins().jump(target1, &args);
                             }
                             2 => {
-                                let c1 = make_call(&mut func, target1, vals, seed);
-                                let c2 = make_call(&mut func, target2, vals, seed + (t1 & 1));
+                                let c1 = make_call(&mut func, target1, i32s, i64s, seed);
+                                let c2 = make_call(&mut func, target2, i32s, i64s, seed + (t1 & 1));
                                 let mut pos = FuncCursor::new(&mut func).at_bottom(b);
                                 let a1: Vec<BlockArg> =
                                     c1.args(&pos.func.dfg.value_lists).collect();
@@ -452,12 +491,10 @@ mod tests {
                                 pos.ins().brif(cond, target1, &a1, target2, &a2);
                             }
                             _ => {
-                                let c1 = make_call(&mut func, target1, vals, seed);
-                                let c2 = make_call(&mut func, target2, vals, seed + 1);
-                                let jt = func.dfg.jump_tables.push(JumpTableData::new(
-                                    c1,
-                                    &[c2, c1],
-                                ));
+                                let c1 = make_call(&mut func, target1, i32s, i64s, seed);
+                                let c2 = make_call(&mut func, target2, i32s, i64s, seed + 1);
+                                let jt =
+                                    func.dfg.jump_tables.push(JumpTableData::new(c1, &[c2, c1]));
                                 let mut pos = FuncCursor::new(&mut func).at_bottom(b);
                                 pos.ins().br_table(cond, jt);
                             }
@@ -471,7 +508,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn func_info_matches_independent_oracle(func in analysis_func_strategy()) {
+        fn func_info_matches_independent_oracle(func in arb_function()) {
             let info = FuncInfo::compute(&func).unwrap();
             let entry = func.layout.entry_block().unwrap();
             let pool = &func.dfg.value_lists;
@@ -626,4 +663,3 @@ mod tests {
         }
     }
 }
-

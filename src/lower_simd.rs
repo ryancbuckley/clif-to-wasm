@@ -43,9 +43,8 @@ impl Lane {
         if !ty.is_vector() || !(16..=128).contains(&ty.bits()) {
             return unsupported(format!("vector type {ty}"));
         }
-        Self::from_scalar(ty.lane_type()).ok_or_else(|| {
-            crate::Error::Unsupported(format!("vector type {ty}"))
-        })
+        Self::from_scalar(ty.lane_type())
+            .ok_or_else(|| crate::Error::Unsupported(format!("vector type {ty}")))
     }
 
     fn from_scalar(ty: Type) -> Option<Lane> {
@@ -949,7 +948,10 @@ impl Emitter<'_> {
                 (i32::MAX as u64, I::I64x2GtS, false),
                 (i32::MIN as i64 as u64, I::I64x2LtS, false),
             ],
-            Opcode::Unarrow => &[(u32::MAX as u64, I::I64x2GtS, false), (0, I::I64x2LtS, false)],
+            Opcode::Unarrow => &[
+                (u32::MAX as u64, I::I64x2GtS, false),
+                (0, I::I64x2LtS, false),
+            ],
             _ => &[(u32::MAX as u64, I::I64x2GtS, true)],
         };
         for (bound, cmp, unsigned) in bounds.iter().cloned() {

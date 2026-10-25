@@ -12,10 +12,12 @@
 //! pointer width so frontends can query pointer size, endianness, and shared
 //! flags.
 
+#![allow(clippy::result_large_err, clippy::type_complexity)]
+
 use crate::object::{Binding, DataDef, DataReloc, ObjectBuilder, SymbolFlags, SymbolId};
 use crate::{
-    CompiledFunction, Config, Env, Error, FuncIndex, GlobalIndex, Name, Result, SymbolValue,
-    TableIndex, TypeIndex, compile_function, wasm_signature_in,
+    CompiledFunction, Config, Env, Error, FuncIndex, Name, Result, SymbolValue, TypeIndex,
+    compile_function, wasm_signature,
 };
 use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::entity::SecondaryMap;
@@ -127,12 +129,12 @@ impl WasmObjectModule {
         let sp = obj.global("__stack_pointer", ptr, true);
         let table = obj.table("__indirect_function_table");
         config.module.relocatable = true;
-        config.module.stack_pointer_global = Some(GlobalIndex(sp.0));
-        config.module.table_index = Some(TableIndex(table.0));
+        config.module.stack_pointer_global = Some(sp.into());
+        config.module.table_index = Some(table.into());
         config.module.tls_base_global = None;
         if options.threads {
             let tls = obj.global("__tls_base", ptr, true);
-            config.module.tls_base_global = Some(GlobalIndex(tls.0));
+            config.module.tls_base_global = Some(tls.into());
         }
         config.module.pinned_reg_global = None;
         config.module.atomic_lock_table_addr = None;
@@ -164,7 +166,7 @@ impl WasmObjectModule {
     }
 
     fn wasm_sig(&self, sig: &ir::Signature) -> ModuleResult<(Vec<ValType>, Vec<ValType>)> {
-        wasm_signature_in(sig, &self.config.module).map_err(|e| unsupported_err(e.to_string()))
+        wasm_signature(sig, &self.config.module).map_err(|e| unsupported_err(e.to_string()))
     }
 
     fn func_symbol(&mut self, id: FuncId) -> ModuleResult<SymbolId> {
@@ -181,7 +183,9 @@ impl WasmObjectModule {
             _ => None,
         };
         let s = match import {
-            Some((module, field)) => self.obj.import_function(&name, flags, &module, &field, &p, &r),
+            Some((module, field)) => self
+                .obj
+                .import_function(&name, flags, &module, &field, &p, &r),
             None => self.obj.function(&name, flags, &p, &r),
         };
         self.funcs[id] = Some(s);
@@ -279,13 +283,11 @@ impl ObjEnv<'_> {
 
 impl Env for ObjEnv<'_> {
     fn func_index(&mut self, name: Name<'_>) -> Result<FuncIndex> {
-        Ok(FuncIndex(self.symbol(name)?.0))
+        self.symbol(name).map(Into::into)
     }
 
-    fn type_index(&mut self, sig: &ir::Signature) -> Result<TypeIndex> {
-        // Signatures here are already adjusted for demoted results.
-        let (p, r) = crate::wasm_signature(sig)?;
-        Ok(TypeIndex(self.m.obj.type_index(&p, &r)))
+    fn type_index(&mut self, params: &[ValType], results: &[ValType]) -> Result<TypeIndex> {
+        Ok(self.m.obj.type_index(params, results))
     }
 
     fn func_table_slot(&mut self, name: Name<'_>) -> Result<u64> {
@@ -299,7 +301,7 @@ impl Env for ObjEnv<'_> {
                 "symbol_value of function {name}"
             )));
         }
-        Ok(SymbolValue::Symbol(s.0))
+        Ok(SymbolValue::Symbol(s))
     }
 }
 

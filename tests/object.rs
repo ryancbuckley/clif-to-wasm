@@ -6,6 +6,8 @@
 //! (`__stack_pointer`), demoted multi-value returns, and argument extension.
 //! Linking is skipped if `rust-lld` is unavailable (set `RUST_LLD` to override).
 
+use clif_to_wasm::Config;
+use clif_to_wasm::object_module::{ObjectOptions, WasmObjectModule, frontend_isa};
 use cranelift_codegen::ir::{
     AbiParam, ArgumentExtension, InstBuilder, MemFlagsData, Signature, StackSlotData,
     StackSlotKind, types,
@@ -14,8 +16,6 @@ use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{DataDescription, Linkage, Module};
-use clif_to_wasm::Config;
-use clif_to_wasm::object_module::{ObjectOptions, WasmObjectModule, frontend_isa};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -23,6 +23,7 @@ fn new_module() -> WasmObjectModule {
     module_with_imports(Box::new(|_| None))
 }
 
+#[allow(clippy::type_complexity)]
 fn module_with_imports(
     import_names: Box<dyn Fn(&str) -> Option<(String, String)> + Send + Sync>,
 ) -> WasmObjectModule {

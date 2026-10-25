@@ -195,7 +195,11 @@ impl Emitter<'_> {
             .first()
             .map_or(types::INVALID, |&a| dfg.value_type(a));
         match op {
-            Opcode::Fadd | Opcode::Fsub | Opcode::Fmul | Opcode::Fdiv | Opcode::Fmin
+            Opcode::Fadd
+            | Opcode::Fsub
+            | Opcode::Fmul
+            | Opcode::Fdiv
+            | Opcode::Fmin
             | Opcode::Fmax => {
                 self.float_operand()?;
                 self.float_operand()?;
@@ -700,8 +704,7 @@ impl Emitter<'_> {
         self.ins(I::I32Or);
         self.local_set(swap);
 
-        let [x_sign, y_sign, x_exp, y_exp, x_hi, y_hi, x_lo, y_lo] =
-            self.scratches(ValType::I64);
+        let [x_sign, y_sign, x_exp, y_exp, x_hi, y_hi, x_lo, y_lo] = self.scratches(ValType::I64);
         for (x, y, pv, cv) in [
             (x_sign, y_sign, p_sign, c_sign),
             (x_exp, y_exp, p_exp, c_exp),

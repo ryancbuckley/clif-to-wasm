@@ -10,9 +10,9 @@
 
 mod harness;
 
+use clif_to_wasm::{Config, Optimizations};
 use cranelift_codegen::data_value::DataValue;
 use cranelift_codegen::ir::Type;
-use clif_to_wasm::{Config, Optimizations};
 use harness::clifgen::{Rng, arg, generate, generate_i128, generate_simd};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

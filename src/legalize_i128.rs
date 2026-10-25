@@ -168,7 +168,10 @@ impl Legalizer<'_> {
     fn pair(&self, v: Value) -> Result<Pair> {
         match self.pairs[v] {
             Some(p) => Ok(p),
-            None => unsupported(format!("{} value {v} used before its definition", self.ty(v))),
+            None => unsupported(format!(
+                "{} value {v} used before its definition",
+                self.ty(v)
+            )),
         }
     }
 
@@ -374,7 +377,12 @@ impl Legalizer<'_> {
                 let hi = pos.ins().iconst(I64, 0);
                 vec![Out::Pair(lo, hi)]
             }
-            (Opcode::F128const, D::UnaryConst { constant_handle, .. }) => {
+            (
+                Opcode::F128const,
+                D::UnaryConst {
+                    constant_handle, ..
+                },
+            ) => {
                 let data = pos.func.dfg.constants.get(constant_handle).as_slice();
                 let bytes: [u8; 16] = data.try_into().expect("16-byte f128 constant");
                 let bits = u128::from_le_bytes(bytes);

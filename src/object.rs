@@ -15,13 +15,31 @@
 //!
 //! [linking conventions]: https://github.com/WebAssembly/tool-conventions/blob/main/Linking.md
 
-use crate::{CompiledFunction, RelocKind};
+use crate::{CompiledFunction, RelocKind, TypeIndex};
 use std::collections::HashMap;
 use wasm_encoder::{Encode, ValType};
 
 /// An entry of the object's symbol table.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct SymbolId(pub u32);
+
+impl From<SymbolId> for crate::FuncIndex {
+    fn from(s: SymbolId) -> Self {
+        Self(s.0)
+    }
+}
+
+impl From<SymbolId> for crate::GlobalIndex {
+    fn from(s: SymbolId) -> Self {
+        Self(s.0)
+    }
+}
+
+impl From<SymbolId> for crate::TableIndex {
+    fn from(s: SymbolId) -> Self {
+        Self(s.0)
+    }
+}
 
 /// How a symbol binds across objects.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -100,7 +118,7 @@ pub struct DataDef {
 
 enum SymKind {
     Func {
-        ty: u32,
+        ty: TypeIndex,
         /// Index into `ObjectBuilder::funcs` once defined.
         def: Option<usize>,
     },
@@ -134,7 +152,7 @@ struct Segment {
 pub struct ObjectBuilder {
     memory64: bool,
     types: Vec<(Vec<ValType>, Vec<ValType>)>,
-    type_map: HashMap<(Vec<ValType>, Vec<ValType>), u32>,
+    type_map: HashMap<(Vec<ValType>, Vec<ValType>), TypeIndex>,
     symbols: Vec<Symbol>,
     funcs: Vec<(SymbolId, CompiledFunction)>,
     segments: Vec<Segment>,
@@ -159,12 +177,12 @@ impl ObjectBuilder {
 
     /// The index of a function type in the type section, for
     /// [`crate::Env::type_index`].
-    pub fn type_index(&mut self, params: &[ValType], results: &[ValType]) -> u32 {
+    pub fn type_index(&mut self, params: &[ValType], results: &[ValType]) -> TypeIndex {
         let key = (params.to_vec(), results.to_vec());
         if let Some(&i) = self.type_map.get(&key) {
             return i;
         }
-        let i = self.types.len() as u32;
+        let i = TypeIndex(self.types.len() as u32);
         self.types.push(key.clone());
         self.type_map.insert(key, i);
         i
@@ -430,7 +448,7 @@ impl ObjectBuilder {
                 Some((m, f)) => (m.as_str(), f.as_str()),
                 None => ("env", s.name.as_str()),
             };
-            imports.import(module, field, wasm_encoder::EntityType::Function(ty));
+            imports.import(module, field, wasm_encoder::EntityType::Function(ty.0));
         }
         for &i in &global_imports {
             let s = &self.symbols[i];
@@ -463,7 +481,7 @@ impl ObjectBuilder {
             let SymKind::Func { ty, .. } = self.symbols[sym.0 as usize].kind else {
                 unreachable!()
             };
-            funcs.function(ty);
+            funcs.function(ty.0);
         }
         section(&mut out, 3, &encoded(&funcs));
         section_index += 1;

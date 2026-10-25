@@ -3,6 +3,7 @@
 
 mod harness;
 
+use clif_to_wasm::Config;
 use cranelift_codegen::data_value::DataValue;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
@@ -10,7 +11,6 @@ use cranelift_codegen::ir::{
 };
 use cranelift_codegen::isa::{CallConv, TargetFrontendConfig};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use clif_to_wasm::Config;
 use harness::clifgen::{Rng, arg};
 
 const VTYPES: [Type; 13] = [

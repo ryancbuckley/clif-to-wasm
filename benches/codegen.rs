@@ -18,9 +18,9 @@
 #[path = "../tests/harness/mod.rs"]
 mod harness;
 
+use clif_to_wasm::Config;
 use cranelift_codegen::data_value::DataValue;
 use cranelift_codegen::ir::{Function, types};
-use clif_to_wasm::Config;
 use harness::kernels::{KERNELS, functions};
 use std::time::Instant;
 
@@ -54,7 +54,7 @@ fn metrics(wasm: &[u8]) -> Metrics {
     for payload in wasmparser::Parser::new(0).parse_all(wasm) {
         if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
             m.funcs += 1;
-            m.code_bytes += body.range().len();
+            m.code_bytes += body.as_bytes().len();
             for local in body.get_locals_reader().unwrap() {
                 m.locals += local.unwrap().0 as u64;
             }
@@ -186,9 +186,8 @@ fn main() {
             Ok(clif_to_wasm::FuncIndex(0))
         }
     }
-    let config = harness::config(|c| {
-        c.module.stack_pointer_global = Some(clif_to_wasm::GlobalIndex(0))
-    });
+    let config =
+        harness::config(|c| c.module.stack_pointer_global = Some(clif_to_wasm::GlobalIndex(0)));
     for (cname, modules) in &corpora {
         let funcs: Vec<Function> = modules
             .iter()

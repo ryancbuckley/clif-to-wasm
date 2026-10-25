@@ -309,7 +309,7 @@ impl<'a> Emitter<'a> {
     /// Complete the function body (`unreachable; end`), run-length encode all
     /// declared and extra locals, and return the [`CompiledFunction`].
     pub fn finish(mut self) -> Result<CompiledFunction> {
-        let (params, results) = wasm_signature(&self.func.signature)?;
+        let (params, results) = wasm_signature(&self.func.signature, &self.config.module)?;
         self.ins(I::Unreachable);
         self.ins(I::End);
         let (body, relocs) = self.body.finish();
@@ -531,7 +531,12 @@ impl<'a> Emitter<'a> {
     }
 
     /// Emit `stack_addr` for `stack_slot` + `offset` with result type `ty`.
-    pub(crate) fn stack_addr(&mut self, stack_slot: StackSlot, offset: i32, ty: Type) -> Result<()> {
+    pub(crate) fn stack_addr(
+        &mut self,
+        stack_slot: StackSlot,
+        offset: i32,
+        ty: Type,
+    ) -> Result<()> {
         let (fp, _) = self.frame.expect("frame for stack slot");
         self.local_get(fp);
         let off = self.slot_offset[stack_slot] as i64 + i64::from(offset);
@@ -694,7 +699,9 @@ impl<'a> Emitter<'a> {
         let Some(table_index) = self.config.module.table_index else {
             return unsupported("call_indirect without ModuleLayout::table_index");
         };
-        let type_index = self.env.type_index(&self.func.dfg.signatures[sig])?;
+        let (params, results) =
+            wasm_signature(&self.func.dfg.signatures[sig], &self.config.module)?;
+        let type_index = self.env.type_index(&params, &results)?;
         Ok((type_index, table_index))
     }
 
@@ -1099,4 +1106,3 @@ mod tests {
         );
     }
 }
-

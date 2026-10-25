@@ -92,7 +92,11 @@ block2:
             continue;
         }
         let out = harness::run_clif(text, &config).unwrap();
-        assert!(out.unsupported.is_empty(), "[{cname}] {:?}", out.unsupported);
+        assert!(
+            out.unsupported.is_empty(),
+            "[{cname}] {:?}",
+            out.unsupported
+        );
         assert!(out.failures.is_empty(), "[{cname}] {:?}", out.failures);
         assert_eq!(out.passed, 1, "[{cname}]");
     }

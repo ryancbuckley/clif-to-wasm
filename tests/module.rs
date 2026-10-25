@@ -5,12 +5,12 @@
 
 mod harness;
 
-use cranelift_codegen::ir::{Function, Signature};
-use cranelift_reader::parse_functions;
 use clif_to_wasm::{
     CompiledFunction, Config, Env, Error, FuncIndex, ModuleBuilder, Name, TableIndex, TypeIndex,
     compile_function, wasm_signature,
 };
+use cranelift_codegen::ir::Function;
+use cranelift_reader::parse_functions;
 use std::collections::HashMap;
 use wasm_encoder::{ConstExpr, GlobalType, MemoryType, RefType, TableType, ValType};
 use wasmtime::{Engine, Instance, Module, Ref, Store};
@@ -82,9 +82,8 @@ impl Env for Names<'_> {
         let k = key(name);
         self.funcs.get(&k).copied().ok_or(Error::Env(k))
     }
-    fn type_index(&mut self, sig: &Signature) -> Result<TypeIndex, Error> {
-        let (p, r) = wasm_signature(sig)?;
-        Ok(self.builder.type_index(&p, &r))
+    fn type_index(&mut self, params: &[ValType], results: &[ValType]) -> Result<TypeIndex, Error> {
+        Ok(self.builder.type_index(params, results))
     }
     fn func_table_slot(&mut self, name: Name<'_>) -> Result<u64, Error> {
         let k = key(name);
@@ -108,7 +107,7 @@ fn add_functions(
 ) -> Vec<FuncIndex> {
     let mut indices = Vec::new();
     for (i, f) in funcs.iter().enumerate() {
-        let (p, r) = wasm_signature(&f.signature).unwrap();
+        let (p, r) = wasm_signature(&f.signature, &config.module).unwrap();
         let idx = builder.declare_function(&p, &r);
         names.insert(name(f), idx);
         slots.insert(name(f), slot(i, idx));
@@ -156,8 +155,8 @@ fn jit_module_links_into_host() {
 
     let engine = Engine::default();
     let mut store = Store::new(&engine, ());
-    let host_inst = Instance::new(&mut store, &Module::new(&engine, &host_wasm).unwrap(), &[])
-        .unwrap();
+    let host_inst =
+        Instance::new(&mut store, &Module::new(&engine, &host_wasm).unwrap(), &[]).unwrap();
     let memory = host_inst.get_memory(&mut store, "memory").unwrap();
     let table = host_inst.get_table(&mut store, "table").unwrap();
     let sp = host_inst.get_global(&mut store, "sp").unwrap();
@@ -253,7 +252,7 @@ impl Env for SlotsOnly {
     fn func_index(&mut self, name: Name<'_>) -> Result<FuncIndex, Error> {
         Err(Error::Env(key(name)))
     }
-    fn type_index(&mut self, _: &Signature) -> Result<TypeIndex, Error> {
+    fn type_index(&mut self, _: &[ValType], _: &[ValType]) -> Result<TypeIndex, Error> {
         Ok(TypeIndex(0))
     }
     fn func_table_slot(&mut self, _: Name<'_>) -> Result<u64, Error> {

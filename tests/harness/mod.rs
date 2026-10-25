@@ -6,6 +6,10 @@
 pub mod clifgen;
 pub mod kernels;
 
+use clif_to_wasm::{
+    Config, Env, Error, FuncIndex, ModuleBuilder, Name, TagIndex, TypeIndex, compile_function,
+    wasm_signature,
+};
 use cranelift_codegen::data_value::DataValue;
 use cranelift_codegen::ir::{
     ExceptionTableItem, ExceptionTag, ExternalName, Function, Type, UserFuncName, immediates::*,
@@ -15,10 +19,6 @@ use cranelift_interpreter::environment::FunctionStore;
 use cranelift_interpreter::interpreter::{Interpreter, InterpreterState};
 use cranelift_interpreter::step::ControlFlow;
 use cranelift_reader::{Comparison, ParseOptions, RunCommand, parse_run_command, parse_test};
-use clif_to_wasm::{
-    Config, Env, Error, FuncIndex, ModuleBuilder, Name, TagIndex, TypeIndex, compile_function,
-    wasm_signature, wasm_signature_in,
-};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use wasm_encoder::{ConstExpr, Encode, Instruction, ValType};
 use wasmtime::Val;
@@ -41,9 +41,8 @@ impl Env for TestEnv<'_> {
     fn func_index(&mut self, name: Name<'_>) -> Result<FuncIndex, Error> {
         self.lookup(name)
     }
-    fn type_index(&mut self, sig: &cranelift_codegen::ir::Signature) -> Result<TypeIndex, Error> {
-        let (p, r) = wasm_signature(sig)?;
-        Ok(self.builder.type_index(&p, &r))
+    fn type_index(&mut self, params: &[ValType], results: &[ValType]) -> Result<TypeIndex, Error> {
+        Ok(self.builder.type_index(params, results))
     }
     fn func_table_slot(&mut self, name: Name<'_>) -> Result<u64, Error> {
         self.lookup(name).map(|idx| u64::from(idx.0))
@@ -163,7 +162,7 @@ pub fn compile_module(funcs: &[Function], config: &Config) -> (Vec<u8>, Vec<Stri
     let mut indices = Vec::new();
     let mut unsupported = Vec::new();
     for &f in &funcs {
-        let (p, r) = wasm_signature_in(&f.signature, &config.module).unwrap_or_default();
+        let (p, r) = wasm_signature(&f.signature, &config.module).unwrap_or_default();
         let idx = builder.declare_function(&p, &r);
         names.insert(func_name(f), idx);
         indices.push(idx);
@@ -239,7 +238,7 @@ pub fn compile_module(funcs: &[Function], config: &Config) -> (Vec<u8>, Vec<Stri
 }
 
 fn stub(f: &Function, config: &Config) -> clif_to_wasm::CompiledFunction {
-    let (params, results) = wasm_signature_in(&f.signature, &config.module).unwrap_or_default();
+    let (params, results) = wasm_signature(&f.signature, &config.module).unwrap_or_default();
     clif_to_wasm::CompiledFunction {
         params,
         results,
@@ -383,7 +382,7 @@ impl Runner {
             let mut out = Vec::new();
             for &ty in returns {
                 let n = ty.bytes() as usize;
-                off = off.next_multiple_of(n.min(16).max(1));
+                off = off.next_multiple_of(n.clamp(1, 16));
                 let at = ret_area as usize + off;
                 out.push(DataValue::read_from_slice_le(&data[at..at + n], ty));
                 off += n;
@@ -630,4 +629,3 @@ pub fn interpret(
     }))
     .ok()
 }
-

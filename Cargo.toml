@@ -2,27 +2,32 @@
 name = "clif-to-wasm"
 version = "0.1.0"
 edition = "2024"
+description = "A WebAssembly backend for Cranelift IR"
+readme = "README.md"
+repository = "https://github.com/ryancbuckley/clif-to-wasm"
 license = "Apache-2.0 WITH LLVM-exception"
+keywords = ["cranelift", "wasm", "webassembly", "compiler", "jit"]
+categories = ["compilers", "wasm"]
 
 [dependencies]
-cranelift-codegen = { version = "=0.136.2", default-features = false, features = ["std", "unwind"] }
-wasm-encoder = "0.245"
-cranelift-module = { version = "=0.136.2", optional = true }
+cranelift-codegen = { version = "0.136.2", default-features = false, features = ["std", "unwind"] }
+wasm-encoder = "0.261"
+cranelift-module = { version = "0.136.2", optional = true }
 
 [features]
 # `cranelift_module::Module` implementation emitting relocatable wasm objects.
 module = ["dep:cranelift-module", "cranelift-codegen/pulley"]
 
 [dev-dependencies]
-cranelift-frontend = "=0.136.2"
-cranelift-interpreter = "=0.136.2"
-cranelift-module = "=0.136.2"
-cranelift-reader = "=0.136.2"
-proptest = "1.11.0"
+cranelift-frontend = "0.136.2"
+cranelift-interpreter = "0.136.2"
+cranelift-module = "0.136.2"
+cranelift-reader = "0.136.2"
+proptest = "1.12.0"
 target-lexicon = "0.13.5"
-wasmparser = "0.245"
-wasmprinter = "0.245"
-wasmtime = { version = "=49.0.2", default-features = false, features = ["cranelift", "runtime", "std", "threads", "gc", "gc-drc"] }
+wasmparser = "0.261"
+wasmprinter = "0.261"
+wasmtime = { version = "49.0.2", default-features = false, features = ["cranelift", "runtime", "std", "threads", "gc", "gc-drc"] }
 wat = "1.261.0"
 
 [[bench]]

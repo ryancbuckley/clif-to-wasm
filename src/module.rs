@@ -253,7 +253,9 @@ impl ModuleBuilder {
     /// Import an exception tag whose payload has the given types. Returns
     /// its tag index.
     pub fn import_tag(&mut self, module: &str, name: &str, params: &[ValType]) -> TagIndex {
-        let idx = self.tags.import((), "tag imports must precede defined tags");
+        let idx = self
+            .tags
+            .import((), "tag imports must precede defined tags");
         let ty = self.type_index(params, &[]);
         self.record_import(
             module,
@@ -642,4 +644,3 @@ mod tests {
         }
     }
 }
-

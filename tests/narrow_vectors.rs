@@ -7,9 +7,9 @@
 
 mod harness;
 
+use clif_to_wasm::Config;
 use cranelift_codegen::data_value::DataValue;
 use cranelift_codegen::ir::{Type, types};
-use clif_to_wasm::Config;
 use proptest::prelude::*;
 
 const NARROW: [Type; 7] = [
@@ -54,7 +54,10 @@ fn op(ty: Type, k: usize) -> Option<(String, Vec<Type>)> {
         19 if !int => ("fcmp lt a, b".into(), vec![Type::int(lb as u16)?.by(n)?]),
         20 if !int => ("fadd a, b".into(), vec![ty]),
         21 if int && lb == 32 => (format!("fcvt_from_sint.f32x{n} a"), vec![types::F32.by(n)?]),
-        22 if !int => (format!("fcvt_to_sint_sat.i32x{n} a"), vec![types::I32.by(n)?]),
+        22 if !int => (
+            format!("fcvt_to_sint_sat.i32x{n} a"),
+            vec![types::I32.by(n)?],
+        ),
         // Every lane, extracted.
         23 => (
             (0..n)
@@ -118,8 +121,15 @@ fn build(ty: Type, k: usize) -> String {
     // The text parser wants numbered values.
     let mut text = format!(
         "function %f({}) -> {} {{\n    ss0 = explicit_slot 16, align = 16\nblock0({}):\n{text}    return {}\n}}\n",
-        params.iter().map(|p| p.split(": ").nth(1).unwrap()).collect::<Vec<_>>().join(", "),
-        rets.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", "),
+        params
+            .iter()
+            .map(|p| p.split(": ").nth(1).unwrap())
+            .collect::<Vec<_>>()
+            .join(", "),
+        rets.iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
         params.join(", "),
         rs.join(", "),
     );
@@ -141,7 +151,11 @@ fn replace_word(s: &str, from: &str, to: &str) -> String {
         let after = rest[i + from.len()..].chars().next();
         let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
         out.push_str(&rest[..i]);
-        out.push_str(if word(before) || word(after) { from } else { to });
+        out.push_str(if word(before) || word(after) {
+            from
+        } else {
+            to
+        });
         rest = &rest[i + from.len()..];
     }
     out.push_str(rest);
@@ -169,9 +183,8 @@ fn cases() -> Vec<(Type, usize)> {
         // Not every operation accepts every narrow type.
         .filter(|&(t, k)| {
             cranelift_reader::parse_functions(&build(t, k)).is_ok_and(|fs| {
-                let flags = cranelift_codegen::settings::Flags::new(
-                    cranelift_codegen::settings::builder(),
-                );
+                let flags =
+                    cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
                 cranelift_codegen::verify_function(&fs[0], &flags).is_ok()
             })
         })
@@ -186,7 +199,13 @@ fn stat(what: &str) {
 }
 
 fn bits() -> impl Strategy<Value = u64> {
-    prop_oneof![Just(0u64), Just(1), Just(u64::MAX), Just(0x8000_0000_8080), any::<u64>()]
+    prop_oneof![
+        Just(0u64),
+        Just(1),
+        Just(u64::MAX),
+        Just(0x8000_0000_8080),
+        any::<u64>()
+    ]
 }
 
 proptest! {
