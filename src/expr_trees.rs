@@ -137,9 +137,9 @@ pub(crate) fn operands(func: &Function, info: &FuncInfo, inst: Inst, out: &mut V
     }
 }
 
-/// Build the expression trees of every reachable block. With `enabled` off,
+/// Build the expression trees of every reachable block. When `stack_values` is false,
 /// every live non-constant instruction remains its own root.
-pub(crate) fn build(func: &Function, info: &FuncInfo, enabled: bool) -> ExprTrees {
+pub(crate) fn build(func: &Function, info: &FuncInfo, stack_values: bool) -> ExprTrees {
     let mut s = ExprTrees {
         root_of: SecondaryMap::new(),
     };
@@ -162,7 +162,7 @@ pub(crate) fn build(func: &Function, info: &FuncInfo, enabled: bool) -> ExprTree
                 c += 1;
             }
         }
-        if !enabled {
+        if !stack_values {
             continue;
         }
 

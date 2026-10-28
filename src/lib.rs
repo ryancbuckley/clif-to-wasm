@@ -22,9 +22,6 @@
 //!    "Beyond Relooper" (ICFP 2022) and lowers instructions with a `local.tee`
 //!    peephole. Irreducible CFGs fall back to a dispatch loop.
 //!
-//! More expensive size passes (cross-block sinking, value-carrying blocks,
-//! local frequency sorting) are left to `wasm-opt`.
-//!
 //! # Example
 //!
 //! Compile a function and assemble it into a module with [`ModuleBuilder`]:
@@ -140,13 +137,12 @@ pub struct Config {
 /// Layout of the wasm module that will contain compiled functions.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct ModuleLayout {
-    /// The address type of linear memory, which is also the wasm type of the
+    /// The address type of linear memory, 32-bit or 64-bit. This is also the wasm type of the
     /// shadow stack pointer.
     pub address_type: AddressType,
-    /// Linear memory index accessed by loads and stores (`MemoryIndex(0)` in
-    /// single-memory modules).
+    /// The index of the linear memory accessed by loads and stores. Most modules have one memory, in which case this will be 0.
     pub memory_index: MemoryIndex,
-    /// Function table used by `call_indirect` (`Some(TableIndex(0))` in
+    /// The index of the function table used by `call_indirect` (`Some(TableIndex(0))` in
     /// single-table modules). When `None`, `call_indirect` is rejected.
     pub table_index: Option<TableIndex>,
     /// Mutable global holding the 16-byte-aligned, downward-growing shadow
@@ -398,7 +394,7 @@ pub struct Reloc {
     pub addend: i64,
 }
 
-/// Relocation type codes from the WebAssembly linking conventions.
+/// Relocation type codes from the [WebAssembly linking conventions](https://github.com/WebAssembly/tool-conventions/blob/main/Linking.md#relocation-sections).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum RelocKind {
@@ -465,7 +461,7 @@ impl CompiledFunction {
     }
 }
 
-/// Map a Cranelift type to its representing wasm value type.
+/// Maps a Cranelift type to the wasm type that represents it.
 ///
 /// `i8`, `i16`, and `f16` live zero-extended in `i32`. Vectors up to 128 bits
 /// map to `v128` (narrower vectors occupy the low bytes).
@@ -501,7 +497,7 @@ pub fn wasm_type(ty: ir::Type) -> Result<ValType> {
     })
 }
 
-/// Map a dynamic vector type (e.g. `i32x4*gv0`) to its fixed-size base vector
+/// Maps a dynamic vector type (e.g. `i32x4*gv0`) to its fixed-size base vector
 /// (scale 1), or return `ty` unchanged.
 pub(crate) fn fixed_type(ty: ir::Type) -> ir::Type {
     if ty.is_dynamic_vector() {
@@ -511,7 +507,7 @@ pub(crate) fn fixed_type(ty: ir::Type) -> ir::Type {
     }
 }
 
-/// Map a Cranelift signature to wasm parameter and result types, splitting each
+/// Maps a Cranelift signature to wasm parameter and result types, splitting each
 /// `i128` or `f128` into two `i64`s (low half first) and applying
 /// [`ModuleLayout::demote_multi_results`] when enabled in `layout`.
 ///
