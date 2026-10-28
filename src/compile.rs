@@ -133,6 +133,15 @@ impl RelocKind {
 /// provide for (such as a stack slot without
 /// [`ModuleLayout::stack_pointer_global`](crate::ModuleLayout::stack_pointer_global)).
 /// Returns any error from `env` unchanged.
+///
+/// # Panics
+///
+/// `func` must pass Cranelift's IR verifier
+/// ([`cranelift_codegen::verify_function`]), which this function does not
+/// run. Invalid IR may cause a panic, either in this crate or in the
+/// `cranelift-codegen` code it calls. On valid IR, a panic is a bug in this
+/// crate: features it lacks return
+/// [`Error::Unsupported`](crate::Error::Unsupported) instead.
 pub fn compile_function(
     func: &Function,
     config: &Config,

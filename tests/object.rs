@@ -6,7 +6,7 @@
 //! (`__stack_pointer`), demoted multi-value returns, and argument extension.
 //! Linking is skipped if `rust-lld` is unavailable (set `RUST_LLD` to override).
 
-use clif_to_wasm::object_module::{self, ObjectOptions, WasmObjectModule};
+use clif_to_wasm::object_module::{self, DefineDataError, ObjectOptions, WasmObjectModule};
 use clif_to_wasm::{AddressType, Config};
 use cranelift_codegen::ir::{
     AbiParam, ArgumentExtension, InstBuilder, MemFlagsData, Signature, StackSlotData,
@@ -15,7 +15,7 @@ use cranelift_codegen::ir::{
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use cranelift_module::{DataDescription, Linkage, Module};
+use cranelift_module::{DataDescription, Linkage, Module, ModuleError, ModuleResult};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -57,6 +57,17 @@ fn define(
     sig: Signature,
     body: impl FnOnce(&mut WasmObjectModule, &mut FunctionBuilder),
 ) {
+    try_define(m, id, sig, body).unwrap();
+}
+
+// `ModuleError` is Cranelift's type; its size is not ours to change.
+#[allow(clippy::result_large_err)]
+fn try_define(
+    m: &mut WasmObjectModule,
+    id: cranelift_module::FuncId,
+    sig: Signature,
+    body: impl FnOnce(&mut WasmObjectModule, &mut FunctionBuilder),
+) -> ModuleResult<()> {
     let mut ctx = m.make_context();
     ctx.func.signature = sig;
     let mut fctx = FunctionBuilderContext::new();
@@ -67,7 +78,7 @@ fn define(
     b.seal_block(entry);
     body(m, &mut b);
     b.finalize(m.target_config());
-    m.define_function(id, &mut ctx).unwrap();
+    m.define_function(id, &mut ctx)
 }
 
 /// Object A: `pair(x) -> (i32, i64)`, `narrow(i8 sext) -> i32`, data
@@ -491,4 +502,76 @@ fn function_pointers_without_table_symbol() {
         .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 78);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn uninitialized_data_is_an_error() {
+    let mut m = new_module();
+    let id = m
+        .declare_data("EMPTY", Linkage::Export, false, false)
+        .unwrap();
+    let err = m.define_data(id, &DataDescription::new()).unwrap_err();
+    let ModuleError::Backend(e) = &err else {
+        panic!("expected a backend error, got {err}");
+    };
+    assert_eq!(
+        e.downcast_ref::<DefineDataError>(),
+        Some(&DefineDataError::Uninitialized {
+            name: "EMPTY".into()
+        }),
+        "the error must name the uninitialized data object"
+    );
+    // The failed definition must not count, so a corrected one succeeds.
+    let mut d = DataDescription::new();
+    d.define_zeroinit(4);
+    m.define_data(id, &d)
+        .expect("defining after a failed attempt must succeed");
+}
+
+#[test]
+fn invalid_data_alignment_is_an_error() {
+    let mut m = new_module();
+    let id = m
+        .declare_data("ODD", Linkage::Export, false, false)
+        .unwrap();
+    for align in [3, 1 << 32] {
+        let mut d = DataDescription::new();
+        d.define_zeroinit(4);
+        // Set directly: `set_align` would reject 3 itself.
+        d.align = Some(align);
+        let err = m.define_data(id, &d).unwrap_err();
+        let ModuleError::Backend(e) = &err else {
+            panic!("expected a backend error, got {err}");
+        };
+        assert_eq!(
+            e.downcast_ref::<DefineDataError>(),
+            Some(&DefineDataError::InvalidAlignment {
+                name: "ODD".into(),
+                align
+            }),
+            "alignment {align} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn failed_function_definition_can_be_retried() {
+    let mut m = new_module();
+    let i32t = types::I32;
+    let s = sig(&[], &[i32t]);
+    let id = m.declare_function("f", Linkage::Export, &s).unwrap();
+    // This backend does not support `get_return_address`.
+    let err = try_define(&mut m, id, s.clone(), |_, b| {
+        let r = b.ins().get_return_address(i32t);
+        b.ins().return_(&[r]);
+    })
+    .unwrap_err();
+    assert!(
+        matches!(err, ModuleError::Compilation(_)),
+        "get_return_address must fail to compile, got {err}"
+    );
+    define(&mut m, id, s, |_, b| {
+        let r = b.ins().iconst(i32t, 7);
+        b.ins().return_(&[r]);
+    });
 }

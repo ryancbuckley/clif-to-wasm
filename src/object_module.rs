@@ -116,6 +116,15 @@ impl std::fmt::Debug for ObjectOptions {
 }
 
 /// A `cranelift_module::Module` writing a relocatable wasm object.
+///
+/// A definition that returns an error does not count as one, so it can be
+/// retried.
+///
+/// # Panics
+///
+/// Defining a function that fails Cranelift's IR verifier may panic when the
+/// `enable_verifier` flag is off; see [`compile_function`](crate::compile_function).
+/// With the flag on (the default), it returns [`ModuleError::Compilation`].
 pub struct WasmObjectModule {
     isa: OwnedTargetIsa,
     declarations: ModuleDeclarations,
@@ -146,6 +155,41 @@ impl std::fmt::Debug for WasmObjectModule {
             .finish_non_exhaustive()
     }
 }
+
+/// Why [`WasmObjectModule::define_data`] rejected a data object. Returned as
+/// the payload of [`ModuleError::Backend`]; recover it with `downcast_ref`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+#[must_use]
+pub enum DefineDataError {
+    /// The data object has no contents ([`Init::Uninitialized`]).
+    Uninitialized {
+        /// The data object's linkage name.
+        name: String,
+    },
+    /// The alignment is not a power of two, or does not fit in a `u32`.
+    InvalidAlignment {
+        /// The data object's linkage name.
+        name: String,
+        /// The requested alignment in bytes.
+        align: u64,
+    },
+}
+
+impl std::fmt::Display for DefineDataError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DefineDataError::Uninitialized { name } => {
+                write!(f, "data {name} is not initialized")
+            }
+            DefineDataError::InvalidAlignment { name, align } => {
+                write!(f, "data {name} has invalid alignment {align}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DefineDataError {}
 
 fn unsupported_err(msg: impl Into<String>) -> ModuleError {
     ModuleError::Compilation(CodegenError::Unsupported(msg.into()))
@@ -426,7 +470,6 @@ impl Module for WasmObjectModule {
         if self.defined_funcs[func_id] {
             return Err(ModuleError::DuplicateDefinition(name));
         }
-        self.defined_funcs[func_id] = true;
         let sym = self.func_symbol(func_id)?;
 
         let flags = self.isa.flags();
@@ -483,6 +526,8 @@ impl Module for WasmObjectModule {
             }
             Err(e) => return Err(unsupported_err(format!("{name}: {e}"))),
         };
+        // Only now, with nothing left to fail, does the definition count.
+        self.defined_funcs[func_id] = true;
         self.obj.define_function(sym, compiled);
         Ok(())
     }
@@ -511,16 +556,28 @@ impl Module for WasmObjectModule {
                 "{name}: data in section {section}"
             )));
         }
-        self.defined_data[data_id] = true;
+        let bytes = match &data.init {
+            Init::Uninitialized => {
+                return Err(ModuleError::Backend(
+                    DefineDataError::Uninitialized { name }.into(),
+                ));
+            }
+            Init::Zeros { size } => vec![0; *size],
+            Init::Bytes { contents } => contents.to_vec(),
+        };
+        let align = data.align.unwrap_or(1).max(1);
+        let align = match u32::try_from(align) {
+            Ok(a) if a.is_power_of_two() => a,
+            _ => {
+                return Err(ModuleError::Backend(
+                    DefineDataError::InvalidAlignment { name, align }.into(),
+                ));
+            }
+        };
         let mutability = if decl.writable {
             Mutability::Mutable
         } else {
             Mutability::Immutable
-        };
-        let bytes = match &data.init {
-            Init::Uninitialized => panic!("data {name} is not initialized"),
-            Init::Zeros { size } => vec![0; *size],
-            Init::Bytes { contents } => contents.to_vec(),
         };
         let mut relocs = Vec::new();
         for &(offset, fref) in &data.function_relocs {
@@ -539,9 +596,10 @@ impl Module for WasmObjectModule {
                 addend,
             });
         }
+        // Only now, with nothing left to fail, does the definition count.
+        self.defined_data[data_id] = true;
         let sym = self.data_symbol(data_id);
         self.used_data[data_id] = data.used;
-        let align = data.align.unwrap_or(1).max(1) as u32;
         self.obj.define_data(
             sym,
             DataDef {
