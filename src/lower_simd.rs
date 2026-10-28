@@ -22,9 +22,9 @@
 use crate::emit::Emitter;
 use crate::locals::Local;
 use crate::lower_float::FloatCmpOps;
-use crate::{Result, fixed_type, unsupported};
+use crate::{Result, error, wasm_types};
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{Inst, InstructionData as D, Opcode, Type, types};
+use cranelift_codegen::ir::{Function, Inst, InstructionData as D, Opcode, Type, types};
 use wasm_encoder::{Instruction as I, MemArg, ValType};
 
 /// The lane type of a 128-bit vector.
@@ -41,7 +41,7 @@ enum Lane {
 impl Lane {
     fn of(ty: Type) -> Result<Lane> {
         if !ty.is_vector() || !(16..=128).contains(&ty.bits()) {
-            return unsupported(format!("vector type {ty}"));
+            return error::unsupported(format!("vector type {ty}"));
         }
         Self::from_scalar(ty.lane_type())
             .ok_or_else(|| crate::Error::Unsupported(format!("vector type {ty}")))
@@ -121,18 +121,18 @@ macro_rules! lanes {
         match $lane {
             $(Lane::$l => $i,)*
             #[allow(unreachable_patterns)]
-            l => return unsupported(format!("{} on {:?} lanes", $op, l)),
+            l => return error::unsupported(format!("{} on {:?} lanes", $op, l)),
         }
     };
 }
 
 /// Does this instruction operate on vectors (and so belong here)?
-pub(crate) fn is_simd(func: &cranelift_codegen::ir::Function, inst: Inst) -> bool {
+pub(crate) fn is_simd(func: &Function, inst: Inst) -> bool {
     let dfg = &func.dfg;
     // Almost every vector operation has a vector result; check the
     // vector-in, scalar-out ones by their operand.
     match dfg.inst_results(inst).first() {
-        Some(&r) if fixed_type(dfg.value_type(r)).is_vector() => {
+        Some(&r) if wasm_types::fixed_type(dfg.value_type(r)).is_vector() => {
             let op = dfg.insts[inst].opcode();
             !op.is_call()
         }
@@ -142,7 +142,9 @@ pub(crate) fn is_simd(func: &cranelift_codegen::ir::Function, inst: Inst) -> boo
             | Opcode::VallTrue
             | Opcode::VhighBits
             | Opcode::Store
-            | Opcode::Bitcast => fixed_type(dfg.value_type(dfg.inst_args(inst)[0])).is_vector(),
+            | Opcode::Bitcast => {
+                wasm_types::fixed_type(dfg.value_type(dfg.inst_args(inst)[0])).is_vector()
+            }
             _ => false,
         },
     }
@@ -183,13 +185,12 @@ impl Emitter<'_> {
         let op = data.opcode();
         let args = dfg.inst_args(inst);
         // Dynamic vectors are treated as their fixed-size types.
-        let ty = dfg
-            .inst_results(inst)
-            .first()
-            .map_or(types::INVALID, |&r| fixed_type(dfg.value_type(r)));
-        let aty = args
-            .first()
-            .map_or(types::INVALID, |&a| fixed_type(dfg.value_type(a)));
+        let ty = dfg.inst_results(inst).first().map_or(types::INVALID, |&r| {
+            wasm_types::fixed_type(dfg.value_type(r))
+        });
+        let aty = args.first().map_or(types::INVALID, |&a| {
+            wasm_types::fixed_type(dfg.value_type(a))
+        });
         // The vector type the operation works on.
         let vty = if ty.is_vector() { ty } else { aty };
         let lane = Lane::of(vty)?;
@@ -222,7 +223,10 @@ impl Emitter<'_> {
             (Opcode::Shuffle, D::Shuffle { imm, .. }) => {
                 self.operand()?;
                 self.operand()?;
-                let bytes: [u8; 16] = dfg.immediates[imm].as_slice().try_into().unwrap();
+                let bytes: [u8; 16] = dfg.immediates[imm]
+                    .as_slice()
+                    .try_into()
+                    .expect("16-byte shuffle mask");
                 self.ins(I::I8x16Shuffle(bytes));
             }
             // With a dynamic vector the size of its fixed type, only the
@@ -250,7 +254,7 @@ impl Emitter<'_> {
             }
             (Opcode::Imul, _) if lane == Lane::I8 => {
                 // The low byte of each 16-bit product.
-                self.widening_mul(Lane::I8, false)?;
+                self.widening_mul(Lane::I8, /* signed= */ false)?;
                 self.ins(I::I8x16Shuffle(shuffle_bytes(1, |i| 2 * i)));
             }
             (Opcode::Imul, _) => {
@@ -260,7 +264,7 @@ impl Emitter<'_> {
                     I16 => I::I16x8Mul, I32 => I::I32x4Mul, I64 => I::I64x2Mul));
             }
             (Opcode::Umulhi | Opcode::Smulhi, _) if lane == Lane::I64 => {
-                self.mulhi_i64x2(op == Opcode::Smulhi)?;
+                self.mulhi_i64x2(/* signed= */ op == Opcode::Smulhi)?;
             }
             (Opcode::Umulhi | Opcode::Smulhi, _) => {
                 // The high half of each double-width product.
@@ -413,7 +417,7 @@ impl Emitter<'_> {
                         self.ins(splat_const(Lane::I64, 0xffff_ffff));
                         self.ins(I::V128And);
                     }
-                    _ => return unsupported(format!("{op} on {vty}")),
+                    _ => return error::unsupported(format!("{op} on {vty}")),
                 }
             }
 
@@ -443,7 +447,7 @@ impl Emitter<'_> {
                     Lane::I16 => (I::I16x8Shl, I::I16x8ShrU),
                     Lane::I32 => (I::I32x4Shl, I::I32x4ShrU),
                     Lane::I64 => (I::I64x2Shl, I::I64x2ShrU),
-                    _ => return unsupported(format!("{op} on {vty}")),
+                    _ => return error::unsupported(format!("{op} on {vty}")),
                 };
                 let (first, second) = if op == Opcode::Rotl {
                     (shl, shr)
@@ -564,7 +568,7 @@ impl Emitter<'_> {
                     (Lane::I16, false) => I::I8x16NarrowI16x8U,
                     (Lane::I32, true) => I::I16x8NarrowI32x4S,
                     (Lane::I32, false) => I::I16x8NarrowI32x4U,
-                    _ => return unsupported(format!("{op} on {vty}")),
+                    _ => return error::unsupported(format!("{op} on {vty}")),
                 });
                 self.join_narrowed(aty)?;
             }
@@ -575,7 +579,7 @@ impl Emitter<'_> {
                 let (max, min, narrow) = match src {
                     Lane::I16 => (0xff, I::I16x8MinU, I::I8x16NarrowI16x8U),
                     Lane::I32 => (0xffff, I::I32x4MinU, I::I16x8NarrowI32x4U),
-                    _ => return unsupported(format!("{op} on {vty}")),
+                    _ => return error::unsupported(format!("{op} on {vty}")),
                 };
                 for _ in 0..2 {
                     self.operand()?;
@@ -621,7 +625,7 @@ impl Emitter<'_> {
                     (Opcode::SwidenHigh, Lane::I32) => I::I64x2ExtendHighI32x4S,
                     (Opcode::UwidenLow, Lane::I32) => I::I64x2ExtendLowI32x4U,
                     (Opcode::UwidenHigh, Lane::I32) => I::I64x2ExtendHighI32x4U,
-                    _ => return unsupported(format!("{op} on {aty}")),
+                    _ => return error::unsupported(format!("{op} on {aty}")),
                 });
             }
 
@@ -692,7 +696,7 @@ impl Emitter<'_> {
                     (Opcode::FcvtFromUint, Lane::I64, Lane::F64) => {
                         self.per_lane_64(Lane::I64, Lane::F64, I::F64ConvertI64U)
                     }
-                    _ => return unsupported(format!("{op} {aty} -> {ty}")),
+                    _ => return error::unsupported(format!("{op} {aty} -> {ty}")),
                 }
             }
             (Opcode::FcvtToSintSat | Opcode::FcvtToUintSat, _) => {
@@ -710,7 +714,7 @@ impl Emitter<'_> {
                     (Opcode::FcvtToUintSat, Lane::F64, Lane::I64) => {
                         self.per_lane_64(Lane::F64, Lane::I64, I::I64TruncSatF64U)
                     }
-                    _ => return unsupported(format!("{op} {aty} -> {ty}")),
+                    _ => return error::unsupported(format!("{op} {aty} -> {ty}")),
                 }
             }
             (Opcode::Fvdemote, _) => {
@@ -726,7 +730,7 @@ impl Emitter<'_> {
                 // Vectors of the same size share a representation, with
                 // lanes in little-endian order.
                 if self.big_endian(flags) && aty.lane_bits() != ty.lane_bits() {
-                    return unsupported(format!("big-endian bitcast {aty} -> {ty}"));
+                    return error::unsupported(format!("big-endian bitcast {aty} -> {ty}"));
                 }
                 self.operand()?;
                 match (aty.is_vector(), ty.is_vector()) {
@@ -736,11 +740,11 @@ impl Emitter<'_> {
                     // A scalar is lane 0 of a vector of its width.
                     (true, false) => match Lane::from_scalar(ty) {
                         Some(l) if l != Lane::I8 => self.ins(l.extract_lane(0)),
-                        _ => return unsupported(format!("bitcast {aty} -> {ty}")),
+                        _ => return error::unsupported(format!("bitcast {aty} -> {ty}")),
                     },
                     (false, _) => match Lane::from_scalar(aty) {
                         Some(l) if l != Lane::I8 => self.ins(l.splat()),
-                        _ => return unsupported(format!("bitcast {aty} -> {ty}")),
+                        _ => return error::unsupported(format!("bitcast {aty} -> {ty}")),
                     },
                 }
             }
@@ -757,7 +761,7 @@ impl Emitter<'_> {
                 D::Load { flags, offset, .. },
             ) => {
                 if self.big_endian(flags) {
-                    return unsupported("big-endian vector load");
+                    return error::unsupported("big-endian vector load");
                 }
                 let off = self.mem_address(offset.into())?;
                 let (size, i): (u32, fn(MemArg) -> I<'static>) = match op {
@@ -779,7 +783,7 @@ impl Emitter<'_> {
             }
             (Opcode::Store, D::Store { flags, offset, .. }) => {
                 if self.big_endian(flags) {
-                    return unsupported("big-endian vector store");
+                    return error::unsupported("big-endian vector store");
                 }
                 let off = self.mem_address(offset.into())?;
                 self.operand()?;
@@ -793,7 +797,7 @@ impl Emitter<'_> {
                 });
             }
 
-            _ => return unsupported(format!("instruction `{}`", dfg.display_inst(inst))),
+            _ => return error::unsupported(format!("instruction `{}`", dfg.display_inst(inst))),
         }
         Ok(())
     }
@@ -842,7 +846,7 @@ impl Emitter<'_> {
             (Lane::I16, true) => (I::I32x4ExtMulLowI16x8S, I::I32x4ExtMulHighI16x8S),
             (Lane::I32, false) => (I::I64x2ExtMulLowI32x4U, I::I64x2ExtMulHighI32x4U),
             (Lane::I32, true) => (I::I64x2ExtMulLowI32x4S, I::I64x2ExtMulHighI32x4S),
-            _ => return unsupported(format!("widening multiply of {lane:?} lanes")),
+            _ => return error::unsupported(format!("widening multiply of {lane:?} lanes")),
         };
         let [x, y] = self.scratches(ValType::V128);
         self.operand()?;
@@ -1103,7 +1107,7 @@ impl Emitter<'_> {
                 SignedGreaterThanOrEqual => I::I64x2GeS,
                 _ => unreachable!("flipped to signed above"),
             },
-            _ => return unsupported(format!("icmp on {lane:?} lanes")),
+            _ => return error::unsupported(format!("icmp on {lane:?} lanes")),
         };
         self.ins(i);
         Ok(())

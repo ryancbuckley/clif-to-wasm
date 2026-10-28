@@ -27,7 +27,7 @@
 
 use crate::emit::Emitter;
 use crate::locals::Local;
-use crate::{Result, fixed_type, unsupported};
+use crate::{Result, error, wasm_types};
 use cranelift_codegen::ir::condcodes::FloatCC;
 use cranelift_codegen::ir::{Inst, Opcode, Type, types};
 use wasm_encoder::{BlockType, Ieee32, Ieee64, Instruction as I, ValType};
@@ -112,8 +112,8 @@ impl Emitter<'_> {
                 Ok(types::F32)
             }
             t @ (types::F32 | types::F64) => Ok(t),
-            t if fixed_type(t).is_vector() => Ok(t),
-            t => unsupported(format!("float operand of type {t}")),
+            t if wasm_types::fixed_type(t).is_vector() => Ok(t),
+            t => error::unsupported(format!("float operand of type {t}")),
         }
     }
 
@@ -254,7 +254,7 @@ impl Emitter<'_> {
                 match aty {
                     types::F32 => self.f32_to_f16(),
                     types::F64 => self.f64_to_f16(),
-                    _ => return unsupported(format!("fdemote {aty} -> {ty}")),
+                    _ => return error::unsupported(format!("fdemote {aty} -> {ty}")),
                 }
             }
             Opcode::FcvtFromSint | Opcode::FcvtFromUint if ty == types::F16 => {
@@ -671,7 +671,7 @@ impl Emitter<'_> {
         self.local_get(b_sig);
         self.ins(I::I64Mul);
         self.local_set(p_lo);
-        self.mulhi64_of(a_sig, b_sig, false);
+        self.mulhi64_of(a_sig, b_sig, /* signed= */ false);
         self.local_tee(p_hi);
         self.ins(I::I64Const(41));
         self.ins(I::I64ShrU);

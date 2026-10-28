@@ -5,12 +5,14 @@
 //! allocated during an instruction's lowering are automatically returned to
 //! the emitter's free pool when [`Emitter::inst`] completes.
 
-use crate::emit::{Emitter, is64, narrow_bits, w};
+use crate::emit::{self, CallKind, Emitter, w};
 use crate::locals::Local;
 use crate::lower_float::FloatCmpOps;
-use crate::{Name, Result, SymbolValue, unsupported, wasm_type};
+use crate::{Name, Result, SymbolValue, error, wasm_types};
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{Inst, InstructionData as D, MemFlags, Opcode, Type, types};
+use cranelift_codegen::ir::{
+    GlobalValueData, Inst, InstructionData as D, MemFlags, Opcode, Type, types,
+};
 use wasm_encoder::{Instruction as I, MemArg, ValType};
 
 impl Emitter<'_> {
@@ -129,12 +131,12 @@ impl Emitter<'_> {
             }
             (Opcode::Bnot | Opcode::Ineg, _) if ty.is_int() => {
                 self.operand()?;
-                if is64(ty) {
+                if emit::is64(ty) {
                     self.ins(I::I64Const(-1));
                 } else {
                     self.ins(I::I32Const(-1));
                 }
-                self.ins(match (op, is64(ty)) {
+                self.ins(match (op, emit::is64(ty)) {
                     (Opcode::Bnot, false) => I::I32Xor,
                     (Opcode::Bnot, true) => I::I64Xor,
                     (_, false) => I::I32Mul,
@@ -159,7 +161,7 @@ impl Emitter<'_> {
             }
             (Opcode::Rotl | Opcode::Rotr, _) => {
                 self.operand()?;
-                if let Some(bits) = narrow_bits(ty) {
+                if let Some(bits) = emit::narrow_bits(ty) {
                     let [x, n] = self.scratches(ValType::I32);
                     self.local_tee(x);
                     self.shift_amount(ty)?;
@@ -202,7 +204,7 @@ impl Emitter<'_> {
                 self.sext(ty);
                 if op == Opcode::Sdiv {
                     self.ins(w!(ty, I32DivS, I64DivS));
-                    if let Some(bits) = narrow_bits(ty) {
+                    if let Some(bits) = emit::narrow_bits(ty) {
                         // MIN / -1 does not overflow in i32; trap explicitly.
                         let s = self.scratch(ValType::I32);
                         self.local_tee(s);
@@ -220,7 +222,7 @@ impl Emitter<'_> {
                 let signed = op == Opcode::Smulhi;
                 match ty {
                     types::I8 | types::I16 => {
-                        let bits = narrow_bits(ty).unwrap();
+                        let bits = emit::narrow_bits(ty).expect("i8 and i16 are narrow");
                         self.operand()?;
                         if signed {
                             self.sext(ty);
@@ -250,13 +252,13 @@ impl Emitter<'_> {
                         self.ins(I::I32WrapI64);
                     }
                     types::I64 => self.mulhi64(signed)?,
-                    _ => return unsupported(format!("{op}.{ty}")),
+                    _ => return error::unsupported(format!("{op}.{ty}")),
                 }
             }
             (Opcode::Bswap | Opcode::Bitrev, _) => {
                 self.operand()?;
                 if op == Opcode::Bitrev {
-                    let wide = is64(ty);
+                    let wide = emit::is64(ty);
                     self.swap_bits(wide, 1, 0x5555_5555_5555_5555);
                     self.swap_bits(wide, 2, 0x3333_3333_3333_3333);
                     self.swap_bits(wide, 4, 0x0f0f_0f0f_0f0f_0f0f);
@@ -266,10 +268,10 @@ impl Emitter<'_> {
             (Opcode::Iabs, _) => {
                 self.operand()?;
                 self.sext(ty);
-                let vt = wasm_type(ty)?;
+                let vt = wasm_types::wasm_type(ty)?;
                 let [s, m] = self.scratches(vt);
                 self.local_tee(s);
-                if is64(ty) {
+                if emit::is64(ty) {
                     self.ins(I::I64Const(63));
                     self.ins(I::I64ShrS);
                 } else {
@@ -285,7 +287,7 @@ impl Emitter<'_> {
             }
             (Opcode::Smin | Opcode::Smax | Opcode::Umin | Opcode::Umax, _) if ty.is_int() => {
                 let signed = matches!(op, Opcode::Smin | Opcode::Smax);
-                let vt = wasm_type(ty)?;
+                let vt = wasm_types::wasm_type(ty)?;
                 let [a, b] = self.scratches(vt);
                 self.operand()?;
                 if signed {
@@ -312,7 +314,7 @@ impl Emitter<'_> {
             }
             (Opcode::Clz | Opcode::Ctz | Opcode::Popcnt, _) => {
                 self.operand()?;
-                let bits = narrow_bits(ty);
+                let bits = emit::narrow_bits(ty);
                 if let (Opcode::Ctz, Some(bits)) = (op, bits) {
                     self.ins(I::I32Const(1 << bits));
                     self.ins(I::I32Or);
@@ -330,10 +332,10 @@ impl Emitter<'_> {
             (Opcode::Cls, _) => {
                 self.operand()?;
                 self.sext(ty);
-                let vt = wasm_type(ty)?;
+                let vt = wasm_types::wasm_type(ty)?;
                 let s = self.scratch(vt);
                 self.local_tee(s);
-                if is64(ty) {
+                if emit::is64(ty) {
                     self.ins(I::I64Const(63));
                     self.ins(I::I64ShrS);
                     self.local_get(s);
@@ -348,7 +350,7 @@ impl Emitter<'_> {
                     self.ins(I::I32Xor);
                     self.ins(I::I32Clz);
                     self.ins(I::I32Const(
-                        1 + narrow_bits(ty).map_or(0, |b| 32 - b as i32),
+                        1 + emit::narrow_bits(ty).map_or(0, |b| 32 - b as i32),
                     ));
                     self.ins(I::I32Sub);
                 }
@@ -386,7 +388,7 @@ impl Emitter<'_> {
                 self.operand()?;
                 self.ins(w!(aty, I32Eqz, I64Eqz));
                 self.ins(I::I32Eqz);
-                if is64(ty) {
+                if emit::is64(ty) {
                     self.ins(I::I64ExtendI32U);
                     self.ins(I::I64Const(-1));
                     self.ins(I::I64Mul);
@@ -404,7 +406,7 @@ impl Emitter<'_> {
                 self.ins(I::Select);
             }
             (Opcode::Bitselect, _) if ty.is_int() => {
-                let vt = wasm_type(ty)?;
+                let vt = wasm_types::wasm_type(ty)?;
                 let c = self.scratch(vt);
                 self.operand()?;
                 self.local_tee(c);
@@ -412,7 +414,7 @@ impl Emitter<'_> {
                 self.ins(w!(ty, I32And, I64And));
                 self.operand()?;
                 self.local_get(c);
-                if is64(ty) {
+                if emit::is64(ty) {
                     self.ins(I::I64Const(-1));
                     self.ins(I::I64Xor);
                 } else {
@@ -423,14 +425,14 @@ impl Emitter<'_> {
                 self.ins(w!(ty, I32Or, I64Or));
             }
             (Opcode::UaddOverflowTrap, _) => {
-                let vt = wasm_type(ty)?;
+                let vt = wasm_types::wasm_type(ty)?;
                 let [a, r] = self.scratches(vt);
                 self.operand()?;
                 self.local_tee(a);
                 self.operand()?;
                 self.ins(w!(ty, I32Add, I64Add));
                 self.local_tee(r);
-                if let Some(bits) = narrow_bits(ty) {
+                if let Some(bits) = emit::narrow_bits(ty) {
                     self.ins(I::I32Const(((1u32 << bits) - 1) as i32));
                     self.ins(I::I32GtU);
                 } else {
@@ -457,21 +459,21 @@ impl Emitter<'_> {
             // Conversions.
             (Opcode::Uextend, _) => {
                 self.operand()?;
-                if is64(ty) && !is64(aty) {
+                if emit::is64(ty) && !emit::is64(aty) {
                     self.ins(I::I64ExtendI32U);
                 }
             }
             (Opcode::Sextend, _) => {
                 self.operand()?;
                 self.sext(aty);
-                if is64(ty) && !is64(aty) {
+                if emit::is64(ty) && !emit::is64(aty) {
                     self.ins(I::I64ExtendI32S);
                 }
                 self.mask(ty);
             }
             (Opcode::Ireduce, _) => {
                 self.operand()?;
-                if is64(aty) {
+                if emit::is64(aty) {
                     self.ins(I::I32WrapI64);
                 }
                 self.mask(ty);
@@ -486,7 +488,7 @@ impl Emitter<'_> {
                     (types::F64, types::I64) => self.ins(I::I64ReinterpretF64),
                     // An f16 is its bits in an i32, like an i16.
                     (types::I16, types::F16) | (types::F16, types::I16) => {}
-                    _ => return unsupported(format!("bitcast {aty} -> {ty}")),
+                    _ => return error::unsupported(format!("bitcast {aty} -> {ty}")),
                 }
             }
             (Opcode::Fpromote, _) if ty == types::F64 && aty == types::F32 => {
@@ -503,7 +505,7 @@ impl Emitter<'_> {
                 if signed {
                     self.sext(aty);
                 }
-                self.ins(match (ty, is64(aty), signed) {
+                self.ins(match (ty, emit::is64(aty), signed) {
                     (types::F32, false, true) => I::F32ConvertI32S,
                     (types::F32, false, false) => I::F32ConvertI32U,
                     (types::F32, true, true) => I::F32ConvertI64S,
@@ -512,13 +514,13 @@ impl Emitter<'_> {
                     (types::F64, false, false) => I::F64ConvertI32U,
                     (types::F64, true, true) => I::F64ConvertI64S,
                     (types::F64, true, false) => I::F64ConvertI64U,
-                    _ => return unsupported(format!("{op} {aty} -> {ty}")),
+                    _ => return error::unsupported(format!("{op} {aty} -> {ty}")),
                 });
             }
             (Opcode::FcvtToSint | Opcode::FcvtToUint, _) => {
                 let signed = op == Opcode::FcvtToSint;
                 let f64 = self.float_operand()? == types::F64;
-                self.ins(match (is64(ty), f64, signed) {
+                self.ins(match (emit::is64(ty), f64, signed) {
                     (false, false, true) => I::I32TruncF32S,
                     (false, false, false) => I::I32TruncF32U,
                     (false, true, true) => I::I32TruncF64S,
@@ -528,7 +530,7 @@ impl Emitter<'_> {
                     (true, true, true) => I::I64TruncF64S,
                     (true, true, false) => I::I64TruncF64U,
                 });
-                if let Some(bits) = narrow_bits(ty) {
+                if let Some(bits) = emit::narrow_bits(ty) {
                     // Trap if the result does not fit the narrow type.
                     let s = self.scratch(ValType::I32);
                     self.local_tee(s);
@@ -550,7 +552,7 @@ impl Emitter<'_> {
             {
                 let signed = op == Opcode::FcvtToSintSat;
                 let f64 = self.float_operand()? == types::F64;
-                self.ins(match (is64(ty), f64, signed) {
+                self.ins(match (emit::is64(ty), f64, signed) {
                     (false, false, true) => I::I32TruncSatF32S,
                     (false, false, false) => I::I32TruncSatF32U,
                     (false, true, true) => I::I32TruncSatF64S,
@@ -561,10 +563,12 @@ impl Emitter<'_> {
                     (true, true, false) => I::I64TruncSatF64U,
                 });
             }
-            (Opcode::FcvtToSintSat | Opcode::FcvtToUintSat, _) if narrow_bits(ty).is_some() => {
+            (Opcode::FcvtToSintSat | Opcode::FcvtToUintSat, _)
+                if matches!(ty, types::I8 | types::I16) =>
+            {
                 // Saturate to i32, then clamp to the narrow range.
                 let signed = op == Opcode::FcvtToSintSat;
-                let bits = narrow_bits(ty).unwrap();
+                let bits = emit::narrow_bits(ty).expect("i8 and i16 are narrow");
                 let f64 = self.float_operand()? == types::F64;
                 self.ins(match (f64, signed) {
                     (false, true) => I::I32TruncSatF32S,
@@ -665,14 +669,16 @@ impl Emitter<'_> {
             ) => self.stack_addr(stack_slot, offset.into(), ty)?,
             (Opcode::SymbolValue | Opcode::TlsValue, D::UnaryGlobalValue { global_value, .. }) => {
                 let gv = &func.global_values[global_value];
-                let cranelift_codegen::ir::GlobalValueData::Symbol { name, offset, .. } = gv else {
-                    return unsupported(format!("global value {gv}"));
+                let GlobalValueData::Symbol { name, offset, .. } = gv else {
+                    return error::unsupported(format!("global value {gv}"));
                 };
                 let offset = offset.bits();
                 let tls = op == Opcode::TlsValue;
                 if tls {
                     let Some(base) = self.config.module.tls_base_global else {
-                        return unsupported("tls_value without ModuleLayout::tls_base_global");
+                        return error::unsupported(
+                            "tls_value without ModuleLayout::tls_base_global",
+                        );
                     };
                     self.global_get(base);
                     self.ptr_to(ty)?;
@@ -713,7 +719,9 @@ impl Emitter<'_> {
 
             (Opcode::GetPinnedReg | Opcode::SetPinnedReg, _) => {
                 let Some(g) = self.config.module.pinned_reg_global else {
-                    return unsupported(format!("{op} without ModuleLayout::pinned_reg_global"));
+                    return error::unsupported(format!(
+                        "{op} without ModuleLayout::pinned_reg_global"
+                    ));
                 };
                 if op == Opcode::GetPinnedReg {
                     self.global_get(g);
@@ -752,13 +760,13 @@ impl Emitter<'_> {
                 if tail {
                     self.epilogue();
                     if self.config.engine.tail_calls {
-                        self.call(idx, true);
+                        self.call(idx, CallKind::Tail);
                     } else {
-                        self.call(idx, false);
+                        self.call(idx, CallKind::Normal);
                         self.ins(I::Return);
                     }
                 } else {
-                    self.call(idx, false);
+                    self.call(idx, CallKind::Normal);
                     self.call_result(inst)?;
                 }
             }
@@ -770,20 +778,20 @@ impl Emitter<'_> {
                 let copies = self.call_args(&dfg.signatures[sig_ref], args.len() - 1, tail)?;
                 self.operand()?;
                 self.byval_copies(copies);
-                if is64(aty) {
+                if emit::is64(aty) {
                     self.ins(I::I32WrapI64);
                 }
                 let (type_index, table_index) = self.indirect_call(sig_ref)?;
                 if tail {
                     self.epilogue();
                     if self.config.engine.tail_calls {
-                        self.call_indirect(type_index, table_index, true);
+                        self.call_indirect(type_index, table_index, CallKind::Tail);
                     } else {
-                        self.call_indirect(type_index, table_index, false);
+                        self.call_indirect(type_index, table_index, CallKind::Normal);
                         self.ins(I::Return);
                     }
                 } else {
-                    self.call_indirect(type_index, table_index, false);
+                    self.call_indirect(type_index, table_index, CallKind::Normal);
                     self.call_result(inst)?;
                 }
             }
@@ -808,7 +816,7 @@ impl Emitter<'_> {
                 self.trap_if();
             }
 
-            _ => return unsupported(format!("instruction `{}`", dfg.display_inst(inst))),
+            _ => return error::unsupported(format!("instruction `{}`", dfg.display_inst(inst))),
         }
         Ok(())
     }
@@ -829,13 +837,13 @@ impl Emitter<'_> {
                 _ => (4, true),
             };
             let m = self.memarg(off, flags, bytes);
-            let raw = types::Type::int_with_byte_size(bytes as u16).unwrap();
+            let raw = Type::int_with_byte_size(bytes as u16).expect("1, 2, 4, or 8 bytes");
             self.ins(match bytes {
                 1 => I::I32Load8U(m),
                 2 => I::I32Load16U(m),
                 4 => I::I32Load(m),
                 8 => I::I64Load(m),
-                _ => return unsupported(format!("{op}.{ty}")),
+                _ => return error::unsupported(format!("{op}.{ty}")),
             });
             self.bswap(raw)?;
             if signed {
@@ -848,7 +856,7 @@ impl Emitter<'_> {
                 (_, types::I64) if signed => self.ins(I::I64ExtendI32S),
                 (_, types::I64) => self.ins(I::I64ExtendI32U),
                 (_, types::I8 | types::I16 | types::I32 | types::F16) => self.mask(ty),
-                _ => return unsupported(format!("{op}.{ty}")),
+                _ => return error::unsupported(format!("{op}.{ty}")),
             }
             return Ok(());
         }
@@ -871,7 +879,7 @@ impl Emitter<'_> {
             (Opcode::Sload16, types::I64) => (2, I::I64Load16S as _),
             (Opcode::Uload32, types::I64) => (4, I::I64Load32U as _),
             (Opcode::Sload32, types::I64) => (4, I::I64Load32S as _),
-            _ => return unsupported(format!("{op}.{ty}")),
+            _ => return error::unsupported(format!("{op}.{ty}")),
         };
         let m = self.memarg(off, flags, size);
         self.ins(i(m));
@@ -897,9 +905,9 @@ impl Emitter<'_> {
                 types::F64 => self.ins(I::I64ReinterpretF64),
                 types::I64 if bytes < 8 => self.ins(I::I32WrapI64),
                 t if t == types::F16 || (t.is_int() && !t.is_vector()) => {}
-                _ => return unsupported(format!("{op}.{vty}")),
+                _ => return error::unsupported(format!("{op}.{vty}")),
             }
-            let raw = types::Type::int_with_byte_size(bytes as u16).unwrap();
+            let raw = Type::int_with_byte_size(bytes as u16).expect("1, 2, 4, or 8 bytes");
             self.bswap(raw)?;
             let m = self.memarg(off, flags, bytes);
             self.ins(match bytes {
@@ -924,7 +932,7 @@ impl Emitter<'_> {
             (Opcode::Istore16, types::I32) => (2, I::I32Store16 as _),
             (Opcode::Istore16, types::I64) => (2, I::I64Store16 as _),
             (Opcode::Istore32, types::I64) => (4, I::I64Store32 as _),
-            _ => return unsupported(format!("{op}.{vty}")),
+            _ => return error::unsupported(format!("{op}.{vty}")),
         };
         let m = self.memarg(off, flags, size);
         self.ins(i(m));
@@ -970,12 +978,12 @@ impl Emitter<'_> {
                 self.free_scratches(mark);
             }
             types::I64 => {
-                self.swap_bits(true, 8, 0x00ff_00ff_00ff_00ff);
-                self.swap_bits(true, 16, 0x0000_ffff_0000_ffff);
+                self.swap_bits(/* wide= */ true, 8, 0x00ff_00ff_00ff_00ff);
+                self.swap_bits(/* wide= */ true, 16, 0x0000_ffff_0000_ffff);
                 self.ins(I::I64Const(32));
                 self.ins(I::I64Rotl);
             }
-            _ => return unsupported(format!("bswap.{ty}")),
+            _ => return error::unsupported(format!("bswap.{ty}")),
         }
         Ok(())
     }
@@ -1108,9 +1116,9 @@ impl Emitter<'_> {
         if ty == types::I64 {
             return self.overflow_op64(kind, signed, carry);
         }
-        let narrow = narrow_bits(ty).is_some();
+        let narrow = emit::narrow_bits(ty).is_some();
         if !narrow && ty != types::I32 {
-            return unsupported(format!("{op}.{ty}"));
+            return error::unsupported(format!("{op}.{ty}"));
         }
         let (wide, wvt) = if narrow {
             (types::I32, ValType::I32)

@@ -11,7 +11,7 @@ use cranelift_codegen::ir::{
 };
 use cranelift_codegen::isa::{CallConv, TargetFrontendConfig};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use harness::clifgen::{Rng, arg};
+use harness::clifgen::{self, Rng};
 
 const VTYPES: [Type; 13] = [
     types::I8X16,
@@ -306,7 +306,8 @@ fn simd_ops_match_interpreter() {
                 .collect();
             let mut rng = Rng(0x5eed ^ tested as u64);
             for _ in 0..iters {
-                let args: Vec<DataValue> = params.iter().map(|&t| arg(&mut rng, t)).collect();
+                let args: Vec<DataValue> =
+                    params.iter().map(|&t| clifgen::arg(&mut rng, t)).collect();
                 let Some(Ok(expected)) =
                     harness::interpret(std::slice::from_ref(&func), "f", &args)
                 else {

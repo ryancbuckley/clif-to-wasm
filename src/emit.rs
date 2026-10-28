@@ -21,12 +21,12 @@
 //!   fusing adjacent `local.set x; local.get x` into `local.tee x` when
 //!   `Optimizations::use_tee` is enabled.
 
-use crate::analysis::{FuncInfo, is_remat};
-use crate::expr_trees::{ExprTrees, Operand, operands};
+use crate::analysis::{self, FuncInfo};
+use crate::expr_trees::{self, ExprTrees, Operand};
 use crate::locals::{Local, Locals};
 use crate::{
     AddressType, CompiledFunction, Config, Env, FuncIndex, GlobalIndex, Name, Reloc, RelocKind,
-    Result, TableIndex, TypeIndex, unsupported, wasm_signature,
+    Result, TableIndex, TypeIndex, error, wasm_types,
 };
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::{
@@ -41,6 +41,15 @@ use wasm_encoder::{BlockType, Encode, Instruction as I, MemArg, ValType};
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ScratchMark(usize);
 
+/// Whether a call returns to its caller or replaces the caller's frame.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CallKind {
+    /// `call` or `call_indirect`.
+    Normal,
+    /// `return_call` or `return_call_indirect`.
+    Tail,
+}
+
 /// A by-value struct argument still to be copied into the frame, from
 /// [`Emitter::call_args`].
 pub(crate) struct ByvalCopy {
@@ -51,12 +60,12 @@ pub(crate) struct ByvalCopy {
     size: u32,
 }
 
-pub(crate) struct Emitter<'a> {
-    pub func: &'a Function,
-    pub config: &'a Config,
-    pub env: &'a mut dyn Env,
-    pub info: &'a FuncInfo,
-    pub trees: &'a ExprTrees,
+pub(crate) struct Emitter<'ctx> {
+    pub func: &'ctx Function,
+    pub config: &'ctx Config,
+    pub env: &'ctx mut dyn Env,
+    pub info: &'ctx FuncInfo,
+    pub trees: &'ctx ExprTrees,
     pub locals: Locals,
     /// Shadow-stack frame: `(frame_pointer_local, frame_size)`.
     frame: Option<(Local, u32)>,
@@ -97,15 +106,15 @@ macro_rules! w {
 }
 pub(crate) use w;
 
-impl<'a> Emitter<'a> {
+impl<'ctx> Emitter<'ctx> {
     /// Create an emitter for `func` and emit the function prologue (shadow
     /// stack allocation and narrow parameter masking).
     pub fn new(
-        func: &'a Function,
-        config: &'a Config,
-        env: &'a mut dyn Env,
-        info: &'a FuncInfo,
-        trees: &'a ExprTrees,
+        func: &'ctx Function,
+        config: &'ctx Config,
+        env: &'ctx mut dyn Env,
+        info: &'ctx FuncInfo,
+        trees: &'ctx ExprTrees,
         locals: Locals,
     ) -> Result<Self> {
         let base = locals.next_index();
@@ -133,7 +142,7 @@ impl<'a> Emitter<'a> {
         let func = self.func;
         let config = self.config;
         if !func.dynamic_stack_slots.is_empty() {
-            return unsupported("dynamic stack slots");
+            return error::unsupported("dynamic stack slots");
         }
         // Calls copy by-value struct arguments (`StructArgument`) into the
         // frame; one area serves all calls, sized for the largest.
@@ -155,20 +164,22 @@ impl<'a> Emitter<'a> {
         }
         if !func.sized_stack_slots.is_empty() || byval_size > 0 {
             let Some(sp) = config.module.stack_pointer_global else {
-                return unsupported("stack slots without ModuleLayout::stack_pointer_global");
+                return error::unsupported(
+                    "stack slots without ModuleLayout::stack_pointer_global",
+                );
             };
             let mut size: u32 = 0;
             for (slot, data) in func.sized_stack_slots.iter() {
                 if data.align_shift > 4 {
-                    return unsupported("stack slot alignment above 16");
+                    return error::unsupported("stack slot alignment above 16");
                 }
                 let align = 1u32 << data.align_shift;
                 let Some(aligned) = size.checked_next_multiple_of(align) else {
-                    return unsupported("stack frame size overflow");
+                    return error::unsupported("stack frame size overflow");
                 };
                 self.slot_offset[slot] = aligned;
                 let Some(next) = aligned.checked_add(data.size) else {
-                    return unsupported("stack frame size overflow");
+                    return error::unsupported("stack frame size overflow");
                 };
                 size = next;
             }
@@ -176,7 +187,7 @@ impl<'a> Emitter<'a> {
                 .checked_next_multiple_of(16)
                 .and_then(|s| Some((s, s.checked_add(byval_size)?)))
             else {
-                return unsupported("stack frame size overflow");
+                return error::unsupported("stack frame size overflow");
             };
             let (byval_base, size) = size;
             self.byval_base = byval_base;
@@ -216,7 +227,12 @@ impl<'a> Emitter<'a> {
             self.local_get(fp);
             self.ptr_const(size as i64);
             self.ptr_add();
-            self.global_set(self.config.module.stack_pointer_global.unwrap());
+            self.global_set(
+                self.config
+                    .module
+                    .stack_pointer_global
+                    .expect("frame implies a stack pointer"),
+            );
         }
     }
 
@@ -254,8 +270,9 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// `call`, or `return_call` if `tail`.
-    pub(crate) fn call(&mut self, f: FuncIndex, tail: bool) {
+    /// `call`, or `return_call` for a tail call.
+    pub(crate) fn call(&mut self, f: FuncIndex, kind: CallKind) {
+        let tail = kind == CallKind::Tail;
         if self.config.module.relocatable {
             self.body.op(&[if tail { 0x12 } else { 0x10 }]);
             self.body.uleb(RelocKind::FunctionIndexLeb, f.0);
@@ -266,8 +283,9 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// `call_indirect`, or `return_call_indirect` if `tail`.
-    pub(crate) fn call_indirect(&mut self, ty: TypeIndex, table: TableIndex, tail: bool) {
+    /// `call_indirect`, or `return_call_indirect` for a tail call.
+    pub(crate) fn call_indirect(&mut self, ty: TypeIndex, table: TableIndex, kind: CallKind) {
+        let tail = kind == CallKind::Tail;
         let (type_index, table_index) = (ty.0, table.0);
         if self.config.module.relocatable {
             self.body.op(&[if tail { 0x13 } else { 0x11 }]);
@@ -308,7 +326,8 @@ impl<'a> Emitter<'a> {
     /// Complete the function body (`unreachable; end`), run-length encode all
     /// declared and extra locals, and return the [`CompiledFunction`].
     pub fn finish(mut self) -> Result<CompiledFunction> {
-        let (params, results) = wasm_signature(&self.func.signature, &self.config.module)?;
+        let (params, results) =
+            wasm_types::wasm_signature(&self.func.signature, &self.config.module)?;
         self.ins(I::Unreachable);
         self.ins(I::End);
         let (body, relocs) = self.body.finish();
@@ -373,7 +392,7 @@ impl<'a> Emitter<'a> {
     /// Push the value `v` onto the wasm operand stack.
     pub fn value(&mut self, v: Value) -> Result<()> {
         match self.func.dfg.value_def(v) {
-            ValueDef::Result(d, _) if is_remat(self.func, d) => self.constant(d),
+            ValueDef::Result(d, _) if analysis::is_remat(self.func, d) => self.constant(d),
             ValueDef::Result(d, _) if self.trees.is_inlined(d) => self.inst(d),
             _ => {
                 self.local_get(self.local(v));
@@ -474,7 +493,7 @@ impl<'a> Emitter<'a> {
             (types::I64, AddressType::I64) => {}
             (types::I32, AddressType::I64) => self.ins(I::I64ExtendI32U),
             (types::I32, AddressType::I32) => {}
-            (ty, _) => return unsupported(format!("address of type {ty}")),
+            (ty, _) => return error::unsupported(format!("address of type {ty}")),
         }
         Ok(())
     }
@@ -547,7 +566,7 @@ impl<'a> Emitter<'a> {
         match (self.frame, self.config.module.stack_pointer_global) {
             (Some((fp, _)), _) => self.local_get(fp),
             (None, Some(sp)) => self.global_get(sp),
-            (None, None) => return unsupported(format!("{op} without a stack pointer")),
+            (None, None) => return error::unsupported(format!("{op} without a stack pointer")),
         }
         self.ptr_to(ty)
     }
@@ -558,7 +577,7 @@ impl<'a> Emitter<'a> {
             (AddressType::I32, types::I32) | (AddressType::I64, types::I64) => {}
             (AddressType::I32, types::I64) => self.ins(I::I64ExtendI32U),
             (AddressType::I64, types::I32) => self.ins(I::I32WrapI64),
-            _ => return unsupported(format!("pointer of type {ty}")),
+            _ => return error::unsupported(format!("pointer of type {ty}")),
         }
         Ok(())
     }
@@ -601,7 +620,7 @@ impl<'a> Emitter<'a> {
             }) = p
             {
                 if tail {
-                    return unsupported("tail call with a by-value struct argument");
+                    return error::unsupported("tail call with a by-value struct argument");
                 }
                 let (fp, _) = self.frame.expect("frame for by-value arguments");
                 // The address in the memory's address type.
@@ -674,11 +693,12 @@ impl<'a> Emitter<'a> {
         let tys: Vec<Type> = results.iter().map(|&r| dfg.value_type(r)).collect();
         let mut held = Vec::with_capacity(tys.len());
         for &ty in tys.iter().rev() {
-            let l = self.scratch(crate::wasm_type(ty)?);
+            let l = self.scratch(wasm_types::wasm_type(ty)?);
             self.local_set(l);
             held.push(l);
         }
-        for (&ty, &l) in tys.iter().zip(held.iter().rev()) {
+        let in_order = tys.iter().zip(held.iter().rev());
+        for (&ty, &l) in in_order {
             self.local_get(l);
             self.mask(ty);
         }
@@ -694,10 +714,10 @@ impl<'a> Emitter<'a> {
     /// The type and table indices for an indirect call with signature `sig`.
     pub(crate) fn indirect_call(&mut self, sig: SigRef) -> Result<(TypeIndex, TableIndex)> {
         let Some(table_index) = self.config.module.table_index else {
-            return unsupported("call_indirect without ModuleLayout::table_index");
+            return error::unsupported("call_indirect without ModuleLayout::table_index");
         };
         let (params, results) =
-            wasm_signature(&self.func.dfg.signatures[sig], &self.config.module)?;
+            wasm_types::wasm_signature(&self.func.dfg.signatures[sig], &self.config.module)?;
         let type_index = self.env.type_index(&params, &results)?;
         Ok((type_index, table_index))
     }
@@ -726,7 +746,7 @@ impl<'a> Emitter<'a> {
     pub fn inst(&mut self, inst: Inst) -> Result<()> {
         let start = self.operand_stack.len();
         let mut ops = std::mem::take(&mut self.ops_tmp);
-        operands(self.func, self.info, inst, &mut ops);
+        expr_trees::operands(self.func, self.info, inst, &mut ops);
         self.operand_stack.extend(ops.iter().map(|o| o.value));
         self.ops_tmp = ops;
         self.cursors.push((start, self.operand_stack.len()));
@@ -734,7 +754,7 @@ impl<'a> Emitter<'a> {
         let res = self.lower(inst);
         self.extra.free_since(scratch_mark);
         res?;
-        let (next, end) = self.cursors.pop().unwrap();
+        let (next, end) = self.cursors.pop().expect("cursor pushed above");
         assert_eq!(next, end, "lowering of {inst} skipped operands");
         self.operand_stack.truncate(start);
         Ok(())
@@ -1005,10 +1025,10 @@ mod tests {
                 body.ins(op.to_insn());
             }
             let (bytes, relocs) = body.finish();
-            prop_assert!(relocs.is_empty());
+            prop_assert!(relocs.is_empty(), "a body without relocatable operands has no relocations");
             let decoded = decode_ops(&bytes);
             let expected = model_peephole(&ops, use_tee);
-            prop_assert_eq!(decoded, expected);
+            prop_assert_eq!(decoded, expected, "tee fusion must match the reference model");
         }
 
         #[test]
@@ -1033,21 +1053,21 @@ mod tests {
                 match action {
                     PoolAction::Fresh(ty) => {
                         let l = extra.fresh(ty);
-                        prop_assert!(l.0 >= base);
+                        prop_assert!(l.0 >= base, "fresh local {l:?} must not alias a parameter");
                         prop_assert!(fresh_set.insert(l), "duplicate fresh local {l:?}");
                         for &(_, al) in &active {
                             prop_assert_ne!(l, al, "fresh local aliased active scratch");
                         }
-                        prop_assert_eq!(extra.types()[(l.0 - base) as usize], ty);
+                        prop_assert_eq!(extra.types()[(l.0 - base) as usize], ty, "fresh local {:?} must have the requested type", l);
                     }
                     PoolAction::Scratch(ty) => {
                         let l = extra.scratch(ty);
-                        prop_assert!(l.0 >= base);
+                        prop_assert!(l.0 >= base, "scratch {l:?} must not alias a parameter");
                         prop_assert!(!fresh_set.contains(&l), "scratch aliased fresh local");
                         for &(_, al) in &active {
                             prop_assert_ne!(l, al, "scratch aliased another active scratch");
                         }
-                        prop_assert_eq!(extra.types()[(l.0 - base) as usize], ty);
+                        prop_assert_eq!(extra.types()[(l.0 - base) as usize], ty, "scratch {:?} must have the requested type", l);
                         active.push((ty, l));
                     }
                     PoolAction::Mark => {
@@ -1063,7 +1083,7 @@ mod tests {
                 // Total allocated types equals fresh locals + active scratches + free scratches.
                 prop_assert_eq!(
                     extra.types().len(),
-                    fresh_set.len() + extra.active_scratch.len() + extra.free_scratch.len()
+                    fresh_set.len() + extra.active_scratch.len() + extra.free_scratch.len(), "every local must be fresh, an active scratch, or a free scratch"
                 );
             }
 
@@ -1072,21 +1092,21 @@ mod tests {
             let count_before = extra.types().len();
             for &(ty, _) in &active {
                 let l = extra.scratch(ty);
-                prop_assert_eq!(extra.types()[(l.0 - base) as usize], ty);
+                prop_assert_eq!(extra.types()[(l.0 - base) as usize], ty, "reused scratch {:?} must have the requested type", l);
             }
-            prop_assert_eq!(extra.types().len(), count_before);
+            prop_assert_eq!(extra.types().len(), count_before, "reusing freed scratches must not declare new locals");
         }
     }
 
     #[test]
     fn stack_frame_overflow_is_unsupported() {
-        use cranelift_codegen::ir::{StackSlotData, StackSlotKind};
+        use cranelift_codegen::ir::{StackSlotData, StackSlotKind, ValueList};
         let mut func = Function::new();
         let b0 = func.dfg.make_block();
         func.layout.append_block(b0);
         let ret = func.dfg.make_inst(D::MultiAry {
             opcode: Opcode::Return,
-            args: cranelift_codegen::ir::ValueList::default(),
+            args: ValueList::default(),
         });
         func.layout.append_inst(ret, b0);
         func.sized_stack_slots.push(StackSlotData::new(
@@ -1099,7 +1119,8 @@ mod tests {
         let err = crate::compile_function(&func, &config, &mut NoEnv).unwrap_err();
         assert_eq!(
             err,
-            crate::Error::Unsupported("stack frame size overflow".into())
+            crate::Error::Unsupported("stack frame size overflow".into()),
+            "a frame larger than the address space must be rejected"
         );
     }
 }

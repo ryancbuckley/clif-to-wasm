@@ -15,7 +15,7 @@ mod harness;
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::ir::{ExternalName, Function, InstBuilder, TrapCode, UserFuncName};
 use cranelift_codegen::settings;
-use cranelift_reader::{ParseOptions, parse_test};
+use cranelift_reader::ParseOptions;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -110,7 +110,7 @@ fn main() {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let test = match parse_test(&text, ParseOptions::default()) {
+        let test = match cranelift_reader::parse_test(&text, ParseOptions::default()) {
             Ok(t) => t,
             Err(e) => {
                 parse_errors.push(format!("{file}: {e}"));
@@ -147,7 +147,9 @@ fn main() {
                             clean = false;
                         }
                         // Only the function itself, not its stubs.
-                        for u in unsupported.iter().filter(|u| u.starts_with(&format!("{name}: "))) {
+                        let prefix = format!("{name}: ");
+                        let own = unsupported.iter().filter(|u| u.starts_with(&prefix));
+                        for u in own {
                             let reason = u.split_once(": ").map(|x| x.1).unwrap_or(u);
                             let reason: String = reason.chars().take(90).collect();
                             *reasons.entry(format!("[{cname}] {reason}")).or_default() += 1;

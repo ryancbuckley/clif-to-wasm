@@ -26,7 +26,8 @@
 //! are evaluated only on the taken edge, so they reject effectful trees to
 //! avoid making unconditional effects conditional.
 
-use crate::analysis::{FuncInfo, has_lowering_side_effect, is_remat};
+use crate::analysis::{self, FuncInfo};
+use crate::wasm_types;
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::{Function, Inst, Opcode, Value, ValueDef};
 
@@ -90,7 +91,7 @@ pub(crate) fn operands(func: &Function, info: &FuncInfo, inst: Inst, out: &mut V
             plain(out, &[args[1], args[2], args[0]]);
         }
         // `v128.bitselect` takes the mask last.
-        Opcode::Bitselect if crate::fixed_type(dfg.value_type(args[0])).is_vector() => {
+        Opcode::Bitselect if wasm_types::fixed_type(dfg.value_type(args[0])).is_vector() => {
             plain(out, &[args[1], args[2], args[0]]);
         }
         Opcode::Store
@@ -113,7 +114,7 @@ pub(crate) fn operands(func: &Function, info: &FuncInfo, inst: Inst, out: &mut V
             } else {
                 plain(out, args);
             }
-            let block = func.layout.inst_block(inst).unwrap();
+            let block = func.layout.inst_block(inst).expect("instruction in layout");
             for &call in &info.dests[block] {
                 out.extend(info.live_args(func, call).map(|value| Operand {
                     value,
@@ -123,7 +124,7 @@ pub(crate) fn operands(func: &Function, info: &FuncInfo, inst: Inst, out: &mut V
         }
         Opcode::Jump | Opcode::Brif | Opcode::BrTable => {
             plain(out, args);
-            let block = func.layout.inst_block(inst).unwrap();
+            let block = func.layout.inst_block(inst).expect("instruction in layout");
             let dests = &info.dests[block];
             let conditional = dests.len() > 1;
             for &call in dests {
@@ -152,12 +153,12 @@ pub(crate) fn build(func: &Function, info: &FuncInfo, stack_values: bool) -> Exp
     for &block in &info.rpo {
         let mut c = 0;
         for inst in func.layout.block_insts(block) {
-            if !info.live_inst[inst] || is_remat(func, inst) {
+            if !info.live_inst[inst] || analysis::is_remat(func, inst) {
                 continue;
             }
             s.root_of[inst] = Some(inst);
             color[inst] = c;
-            if has_lowering_side_effect(func, inst) {
+            if analysis::has_lowering_side_effect(func, inst) {
                 effectful[inst] = true;
                 c += 1;
             }
@@ -230,7 +231,7 @@ mod tests {
         pos.ins().return_(&[old]);
 
         let info = FuncInfo::compute(&func).unwrap();
-        let trees = build(&func, &info, true);
+        let trees = build(&func, &info, /* stack_values= */ true);
         let get_inst = func.layout.first_inst(b0).unwrap();
         assert!(
             trees.is_root(get_inst),
@@ -284,7 +285,7 @@ mod tests {
         trace: &mut Vec<Inst>,
     ) {
         if let ValueDef::Result(d, _) = func.dfg.value_def(v) {
-            if is_remat(func, d) {
+            if analysis::is_remat(func, d) {
                 return;
             }
             if trees.is_inlined(d) {
@@ -305,7 +306,7 @@ mod tests {
         for op in ops {
             sim_value(func, info, trees, op.value, trace);
         }
-        if has_lowering_side_effect(func, inst) {
+        if analysis::has_lowering_side_effect(func, inst) {
             trace.push(inst);
         }
     }
@@ -419,19 +420,19 @@ mod tests {
             }
 
             let info = FuncInfo::compute(&func).unwrap();
-            let trees = build(&func, &info, true);
+            let trees = build(&func, &info, /* stack_values= */ true);
 
             // Structural invariants on `trees`.
             for inst in func.layout.block_insts(b0) {
-                if !info.live_inst[inst] || is_remat(&func, inst) {
-                    prop_assert_eq!(trees.root(inst), None);
+                if !info.live_inst[inst] || analysis::is_remat(&func, inst) {
+                    prop_assert_eq!(trees.root(inst), None, "dead or rematerialized {} must not be in a tree", inst);
                 } else {
                     let r = trees.root(inst).unwrap();
-                    prop_assert!(trees.is_root(r));
+                    prop_assert!(trees.is_root(r), "root_of({}) must be a root", inst);
                     if trees.is_inlined(inst) {
-                        prop_assert_eq!(func.dfg.inst_results(inst).len(), 1);
+                        prop_assert_eq!(func.dfg.inst_results(inst).len(), 1, "inlined {} must have a single result", inst);
                         let res = func.dfg.first_result(inst);
-                        prop_assert_eq!(info.use_count[res], 1);
+                        prop_assert_eq!(info.use_count[res], 1, "inlined {} must have its result used once", inst);
                     }
                 }
             }
@@ -440,7 +441,7 @@ mod tests {
             let expected_effects: Vec<Inst> = func
                 .layout
                 .block_insts(b0)
-                .filter(|&i| info.live_inst[i] && has_lowering_side_effect(&func, i))
+                .filter(|&i| info.live_inst[i] && analysis::has_lowering_side_effect(&func, i))
                 .collect();
 
             // Simulate `Structurer` emission of `b0` on each outgoing path and verify
@@ -457,7 +458,7 @@ mod tests {
                 Opcode::Return => {
                     let mut trace = body_effects;
                     sim_inst(&func, &info, &trees, term, &mut trace);
-                    prop_assert_eq!(trace, expected_effects);
+                    prop_assert_eq!(trace, expected_effects, "return path must emit effects in program order");
                 }
                 Opcode::Jump => {
                     let mut trace = body_effects;
@@ -465,7 +466,7 @@ mod tests {
                         sim_value(&func, &info, &trees, a, &mut trace);
                     }
                     trace.push(term);
-                    prop_assert_eq!(trace, expected_effects);
+                    prop_assert_eq!(trace, expected_effects, "jump path must emit effects in program order");
                 }
                 Opcode::Brif => {
                     let mut prefix = body_effects;
@@ -477,7 +478,7 @@ mod tests {
                             sim_value(&func, &info, &trees, a, &mut arm_trace);
                         }
                         arm_trace.push(term);
-                        prop_assert_eq!(arm_trace, expected_effects.clone());
+                        prop_assert_eq!(arm_trace, expected_effects.clone(), "each brif arm must emit effects in program order");
                     }
                 }
                 _ => unreachable!(),

@@ -33,8 +33,8 @@
 //! 4. a fresh local.
 
 use crate::analysis::FuncInfo;
-use crate::expr_trees::{ExprTrees, Operand, operands};
-use crate::{Result, wasm_type};
+use crate::expr_trees::{self, ExprTrees, Operand};
+use crate::{Result, wasm_types};
 use cranelift_codegen::entity::{EntityRef, SecondaryMap};
 use cranelift_codegen::ir::{Block, Function, Inst, Value, ValueDef};
 use std::cmp::Reverse;
@@ -116,13 +116,13 @@ pub(crate) fn allocate(
     let mut slots: Vec<Slot> = Vec::new();
     let mut classes: Vec<Class> = Vec::new();
     for &param in entry_params {
-        let ty = wasm_type(func.dfg.value_type(param))?;
+        let ty = wasm_types::wasm_type(func.dfg.value_type(param))?;
         local_of[param] = new_slot(&mut slots, &mut classes, ty);
     }
 
     for (v, segs) in ranges.iter() {
-        let ty = wasm_type(func.dfg.value_type(v))?;
-        let (lo, hi) = (segs[0].0, segs.last().unwrap().1);
+        let ty = wasm_types::wasm_type(func.dfg.value_type(v))?;
+        let (lo, hi) = (segs[0].0, segs.last().expect("live range has a segment").1);
         let fits = |slots: &[Slot], l: Local| {
             let s = &slots[l.0 as usize];
             s.ty == ty && !overlaps(&s.segs, segs)
@@ -240,7 +240,7 @@ fn compute_live_ranges(func: &Function, info: &FuncInfo, trees: &ExprTrees) -> L
         end[b] = Pos(p);
         p += 1;
     }
-    let term_pos = |b: Block| pos[func.layout.last_inst(b).unwrap()];
+    let term_pos = |b: Block| pos[func.layout.last_inst(b).expect("block has a terminator")];
 
     // Collect uses of each value that needs a local, and block-argument moves.
     let is_local = |v: Value| needs_local(func, info, trees, v);
@@ -252,8 +252,8 @@ fn compute_live_ranges(func: &Function, info: &FuncInfo, trees: &ExprTrees) -> L
             let Some(root) = trees.root(inst) else {
                 continue;
             };
-            let at_block = func.layout.inst_block(root).unwrap();
-            operands(func, info, inst, &mut ops);
+            let at_block = func.layout.inst_block(root).expect("instruction in layout");
+            expr_trees::operands(func, info, inst, &mut ops);
             for o in &ops {
                 if is_local(o.value) {
                     use_list.push((o.value, at_block, pos[root]));
@@ -292,7 +292,7 @@ fn compute_live_ranges(func: &Function, info: &FuncInfo, trees: &ExprTrees) -> L
         scratch.touched.clear();
         let def_block = match func.dfg.value_def(v) {
             ValueDef::Result(d, _) => {
-                let b = func.layout.inst_block(d).unwrap();
+                let b = func.layout.inst_block(d).expect("instruction in layout");
                 scratch.add(b, cur, pos[d]);
                 b
             }
@@ -487,7 +487,7 @@ fn new_slot(slots: &mut Vec<Slot>, classes: &mut Vec<Class>, ty: ValType) -> Loc
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis::tests::arb_function;
+    use crate::analysis;
     use proptest::prelude::*;
     use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -546,7 +546,7 @@ mod tests {
                 expected[v.index()].push(item);
             }
             for (i, exp) in expected.iter().enumerate() {
-                prop_assert_eq!(buckets.get(Value::new(i)), exp.as_slice());
+                prop_assert_eq!(buckets.get(Value::new(i)), exp.as_slice(), "bucket {} must hold its entries in insertion order", i);
             }
         }
 
@@ -558,8 +558,8 @@ mod tests {
             let pts_a = point_set(&a);
             let pts_b = point_set(&b);
             let expected = !pts_a.is_disjoint(&pts_b);
-            prop_assert_eq!(overlaps(&a, &b), expected);
-            prop_assert_eq!(overlaps(&b, &a), expected);
+            prop_assert_eq!(overlaps(&a, &b), expected, "overlaps must agree with the point-set oracle");
+            prop_assert_eq!(overlaps(&b, &a), expected, "overlaps must be symmetric");
         }
 
         #[test]
@@ -576,14 +576,14 @@ mod tests {
                     b.push(seg);
                 }
             }
-            prop_assert!(!overlaps(&a, &b));
+            prop_assert!(!overlaps(&a, &b), "a partition of disjoint segments must not overlap");
             let expected_pts: BTreeSet<u32> =
                 point_set(&a).union(&point_set(&b)).copied().collect();
 
             let mut merged = a.clone();
             merge_into(&mut merged, &b);
-            prop_assert_eq!(point_set(&merged), expected_pts);
-            prop_assert_eq!(merged, combined);
+            prop_assert_eq!(point_set(&merged), expected_pts, "merge must cover exactly the union of points");
+            prop_assert_eq!(merged, combined, "merging a partition must restore the original segments");
         }
 
         #[test]
@@ -629,10 +629,10 @@ mod tests {
                             // Verify no slot in `free` or `ends` actually has `end <= lo`.
                             let class = class_of(&mut classes, ValType::I32);
                             for &l in &class.free {
-                                prop_assert!(slots[l.0 as usize].end > lo);
+                                prop_assert!(slots[l.0 as usize].end > lo, "a free slot reported unavailable must end after {:?}", lo);
                             }
                             for &Reverse((_, l)) in class.ends.iter() {
-                                prop_assert!(slots[l.0 as usize].end > lo);
+                                prop_assert!(slots[l.0 as usize].end > lo, "a pending slot reported unavailable must end after {:?}", lo);
                             }
                         }
                     }
@@ -653,7 +653,7 @@ mod tests {
 
         #[test]
         fn live_ranges_and_allocation_soundness(
-            func in arb_function(),
+            func in analysis::tests::arb_function(),
             stack_values in any::<bool>(),
         ) {
             let info = FuncInfo::compute(&func).unwrap();
@@ -663,7 +663,7 @@ mod tests {
             // 1. Every value's segment list is non-empty, sorted, and non-overlapping.
             let mut seg_map: HashMap<Value, Vec<Segment>> = HashMap::new();
             for (v, segs) in ranges.iter() {
-                prop_assert!(!segs.is_empty());
+                prop_assert!(!segs.is_empty(), "live value {} must have a live range", v);
                 for (i, &(lo, hi)) in segs.iter().enumerate() {
                     prop_assert!(lo < hi, "empty or inverted segment for {v}: ({lo:?}, {hi:?})");
                     if i > 0 {
@@ -724,7 +724,7 @@ mod tests {
                             // Collect all local operands in the tree rooted at `inst`.
                             for cand in func.layout.block_insts(b) {
                                 if trees.root(cand) == Some(inst) {
-                                    operands(&func, &info, cand, &mut ops);
+                                    expr_trees::operands(&func, &info, cand, &mut ops);
                                     for o in &ops {
                                         if is_local(o.value) {
                                             cur.insert(o.value);
@@ -748,13 +748,13 @@ mod tests {
             }
 
             // 3. Verify `allocate` with both `coalesce = false` and `coalesce = true`.
-            let alloc_no_coal = allocate(&func, &info, &trees, false).unwrap();
-            let alloc_coal = allocate(&func, &info, &trees, true).unwrap();
+            let alloc_no_coal = allocate(&func, &info, &trees, /* coalesce= */ false).unwrap();
+            let alloc_coal = allocate(&func, &info, &trees, /* coalesce= */ true).unwrap();
 
             for locals in [&alloc_no_coal, &alloc_coal] {
                 // Every entry parameter i gets Local(i).
                 for (i, &p) in func.dfg.block_params(info.rpo[0]).iter().enumerate() {
-                    prop_assert_eq!(locals.local_of[p], Local(i as u32));
+                    prop_assert_eq!(locals.local_of[p], Local(i as u32), "entry parameter {} must keep local {}", p, i);
                 }
 
                 // Every pair of distinct values assigned the same Local must have non-overlapping segments
@@ -762,10 +762,10 @@ mod tests {
                 let mut by_local: HashMap<Local, Vec<Value>> = HashMap::new();
                 for (v, _) in ranges.iter() {
                     let l = locals.local_of[v];
-                    prop_assert_ne!(l, Local::NONE);
-                    let vt = wasm_type(func.dfg.value_type(v)).unwrap();
+                    prop_assert_ne!(l, Local::NONE, "live value {} must be assigned a local", v);
+                    let vt = wasm_types::wasm_type(func.dfg.value_type(v)).unwrap();
                     if l.0 >= locals.num_params {
-                        prop_assert_eq!(locals.decls[(l.0 - locals.num_params) as usize], vt);
+                        prop_assert_eq!(locals.decls[(l.0 - locals.num_params) as usize], vt, "{} must share a local only with values of its wasm type", v);
                     }
                     for &other in by_local.get(&l).unwrap_or(&Vec::new()) {
                         prop_assert!(
@@ -809,7 +809,7 @@ mod tests {
                         }
                         for cand in func.layout.block_insts(b) {
                             if trees.root(cand) == Some(inst) {
-                                operands(&func, &info, cand, &mut ops);
+                                expr_trees::operands(&func, &info, cand, &mut ops);
                                 for o in &ops {
                                     if is_local(o.value) {
                                         cur.insert(o.value);
@@ -830,7 +830,7 @@ mod tests {
                     .filter(|&(a, p)| locals.move_needed(a, p))
                     .count()
             };
-            prop_assert!(count_moves(&alloc_coal) <= count_moves(&alloc_no_coal));
+            prop_assert!(count_moves(&alloc_coal) <= count_moves(&alloc_no_coal), "coalescing must never add moves");
         }
     }
 }

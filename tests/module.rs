@@ -7,10 +7,9 @@ mod harness;
 
 use clif_to_wasm::{
     AddressType, CompiledFunction, Config, Env, Error, FuncIndex, ModuleBuilder, Name, TableIndex,
-    TypeIndex, compile_function, wasm_signature,
+    TypeIndex,
 };
 use cranelift_codegen::ir::Function;
-use cranelift_reader::parse_functions;
 use std::collections::HashMap;
 use wasm_encoder::{ConstExpr, GlobalType, MemoryType, RefType, TableType, ValType};
 use wasmtime::{Engine, Instance, Module, Ref, Store};
@@ -107,7 +106,7 @@ fn add_functions(
 ) -> Vec<FuncIndex> {
     let mut indices = Vec::new();
     for (i, f) in funcs.iter().enumerate() {
-        let (p, r) = wasm_signature(&f.signature, &config.module).unwrap();
+        let (p, r) = clif_to_wasm::wasm_signature(&f.signature, &config.module).unwrap();
         let idx = builder.declare_function(&p, &r);
         names.insert(name(f), idx);
         slots.insert(name(f), slot(i, idx));
@@ -119,7 +118,8 @@ fn add_functions(
             slots: &slots,
             builder,
         };
-        let compiled: CompiledFunction = compile_function(f, config, &mut env).unwrap();
+        let compiled: CompiledFunction =
+            clif_to_wasm::compile_function(f, config, &mut env).unwrap();
         builder.define_function(idx, compiled);
         builder.export_function(&name(f), idx);
     }
@@ -129,7 +129,7 @@ fn add_functions(
 #[test]
 fn jit_module_links_into_host() {
     // The host: defines memory, table and stack pointer, and exports them.
-    let host_funcs = parse_functions(HOST).unwrap();
+    let host_funcs = cranelift_reader::parse_functions(HOST).unwrap();
     let mut host = ModuleBuilder::new();
     let mem = host.define_memory(1, AddressType::I32);
     let table = host.function_table();
@@ -163,7 +163,7 @@ fn jit_module_links_into_host() {
     let double = host_inst.get_func(&mut store, "double").unwrap();
 
     // Later, the JIT grows the table to make room for the new functions.
-    let jit_funcs = parse_functions(JIT).unwrap();
+    let jit_funcs = cranelift_reader::parse_functions(JIT).unwrap();
     let base = table
         .grow(&mut store, jit_funcs.len() as u64, Ref::Func(None))
         .unwrap();
@@ -262,7 +262,7 @@ impl Env for SlotsOnly {
 
 #[test]
 fn call_indirect_needs_a_table() {
-    let funcs = parse_functions(
+    let funcs = cranelift_reader::parse_functions(
         "
 function %call_ptr(i32, i32) -> i32 {
     sig0 = (i32) -> i32
@@ -292,24 +292,24 @@ block0:
     // Calling through a pointer needs to know which table to use.
     for f in &funcs[..2] {
         assert_eq!(
-            compile_function(f, &config, &mut SlotsOnly).unwrap_err(),
+            clif_to_wasm::compile_function(f, &config, &mut SlotsOnly).unwrap_err(),
             Error::Unsupported("call_indirect without ModuleLayout::table_index".into()),
             "{}",
             f.name
         );
     }
     // Taking an address only needs the slot, which the Env provides.
-    compile_function(&funcs[2], &config, &mut SlotsOnly).unwrap();
+    clif_to_wasm::compile_function(&funcs[2], &config, &mut SlotsOnly).unwrap();
 
     config.module.table_index = Some(TableIndex(0));
     for f in &funcs {
-        compile_function(f, &config, &mut SlotsOnly).unwrap();
+        clif_to_wasm::compile_function(f, &config, &mut SlotsOnly).unwrap();
     }
 }
 
 #[test]
 fn i128_atomic_needs_lock_table() {
-    let f = &parse_functions(
+    let f = &cranelift_reader::parse_functions(
         "
 function %load128(i32) -> i128 {
 block0(v0: i32):
@@ -322,14 +322,14 @@ block0(v0: i32):
     let mut config = Config::default();
     assert_eq!(config.module.atomic_lock_table_addr, None);
     assert_eq!(
-        compile_function(f, &config, &mut SlotsOnly).unwrap_err(),
+        clif_to_wasm::compile_function(f, &config, &mut SlotsOnly).unwrap_err(),
         Error::Unsupported("i128 atomic without ModuleLayout::atomic_lock_table_addr".into()),
     );
     config.module.atomic_lock_table_addr = Some(2);
     assert_eq!(
-        compile_function(f, &config, &mut SlotsOnly).unwrap_err(),
+        clif_to_wasm::compile_function(f, &config, &mut SlotsOnly).unwrap_err(),
         Error::Unsupported("unaligned ModuleLayout::atomic_lock_table_addr".into()),
     );
     config.module.atomic_lock_table_addr = Some(4096);
-    compile_function(f, &config, &mut SlotsOnly).unwrap();
+    clif_to_wasm::compile_function(f, &config, &mut SlotsOnly).unwrap();
 }

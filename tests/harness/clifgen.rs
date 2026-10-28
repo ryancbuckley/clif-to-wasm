@@ -19,7 +19,7 @@ impl Rng {
         self.0 ^= self.0 >> 12;
         self.0 ^= self.0 << 25;
         self.0 ^= self.0 >> 27;
-        self.0.wrapping_mul(0x2545F4914F6CDD1D)
+        self.0.wrapping_mul(0x2545f4914f6cdd1d)
     }
     pub fn below(&mut self, n: u64) -> u64 {
         self.next() % n
@@ -980,7 +980,7 @@ pub fn generate_i128(seed: u64) -> (Function, Vec<Type>) {
 
 fn generate_with(seed: u64, features: Features) -> (Function, Vec<Type>) {
     let simd = features.simd;
-    let mut rng = Rng(seed.wrapping_mul(0x9E3779B97F4A7C15) | 1);
+    let mut rng = Rng(seed.wrapping_mul(0x9e3779b97f4a7c15) | 1);
     let mut all: Vec<Type> = TYPES.to_vec();
     if simd {
         all.extend(VTYPES);

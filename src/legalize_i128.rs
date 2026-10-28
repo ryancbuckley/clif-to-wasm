@@ -27,16 +27,17 @@
 //!   table at [`crate::ModuleLayout::atomic_lock_table_addr`] guarding the two
 //!   `i64` atomic accesses.
 
-use crate::{Result, unsupported};
+use crate::{Result, error};
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::{Ieee64, Offset32};
+use cranelift_codegen::ir::types::{F32, F64, F128, I32, I64, I64X2, I128, INVALID};
 use cranelift_codegen::ir::{
     AbiParam, AtomicRmwOp, Block, BlockArg, BlockCall, Endianness, Function, Inst, InstBuilder,
-    InstructionData as D, MemFlagsData, Opcode, Signature, TrapCode, Type, Value, types::*,
+    InstructionData as D, MemFlagsData, Opcode, Signature, TrapCode, Type, Value,
 };
 use std::borrow::Cow;
 
@@ -157,8 +158,8 @@ fn legalize(func: &mut Function, lock_table_addr: Option<u64>) -> Result<()> {
     Ok(())
 }
 
-struct Legalizer<'f> {
-    func: &'f mut Function,
+struct Legalizer<'func> {
+    func: &'func mut Function,
     pairs: SecondaryMap<Value, Option<Pair>>,
     lock_table_addr: Option<u64>,
 }
@@ -171,7 +172,7 @@ impl Legalizer<'_> {
     fn pair(&self, v: Value) -> Result<Pair> {
         match self.pairs[v] {
             Some(p) => Ok(p),
-            None => unsupported(format!(
+            None => error::unsupported(format!(
                 "{} value {v} used before its definition",
                 self.ty(v)
             )),
@@ -217,7 +218,11 @@ impl Legalizer<'_> {
     /// Replace the results of `old` and remove it.
     fn finish(&mut self, old: Inst, outs: &[Out]) {
         let results = self.func.dfg.inst_results(old).to_vec();
-        debug_assert_eq!(results.len(), outs.len());
+        debug_assert_eq!(
+            results.len(),
+            outs.len(),
+            "{old}: each result needs exactly one replacement"
+        );
         self.func.dfg.detach_inst_results(old);
         for (&r, &out) in results.iter().zip(outs) {
             match out {
@@ -272,7 +277,7 @@ impl Legalizer<'_> {
                 .chain(&sig.returns)
                 .any(|p| is_pair(p.value_type));
             if wide_sig || wide_arg || wide_branch_arg {
-                return unsupported("128-bit scalar in try_call");
+                return error::unsupported("128-bit scalar in try_call");
             }
         }
         if !wide_arg && !wide_res && !wide_branch_arg {
@@ -314,7 +319,7 @@ impl Legalizer<'_> {
         let p = |i: usize| -> Result<Pair> {
             match arg_pairs[i] {
                 Some(pair) => Ok(pair),
-                None => unsupported(format!(
+                None => error::unsupported(format!(
                     "{} value {} used before its definition",
                     arg_tys[i], args[i]
                 )),
@@ -682,7 +687,7 @@ impl Legalizer<'_> {
                 if flags.endianness(Endianness::Little) == Endianness::Big
                     && aty.lane_bits() != ty.lane_bits()
                 {
-                    return unsupported(format!("big-endian bitcast {aty} -> {ty}"));
+                    return error::unsupported(format!("big-endian bitcast {aty} -> {ty}"));
                 }
                 if is_pair(aty) && is_pair(ty) {
                     let (lo, hi) = p(0)?;
@@ -707,7 +712,7 @@ impl Legalizer<'_> {
                     };
                     vec![Out::Value(v)]
                 } else {
-                    return unsupported(format!("bitcast {aty} -> {ty}"));
+                    return error::unsupported(format!("bitcast {aty} -> {ty}"));
                 }
             }
 
@@ -740,7 +745,7 @@ impl Legalizer<'_> {
             }
 
             _ => {
-                return unsupported(format!(
+                return error::unsupported(format!(
                     "128-bit scalar in `{}`",
                     pos.func.dfg.display_inst(inst)
                 ));
@@ -793,7 +798,11 @@ impl Legalizer<'_> {
     ///         <sign fix-ups>; the rest of the original block
     /// ```
     fn divmod(&mut self, inst: Inst, signed: bool, rem: bool, x: Pair, d: Pair) -> Pair {
-        let orig = self.func.layout.inst_block(inst).unwrap();
+        let orig = self
+            .func
+            .layout
+            .inst_block(inst)
+            .expect("instruction in layout");
         let mut pos = FuncCursor::new(self.func).at_inst(inst);
 
         let nonzero = pos.ins().bor(d.0, d.1);
@@ -893,10 +902,10 @@ impl Legalizer<'_> {
         p: impl Fn(usize) -> Result<Pair>,
     ) -> Result<()> {
         let Some(table_base) = self.lock_table_addr else {
-            return unsupported("i128 atomic without ModuleLayout::atomic_lock_table_addr");
+            return error::unsupported("i128 atomic without ModuleLayout::atomic_lock_table_addr");
         };
         if table_base & 3 != 0 {
-            return unsupported("unaligned ModuleLayout::atomic_lock_table_addr");
+            return error::unsupported("unaligned ModuleLayout::atomic_lock_table_addr");
         }
         let (flags, addr) = match data {
             D::LoadNoOffset { flags, .. }
@@ -916,9 +925,9 @@ impl Legalizer<'_> {
         let func = &mut *self.func;
         let addr_ty = func.dfg.value_type(addr);
         if addr_ty == I32 && table_base > u32::MAX as u64 {
-            return unsupported("ModuleLayout::atomic_lock_table_addr out of 32-bit range");
+            return error::unsupported("ModuleLayout::atomic_lock_table_addr out of 32-bit range");
         }
-        let orig = func.layout.inst_block(inst).unwrap();
+        let orig = func.layout.inst_block(inst).expect("instruction in layout");
         let cont = func.dfg.make_block();
         func.layout.split_block(cont, inst);
         let spin = func.dfg.make_block();
@@ -962,14 +971,14 @@ impl Legalizer<'_> {
                 opcode: Opcode::AtomicStore,
                 ..
             } => {
-                let (lo, hi) = operand_pairs.0.unwrap();
+                let (lo, hi) = operand_pairs.0.expect("stored pair");
                 pos.ins().atomic_store(flags, lo, lo_addr);
                 pos.ins().atomic_store(flags, hi, hi_addr);
                 None
             }
             D::AtomicCas { .. } => {
-                let exp = operand_pairs.0.unwrap();
-                let new = operand_pairs.1.unwrap();
+                let exp = operand_pairs.0.expect("expected pair");
+                let new = operand_pairs.1.expect("replacement pair");
                 let old_lo = pos.ins().atomic_load(I64, flags, lo_addr);
                 let old_hi = pos.ins().atomic_load(I64, flags, hi_addr);
                 let old = (old_lo, old_hi);
@@ -980,7 +989,7 @@ impl Legalizer<'_> {
                 Some(old)
             }
             D::AtomicRmw { op, .. } => {
-                let x = operand_pairs.0.unwrap();
+                let x = operand_pairs.0.expect("operand pair");
                 let old_lo = pos.ins().atomic_load(I64, flags, lo_addr);
                 let old_hi = pos.ins().atomic_load(I64, flags, hi_addr);
                 let old = (old_lo, old_hi);
@@ -1032,7 +1041,7 @@ impl Legalizer<'_> {
 fn half_offsets(endianness: Endianness, offset: Offset32) -> Result<(i32, i32)> {
     let off = i32::from(offset);
     let Some(next) = off.checked_add(8) else {
-        return unsupported("i128 memory offset overflow");
+        return error::unsupported("i128 memory offset overflow");
     };
     Ok(match endianness {
         Endianness::Little => (off, next),
@@ -1184,14 +1193,12 @@ fn u128_to_float(pos: &mut FuncCursor, ty: Type, (lo, hi): Pair) -> Value {
     let scale = if ty == F64 {
         let e = pos.ins().iadd_imm_s(k, 1023);
         let bits = pos.ins().ishl_imm_u(e, 52);
-        pos.ins()
-            .bitcast(F64, cranelift_codegen::ir::MemFlagsData::new(), bits)
+        pos.ins().bitcast(F64, MemFlagsData::new(), bits)
     } else {
         let k = pos.ins().ireduce(I32, k);
         let e = pos.ins().iadd_imm_s(k, 127);
         let bits = pos.ins().ishl_imm_u(e, 23);
-        pos.ins()
-            .bitcast(F32, cranelift_codegen::ir::MemFlagsData::new(), bits)
+        pos.ins().bitcast(F32, MemFlagsData::new(), bits)
     };
     let big = pos.ins().fmul(f, scale);
     pos.ins().select(hz, small, big)

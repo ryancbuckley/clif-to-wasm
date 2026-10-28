@@ -19,7 +19,7 @@ use crate::object::{
 };
 use crate::{
     AddressType, CompiledFunction, Config, Env, Error, FuncIndex, Name, Result, SymbolValue,
-    TypeIndex, compile_function, wasm_signature,
+    TypeIndex, compile, wasm_types,
 };
 use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::entity::SecondaryMap;
@@ -87,6 +87,21 @@ pub struct ObjectOptions {
     /// field to import it as, if not `env` and the symbol name (Rust's
     /// `#[link(wasm_import_module = "...")]`).
     pub import_names: Box<dyn Fn(&str) -> Option<(String, String)> + Send + Sync>,
+}
+
+impl Default for ObjectOptions {
+    /// Single-threaded, no declared features, unsupported functions fail,
+    /// Cranelift's default libcall names, and every import from `env`.
+    fn default() -> Self {
+        ObjectOptions {
+            config: Config::default(),
+            threads: false,
+            features: Vec::new(),
+            stub_unsupported: false,
+            libcall_names: cranelift_module::default_libcall_names(),
+            import_names: Box::new(|_| None),
+        }
+    }
 }
 
 impl std::fmt::Debug for ObjectOptions {
@@ -202,7 +217,8 @@ impl WasmObjectModule {
     }
 
     fn wasm_sig(&self, sig: &ir::Signature) -> ModuleResult<(Vec<ValType>, Vec<ValType>)> {
-        wasm_signature(sig, &self.config.module).map_err(|e| unsupported_err(e.to_string()))
+        wasm_types::wasm_signature(sig, &self.config.module)
+            .map_err(|e| unsupported_err(e.to_string()))
     }
 
     fn func_symbol(&mut self, id: FuncId) -> ModuleResult<SymbolId> {
@@ -273,6 +289,7 @@ impl WasmObjectModule {
     }
 
     /// Write the object file.
+    #[must_use]
     pub fn finish(mut self) -> Vec<u8> {
         // Linkage may have changed since a symbol was declared.
         let funcs: Vec<(FuncId, Linkage)> = self
@@ -302,8 +319,8 @@ impl WasmObjectModule {
 }
 
 /// Resolves names during compilation to the module's symbols.
-struct ObjEnv<'a> {
-    m: &'a mut WasmObjectModule,
+struct ObjEnv<'module> {
+    m: &'module mut WasmObjectModule,
 }
 
 impl ObjEnv<'_> {
@@ -444,7 +461,7 @@ impl Module for WasmObjectModule {
         }
 
         let config = self.config.clone();
-        let compiled = compile_function(func, &config, &mut ObjEnv { m: self });
+        let compiled = compile::compile_function(func, &config, &mut ObjEnv { m: self });
         let compiled = match compiled {
             Ok(c) => c,
             Err(e) if self.stub_unsupported => {

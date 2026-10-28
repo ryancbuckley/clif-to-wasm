@@ -16,9 +16,9 @@
 //! Big-endian atomic loads, stores, and CAS byte-swap values around the native
 //! little-endian wasm atomic instructions.
 
-use crate::emit::{Emitter, is64, w};
+use crate::emit::{self, Emitter, w};
 use crate::locals::Local;
-use crate::{Result, unsupported};
+use crate::{Result, error};
 use cranelift_codegen::ir::{
     AtomicRmwOp, Inst, InstructionData as D, MemFlags, Opcode, Type, types,
 };
@@ -44,7 +44,7 @@ impl Emitter<'_> {
                 return Ok(());
             }
             _ if !matches!(ty, types::I8 | types::I16 | types::I32 | types::I64) => {
-                return unsupported(format!(
+                return error::unsupported(format!(
                     "atomic access of type {ty} in `{}`",
                     dfg.display_inst(inst)
                 ));
@@ -96,7 +96,7 @@ impl Emitter<'_> {
             }
             D::AtomicRmw { op, flags, .. } => self.atomic_rmw(op, flags, ty)?,
             _ => {
-                return unsupported(format!("instruction `{}`", dfg.display_inst(inst)));
+                return error::unsupported(format!("instruction `{}`", dfg.display_inst(inst)));
             }
         }
         Ok(())
@@ -120,7 +120,11 @@ impl Emitter<'_> {
             return Ok(());
         }
 
-        let vt = if is64(ty) { ValType::I64 } else { ValType::I32 };
+        let vt = if emit::is64(ty) {
+            ValType::I64
+        } else {
+            ValType::I32
+        };
         let ptr = self.config.module.ptr_ty();
         let p = self.scratch(ptr);
         let [x, old] = self.scratches(vt);

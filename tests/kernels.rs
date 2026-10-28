@@ -6,11 +6,11 @@ mod harness;
 use clif_to_wasm::Config;
 use cranelift_codegen::data_value::DataValue;
 use cranelift_codegen::ir::types;
-use harness::kernels::{KERNELS, functions};
+use harness::kernels::{self, KERNELS};
 
 #[test]
 fn kernels_match_interpreter() {
-    let funcs = functions();
+    let funcs = kernels::functions();
     for f in &funcs {
         cranelift_codegen::verify_function(
             f,

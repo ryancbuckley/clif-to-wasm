@@ -21,7 +21,7 @@ mod harness;
 use clif_to_wasm::Config;
 use cranelift_codegen::data_value::DataValue;
 use cranelift_codegen::ir::{Function, types};
-use harness::kernels::{KERNELS, functions};
+use harness::kernels::{self, KERNELS};
 use std::time::Instant;
 
 fn variants() -> Vec<(&'static str, Config)> {
@@ -129,7 +129,7 @@ fn main() {
     let reps = if quick { 3 } else { 7 };
     let fuzz_n = if quick { 200 } else { 1000 };
 
-    let kernel_funcs = functions();
+    let kernel_funcs = kernels::functions();
     let fuzz_funcs: Vec<Function> = (1..=fuzz_n)
         .map(|s| harness::clifgen::generate(s).0)
         .collect();

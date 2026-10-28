@@ -6,8 +6,9 @@
 //! C-struct-aligned offsets there, and return nothing. This pass rewrites both
 //! function definitions and call sites before `i128` legalization.
 
-use crate::{Result, unsupported};
+use crate::{Result, error};
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
+use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::{
     AbiParam, ArgumentPurpose, Function, Inst, InstBuilder, InstructionData, MemFlagsData, Opcode,
     Signature, StackSlotData, StackSlotKind, Type, Value, types,
@@ -76,7 +77,7 @@ pub(crate) fn demote(func: &mut Function, ptr: Type) -> Result<()> {
     }
     let (own_offsets, _) = layout(own.iter().map(|p| p.value_type));
 
-    let mut demoted_sigs = cranelift_codegen::entity::SecondaryMap::new();
+    let mut demoted_sigs = SecondaryMap::new();
     for (sig_ref, sig) in func.dfg.signatures.iter_mut() {
         if needs_demotion(sig) {
             *sig = demoted(sig, ptr);
@@ -130,7 +131,11 @@ pub(crate) fn demote(func: &mut Function, ptr: Type) -> Result<()> {
                 Opcode::Call | Opcode::CallIndirect => {
                     let results = pos.func.dfg.inst_results(inst).to_vec();
                     let (offsets, _) = layout(results.iter().map(|&r| pos.func.dfg.value_type(r)));
-                    let addr = pos.ins().stack_addr(ptr, area.unwrap(), 0);
+                    let addr = pos.ins().stack_addr(
+                        ptr,
+                        area.expect("return area for multi-result calls"),
+                        0,
+                    );
                     insert_first_arg(pos.func, inst, addr);
                     pos.func.dfg.detach_inst_results(inst);
                     pos.next_inst();
@@ -143,11 +148,13 @@ pub(crate) fn demote(func: &mut Function, ptr: Type) -> Result<()> {
                 }
                 Opcode::ReturnCall | Opcode::ReturnCallIndirect => {
                     let Some(p) = ret_ptr else {
-                        return unsupported("tail call returning more values than the caller");
+                        return error::unsupported(
+                            "tail call returning more values than the caller",
+                        );
                     };
                     insert_first_arg(pos.func, inst, p);
                 }
-                _ => return unsupported(format!("{op} returning more than one value")),
+                _ => return error::unsupported(format!("{op} returning more than one value")),
             }
         }
     }

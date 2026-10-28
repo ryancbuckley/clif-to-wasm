@@ -77,6 +77,7 @@ define_index!(
 /// Any WebAssembly module entity that can be exported (`FuncIndex`,
 /// `TableIndex`, `MemoryIndex`, `GlobalIndex`, or `TagIndex`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[non_exhaustive]
 pub struct Export {
     /// The kind of entity.
     pub kind: ExportKind,
@@ -338,7 +339,8 @@ impl ModuleBuilder {
         let (ty, body) = self.funcs.defined_mut(index);
         assert_eq!(
             self.types[ty.0 as usize],
-            (func.params.clone(), func.results.clone())
+            (func.params.clone(), func.results.clone()),
+            "define_function: {index:?} defined with a signature other than its declared one"
         );
         *body = Some(func);
     }
@@ -427,6 +429,7 @@ impl ModuleBuilder {
     ///
     /// Panics if a declared function was never defined, or if a slot given
     /// to [`Self::place_in_table`] does not fit in a 32-bit table.
+    #[must_use]
     pub fn finish(mut self) -> Vec<u8> {
         let total = self.funcs.total();
         if let Some(t) = self.function_table {
@@ -503,7 +506,12 @@ impl ModuleBuilder {
         if !self.elements.is_empty() {
             let mut elems = ElementSection::new();
             for (table, first, funcs) in &self.elements {
-                let offset = if self.tables.get(*table).unwrap().table64 {
+                let offset = if self
+                    .tables
+                    .get(*table)
+                    .expect("table checked by place_in_table")
+                    .table64
+                {
                     ConstExpr::i64_const(*first as i64)
                 } else {
                     let first = u32::try_from(*first).expect("slot out of range for table32");
@@ -599,8 +607,8 @@ mod tests {
                 let t1 = b.type_index(params, results);
                 let idx = b.import_function("env", &format!("ifunc_{i}"), params, results);
                 let t2 = b.type_index(params, results);
-                prop_assert_eq!(t1, t2);
-                prop_assert_eq!(idx, FuncIndex(i as u32));
+                prop_assert_eq!(t1, t2, "identical signatures must share a type index");
+                prop_assert_eq!(idx, FuncIndex(i as u32), "imported functions are numbered in import order");
                 all_funcs.push(idx);
             }
 
@@ -616,11 +624,11 @@ mod tests {
                         page_size_log2: None,
                     },
                 );
-                prop_assert_eq!(m, MemoryIndex(0));
+                prop_assert_eq!(m, MemoryIndex(0), "an imported memory comes first");
             }
             if def_mem {
                 let m = b.define_memory(1, if mem64 { AddressType::I64 } else { AddressType::I32 });
-                prop_assert_eq!(m, MemoryIndex(import_mem as u32));
+                prop_assert_eq!(m, MemoryIndex(import_mem as u32), "a defined memory follows any imported one");
                 b.export("mem_export", m);
             }
 
@@ -634,7 +642,7 @@ mod tests {
                         shared: false,
                     },
                 );
-                prop_assert_eq!(g, GlobalIndex(i as u32));
+                prop_assert_eq!(g, GlobalIndex(i as u32), "imported globals are numbered in import order");
             }
             for (i, &vt) in defined_globals.iter().enumerate() {
                 let init = match vt {
@@ -646,17 +654,17 @@ mod tests {
                     _ => unreachable!(),
                 };
                 let g = b.define_global(vt, init);
-                prop_assert_eq!(g, GlobalIndex((imported_globals.len() + i) as u32));
+                prop_assert_eq!(g, GlobalIndex((imported_globals.len() + i) as u32), "defined globals follow the imported ones");
                 b.export(&format!("eglob_{i}"), g);
             }
 
             for (i, params) in imported_tags.iter().enumerate() {
                 let t = b.import_tag("env", &format!("itag_{i}"), params);
-                prop_assert_eq!(t, TagIndex(i as u32));
+                prop_assert_eq!(t, TagIndex(i as u32), "imported tags are numbered in import order");
             }
             for (i, params) in defined_tags.iter().enumerate() {
                 let t = b.define_tag(params);
-                prop_assert_eq!(t, TagIndex((imported_tags.len() + i) as u32));
+                prop_assert_eq!(t, TagIndex((imported_tags.len() + i) as u32), "defined tags follow the imported ones");
                 b.export(&format!("etag_{i}"), t);
             }
 
@@ -672,7 +680,7 @@ mod tests {
                         shared: false,
                     },
                 );
-                prop_assert_eq!(t, TableIndex(0));
+                prop_assert_eq!(t, TableIndex(0), "an imported table comes first");
                 Some(t)
             } else {
                 None
@@ -681,7 +689,7 @@ mod tests {
             let mut decls = Vec::new();
             for (i, (params, results)) in defined_funcs.iter().enumerate() {
                 let idx = b.declare_function(params, results);
-                prop_assert_eq!(idx, FuncIndex((imported_funcs.len() + i) as u32));
+                prop_assert_eq!(idx, FuncIndex((imported_funcs.len() + i) as u32), "declared functions follow the imported ones");
                 decls.push((idx, params.clone(), results.clone()));
                 all_funcs.push(idx);
             }
@@ -696,7 +704,7 @@ mod tests {
 
             if use_func_table {
                 let ft = b.function_table();
-                prop_assert_eq!(ft, TableIndex(import_tbl as u32));
+                prop_assert_eq!(ft, TableIndex(import_tbl as u32), "the function table follows any imported table");
                 b.export("ftbl", ft);
             } else if let Some(t) = imported_tbl {
                 b.place_in_table(t, 2, &all_funcs);

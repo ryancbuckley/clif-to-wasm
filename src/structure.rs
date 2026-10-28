@@ -13,17 +13,18 @@
 //! and `if` has type `[] -> []`. Irreducible CFGs fall back to a single
 //! `loop` + `br_table` dispatcher on a label local.
 
-use crate::analysis::{FuncInfo, same_call};
-use crate::emit::Emitter;
+use crate::analysis::{self, FuncInfo};
+use crate::emit::{CallKind, Emitter};
 use crate::expr_trees::ExprTrees;
 use crate::locals::{Local, Locals};
-use crate::{CompiledFunction, Config, Env, Result, unsupported, wasm_signature, wasm_type};
+use crate::{CompiledFunction, Config, Env, Result, error, wasm_types};
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::{
     ArgumentPurpose, Block, BlockArg, BlockCall, ExceptionTableItem, ExceptionTag, Function, Inst,
     InstructionData, Opcode, types,
 };
 use std::borrow::Cow;
+use std::cmp::Reverse;
 use wasm_encoder::{BlockType, Catch, Instruction as I, ValType};
 
 /// An entry on the wasm label stack, used to compute branch depths.
@@ -58,8 +59,8 @@ enum Task {
     },
 }
 
-struct Structurer<'a> {
-    e: Emitter<'a>,
+struct Structurer<'ctx> {
+    e: Emitter<'ctx>,
     labels: Vec<Label>,
     tasks: Vec<Task>,
     /// The label local, when emitting a dispatch loop for an irreducible CFG.
@@ -159,7 +160,7 @@ impl Structurer<'_> {
             .children(x)
             .filter(|&c| info.is_merge(c))
             .collect();
-        merges.sort_unstable_by_key(|&b| std::cmp::Reverse(info.rpo_num[b]));
+        merges.sort_unstable_by_key(|&b| Reverse(info.rpo_num[b]));
         for &y in &merges {
             self.e.ins(I::Block(BlockType::Empty));
             self.labels.push(Label::BlockFollowedBy(y));
@@ -198,7 +199,7 @@ impl Structurer<'_> {
 
     fn block_body(&mut self, b: Block) -> Result<()> {
         let func = self.e.func;
-        let term = func.layout.last_inst(b).unwrap();
+        let term = func.layout.last_inst(b).expect("block has a terminator");
         for inst in func.layout.block_insts(b) {
             if inst != term && self.e.trees.is_root(inst) {
                 self.e.root(inst)?;
@@ -214,7 +215,7 @@ impl Structurer<'_> {
     fn terminator(&mut self, b: Block) -> Result<()> {
         let func = self.e.func;
         let info = self.e.info;
-        let term = func.layout.last_inst(b).unwrap();
+        let term = func.layout.last_inst(b).expect("block has a terminator");
         let dests = &info.dests[b];
         match func.dfg.insts[term].opcode() {
             Opcode::Jump => self.tasks.push(Task::Branch {
@@ -270,8 +271,12 @@ impl Structurer<'_> {
             unreachable!()
         };
         let jt = &dfg.jump_tables[table];
-        let pos =
-            |call: &BlockCall| dests.iter().position(|d| same_call(func, d, call)).unwrap() as u32;
+        let pos = |call: &BlockCall| {
+            dests
+                .iter()
+                .position(|d| analysis::same_call(func, d, call))
+                .expect("edge is one of the block's destinations") as u32
+        };
         let targets: Vec<u32> = jt.as_slice().iter().map(pos).collect();
         let default = pos(&jt.default_block());
 
@@ -347,7 +352,7 @@ impl Structurer<'_> {
         let table = &dfg.exception_tables[et];
         let sig_ref = table.signature();
         let sig = &dfg.signatures[sig_ref];
-        let (_, results) = wasm_signature(sig, &self.e.config.module)?;
+        let (_, results) = wasm_types::wasm_signature(sig, &self.e.config.module)?;
         let normal = *table.normal_return();
         let entries: Vec<(Option<ExceptionTag>, BlockCall)> = table
             .items()
@@ -372,19 +377,19 @@ impl Structurer<'_> {
             .unwrap_or(types::I64);
         let payload_ir = sig.call_conv.exception_payload_types(ptr).to_vec();
         if !entries.is_empty() && payload_ir.is_empty() {
-            return unsupported(format!(
+            return error::unsupported(format!(
                 "exceptions with calling convention {}",
                 sig.call_conv
             ));
         }
         for (tag, call) in &entries {
             if tag.is_none() && exn_ty(call).is_some() {
-                return unsupported("catch-all handler using the exception payload");
+                return error::unsupported("catch-all handler using the exception payload");
             }
         }
         let payload: Vec<ValType> = payload_ir
             .iter()
-            .map(|&t| wasm_type(t))
+            .map(|&t| wasm_types::wasm_type(t))
             .collect::<Result<_>>()?;
         let payload_block = match payload[..] {
             [] => BlockType::Empty,
@@ -420,14 +425,14 @@ impl Structurer<'_> {
         self.labels.push(Label::Other);
         let args = dfg.inst_args(term);
         if self.e.config.module.relocatable {
-            return unsupported("try_call in a relocatable object");
+            return error::unsupported("try_call in a relocatable object");
         }
         if sig
             .params
             .iter()
             .any(|p| matches!(p.purpose, ArgumentPurpose::StructArgument(_)))
         {
-            return unsupported("try_call with a by-value struct argument");
+            return error::unsupported("try_call with a by-value struct argument");
         }
         let direct_args = if func_ref.is_some() { args } else { &args[1..] };
         for (i, &a) in direct_args.iter().enumerate() {
@@ -437,7 +442,7 @@ impl Structurer<'_> {
         match func_ref {
             Some(func_ref) => {
                 let idx = self.e.callee_index(func_ref)?;
-                self.e.call(idx, false);
+                self.e.call(idx, CallKind::Normal);
             }
             None => {
                 self.e.value(args[0])?;
@@ -445,10 +450,13 @@ impl Structurer<'_> {
                     self.e.ins(I::I32WrapI64);
                 }
                 let (type_index, table_index) = self.e.indirect_call(sig_ref)?;
-                self.e.call_indirect(type_index, table_index, false);
+                self.e
+                    .call_indirect(type_index, table_index, CallKind::Normal);
             }
         }
-        for (&l, p) in result_locals.iter().zip(&sig.returns).rev() {
+        // The last result is on top of the stack.
+        let last_first = result_locals.iter().zip(&sig.returns).rev();
+        for (&l, p) in last_first {
             self.e.mask(p.value_type);
             self.e.local_set(l);
         }

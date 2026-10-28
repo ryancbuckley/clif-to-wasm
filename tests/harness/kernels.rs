@@ -5,9 +5,10 @@
 //! data and returns a checksum. Addresses are `i32`, as for a wasm32 host.
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+use cranelift_codegen::ir::types::{F64, I8, I32, I64};
 use cranelift_codegen::ir::{
     AbiParam, BlockCall, Function, InstBuilder, JumpTableData, MemFlagsData, Signature, StackSlot,
-    StackSlotData, StackSlotKind, Type, UserFuncName, Value, types::*,
+    StackSlotData, StackSlotKind, Type, UserFuncName, Value,
 };
 use cranelift_codegen::isa::{CallConv, TargetFrontendConfig};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -360,7 +361,7 @@ fn crc32() -> Function {
                 let c = b.use_var(crc);
                 let low = b.ins().band_imm_u(c, 1);
                 let mask = b.ins().ineg(low);
-                let poly = b.ins().band_imm_u(mask, 0xEDB8_8320);
+                let poly = b.ins().band_imm_u(mask, 0xedb8_8320);
                 let sh = b.ins().ushr_imm_u(c, 1);
                 let c = b.ins().bxor(sh, poly);
                 b.def_var(crc, c);

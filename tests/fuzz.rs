@@ -13,7 +13,7 @@ mod harness;
 use clif_to_wasm::{Config, Optimizations};
 use cranelift_codegen::data_value::DataValue;
 use cranelift_codegen::ir::Type;
-use harness::clifgen::{Rng, arg, generate, generate_i128, generate_simd};
+use harness::clifgen::{self, Rng};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -47,9 +47,9 @@ fn differential() {
         .filter(|&(_, kind)| only.is_none_or(|o| o == kind));
     for (seed, kind) in runs {
         let (func, params) = match kind {
-            Kind::Scalar => generate(seed),
-            Kind::Simd => generate_simd(seed),
-            Kind::I128 => generate_i128(seed),
+            Kind::Scalar => clifgen::generate(seed),
+            Kind::Simd => clifgen::generate_simd(seed),
+            Kind::I128 => clifgen::generate_i128(seed),
         };
         cranelift_codegen::verify_function(
             &func,
@@ -81,7 +81,8 @@ fn differential() {
                 .collect();
             let mut rng = Rng(seed ^ 0xdead_beef);
             for _ in 0..4 {
-                let args: Vec<DataValue> = params.iter().map(|&t| arg(&mut rng, t)).collect();
+                let args: Vec<DataValue> =
+                    params.iter().map(|&t| clifgen::arg(&mut rng, t)).collect();
                 let expected = match harness::interpret(std::slice::from_ref(&func), "f", &args) {
                     Some(Ok(e)) => e,
                     Some(Err(e)) => panic!("seed {seed} {kind:?}: interpreter error: {e}\n{func}"),

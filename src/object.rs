@@ -43,6 +43,7 @@ impl From<SymbolId> for crate::TableIndex {
 
 /// How a symbol binds across objects.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+#[non_exhaustive]
 pub enum Binding {
     /// Visible to other objects; one definition wins.
     #[default]
@@ -95,6 +96,7 @@ const SEG_FLAG_RETAIN: u32 = 0x4;
 
 /// Where a data symbol lives.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+#[non_exhaustive]
 pub enum DataStorage {
     /// Once in the program, at a fixed address.
     #[default]
@@ -114,6 +116,7 @@ pub enum Mutability {
 
 /// A relocated field in a data object: a pointer-sized address.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[non_exhaustive]
 pub struct DataReloc {
     /// Byte offset of the field in the object.
     pub offset: u32,
@@ -124,8 +127,21 @@ pub struct DataReloc {
     pub addend: i64,
 }
 
+impl DataReloc {
+    /// A reference to `symbol` (plus `addend` for a data symbol) in the field
+    /// at `offset`.
+    pub fn new(offset: u32, symbol: SymbolId, addend: i64) -> Self {
+        DataReloc {
+            offset,
+            symbol,
+            addend,
+        }
+    }
+}
+
 /// The contents of a data object.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[non_exhaustive]
 pub struct DataDef {
     /// The initial bytes; for zero-initialized data, all zeros.
     pub bytes: Vec<u8>,
@@ -136,6 +152,19 @@ pub struct DataDef {
     pub mutability: Mutability,
     /// The fields of `bytes` that hold addresses.
     pub relocs: Vec<DataReloc>,
+}
+
+impl DataDef {
+    /// A data object holding `bytes`, aligned to `align` bytes (a power of
+    /// two), with no relocated fields. Add any to [`DataDef::relocs`].
+    pub fn new(bytes: Vec<u8>, align: u32, mutability: Mutability) -> Self {
+        DataDef {
+            bytes,
+            align,
+            mutability,
+            relocs: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -187,12 +216,7 @@ struct Segment {
 /// let greeting = obj.declare_data("greeting", SymbolFlags::default(), DataStorage::Static);
 /// obj.define_data(
 ///     greeting,
-///     DataDef {
-///         bytes: b"hello\0".to_vec(),
-///         align: 1,
-///         mutability: Mutability::Immutable,
-///         relocs: Vec::new(),
-///     },
+///     DataDef::new(b"hello\0".to_vec(), 1, Mutability::Immutable),
 /// );
 /// let object_file = obj.finish();
 /// # wasmparser::validate(&object_file).unwrap();
@@ -334,7 +358,11 @@ impl ObjectBuilder {
     /// Panics if `data.align` is not a power of two, or if `sym` is not a data
     /// symbol of this object or is already defined.
     pub fn define_data(&mut self, sym: SymbolId, data: DataDef) {
-        assert!(data.align.is_power_of_two());
+        assert!(
+            data.align.is_power_of_two(),
+            "define_data: alignment {} is not a power of two",
+            data.align
+        );
         let n = self.segments.len();
         match &mut self.symbols[sym.0 as usize].kind {
             SymKind::Data { def, .. } => {
@@ -444,6 +472,7 @@ impl ObjectBuilder {
     }
 
     /// Write the object file.
+    #[must_use]
     pub fn finish(mut self) -> Vec<u8> {
         self.prune();
         // Index spaces: imports first, then definitions.

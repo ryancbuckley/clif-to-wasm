@@ -4,7 +4,7 @@
 //! reachable blocks, followed by backwards value- and instruction-level
 //! liveness (dead-code elimination and exact use counting).
 
-use crate::{Result, unsupported};
+use crate::{Result, error};
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
@@ -72,7 +72,7 @@ impl FuncInfo {
         let domtree = DominatorTree::with_function(func, &cfg);
         let rpo: Vec<Block> = domtree.cfg_rpo().copied().collect();
         if rpo.is_empty() {
-            return unsupported("function without a body");
+            return error::unsupported("function without a body");
         }
         let mut rpo_num = SecondaryMap::with_default(RpoIndex::UNREACHABLE);
         for (i, &b) in rpo.iter().enumerate() {
@@ -88,7 +88,7 @@ impl FuncInfo {
 
         for &b in &rpo {
             let Some(term) = func.layout.last_inst(b) else {
-                return unsupported(format!("empty block {b}"));
+                return error::unsupported(format!("empty block {b}"));
             };
             let data = &func.dfg.insts[term];
             match data.opcode() {
@@ -101,7 +101,7 @@ impl FuncInfo {
                 | Opcode::TryCall
                 | Opcode::TryCallIndirect
                 | Opcode::Trap => {}
-                op => return unsupported(format!("terminator {op}")),
+                op => return error::unsupported(format!("terminator {op}")),
             }
             // Keep every `try_call` edge (in exception-table order, normal
             // return last) because each needs its own wasm catch label and may
@@ -110,7 +110,7 @@ impl FuncInfo {
             let mut ds: Vec<BlockCall> = Vec::new();
             for call in data.branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables) {
                 if !is_try && call.args(pool).any(|a| !matches!(a, BlockArg::Value(_))) {
-                    return unsupported("non-value block argument");
+                    return error::unsupported("non-value block argument");
                 }
                 if is_try || !ds.iter().any(|d| same_call(func, d, call)) {
                     ds.push(*call);
@@ -187,7 +187,10 @@ impl FuncInfo {
                     for &p in &self.preds[block] {
                         for call in &self.dests[p] {
                             if call.block(pool) == block
-                                && let BlockArg::Value(a) = call.args(pool).nth(idx).unwrap()
+                                && let BlockArg::Value(a) = call
+                                    .args(pool)
+                                    .nth(idx)
+                                    .expect("an argument for each block parameter")
                             {
                                 worklist.push(a);
                             }
@@ -318,16 +321,25 @@ pub(crate) mod tests {
         let get_inst = func.layout.first_inst(b0).unwrap();
         // `get_pinned_reg` has `other_side_effects`, so it is kept and ordered
         // with other effects (Cranelift's lowering excludes it from both).
-        assert!(must_lower_even_if_unused(&func, get_inst));
-        assert!(has_lowering_side_effect(&func, get_inst));
+        assert!(
+            must_lower_even_if_unused(&func, get_inst),
+            "get_pinned_reg reads state, so it must be kept even if unused"
+        );
+        assert!(
+            has_lowering_side_effect(&func, get_inst),
+            "get_pinned_reg must stay ordered with other effects"
+        );
     }
 
     #[test]
     fn function_without_blocks_is_unsupported() {
-        assert!(matches!(
-            FuncInfo::compute(&Function::new()),
-            Err(crate::Error::Unsupported(_))
-        ));
+        assert!(
+            matches!(
+                FuncInfo::compute(&Function::new()),
+                Err(crate::Error::Unsupported(_))
+            ),
+            "a function without blocks has no entry to compile"
+        );
     }
 
     /// Independent BFS reachability from `entry`, optionally forbidding `avoid`.
@@ -541,15 +553,15 @@ pub(crate) mod tests {
             let reachable = reachable_without(entry, &raw_succs, None);
             let rpo_set: HashSet<Block> = info.rpo.iter().copied().collect();
             prop_assert_eq!(info.rpo.len(), rpo_set.len(), "duplicate blocks in rpo");
-            prop_assert_eq!(&rpo_set, &reachable);
-            prop_assert_eq!(info.rpo[0], entry);
+            prop_assert_eq!(&rpo_set, &reachable, "rpo must hold exactly the reachable blocks");
+            prop_assert_eq!(info.rpo[0], entry, "rpo must start at the entry block");
 
             for b in func.layout.blocks() {
                 if reachable.contains(&b) {
                     let idx = info.rpo.iter().position(|&x| x == b).unwrap();
-                    prop_assert_eq!(info.rpo_num[b], RpoIndex(idx as u32));
+                    prop_assert_eq!(info.rpo_num[b], RpoIndex(idx as u32), "rpo_num of {} must be its position in rpo", b);
                 } else {
-                    prop_assert_eq!(info.rpo_num[b], RpoIndex::UNREACHABLE);
+                    prop_assert_eq!(info.rpo_num[b], RpoIndex::UNREACHABLE, "unreachable {} must have no rpo number", b);
                 }
             }
 
@@ -581,11 +593,11 @@ pub(crate) mod tests {
                         }
                     }
                 }
-                prop_assert_eq!(&info.preds[b], &exp_preds);
-                prop_assert_eq!(info.forward_in[b], exp_forward);
-                prop_assert_eq!(info.loop_header[b], exp_loop);
+                prop_assert_eq!(&info.preds[b], &exp_preds, "preds of {} must be the distinct blocks branching to it", b);
+                prop_assert_eq!(info.forward_in[b], exp_forward, "forward_in of {} must count edges from earlier blocks in rpo", b);
+                prop_assert_eq!(info.loop_header[b], exp_loop, "{} is a loop header iff it has a back edge", b);
             }
-            prop_assert_eq!(info.reducible, expected_reducible);
+            prop_assert_eq!(info.reducible, expected_reducible, "reducible iff every back edge targets a dominator of its source");
 
             // 4. Independent iterative fixpoint oracle for `live_inst` and `use_count`.
             let mut exp_live_inst: HashSet<Inst> = HashSet::new();
@@ -643,7 +655,7 @@ pub(crate) mod tests {
             let mut exp_use_count: HashMap<Value, u32> = HashMap::new();
             for &b in &info.rpo {
                 for inst in func.layout.block_insts(b) {
-                    prop_assert_eq!(info.live_inst[inst], exp_live_inst.contains(&inst));
+                    prop_assert_eq!(info.live_inst[inst], exp_live_inst.contains(&inst), "liveness of {} must match the fixpoint oracle", inst);
                     if exp_live_inst.contains(&inst) {
                         for &arg in func.dfg.inst_args(inst) {
                             *exp_use_count.entry(arg).or_default() += 1;
@@ -669,7 +681,7 @@ pub(crate) mod tests {
                 let v = Value::new(vi);
                 let exp = exp_use_count.get(&v).copied().unwrap_or(0);
                 prop_assert_eq!(info.use_count[v], exp, "use_count mismatch for {}", v);
-                prop_assert_eq!(info.is_live(v), exp_live_val.contains(&v));
+                prop_assert_eq!(info.is_live(v), exp_live_val.contains(&v), "liveness of {} must match the fixpoint oracle", v);
             }
         }
     }
