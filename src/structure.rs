@@ -18,13 +18,15 @@ use crate::emit::{CallKind, Emitter};
 use crate::expr_trees::ExprTrees;
 use crate::locals::{Local, Locals};
 use crate::{CompiledFunction, Config, Env, Result, error, wasm_types};
+use alloc::borrow::Cow;
+use alloc::format;
+use alloc::vec::Vec;
+use core::cmp::Reverse;
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::{
     ArgumentPurpose, Block, BlockArg, BlockCall, ExceptionTableItem, ExceptionTag, Function, Inst,
     InstructionData, Opcode, types,
 };
-use std::borrow::Cow;
-use std::cmp::Reverse;
 use wasm_encoder::{BlockType, Catch, Instruction as I, ValType};
 
 /// An entry on the wasm label stack, used to compute branch depths.
@@ -236,7 +238,7 @@ impl Structurer<'_> {
                 let (mut then, mut els) = (dests[0], dests[1]);
                 if func.dfg.value_type(cond) == types::I64 {
                     self.e.ins(I::I64Eqz);
-                    std::mem::swap(&mut then, &mut els);
+                    core::mem::swap(&mut then, &mut els);
                 }
                 self.e.ins(I::If(BlockType::Empty));
                 self.labels.push(Label::If);

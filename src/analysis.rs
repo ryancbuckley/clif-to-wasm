@@ -5,6 +5,8 @@
 //! liveness (dead-code elimination and exact use counting).
 
 use crate::{Result, error};
+use alloc::format;
+use alloc::vec::Vec;
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::flowgraph::ControlFlowGraph;
@@ -301,14 +303,16 @@ pub(crate) fn has_lowering_side_effect(func: &Function, inst: Inst) -> bool {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use alloc::collections::VecDeque;
+    use alloc::vec;
     use cranelift_codegen::cursor::{Cursor, FuncCursor};
     use cranelift_codegen::entity::EntityRef;
     use cranelift_codegen::ir::{
         AbiParam, InstBuilder, JumpTableData, MemFlagsData, Signature, TrapCode, types,
     };
     use cranelift_codegen::isa::CallConv;
+    use hashbrown::{HashMap, HashSet};
     use proptest::prelude::*;
-    use std::collections::{HashMap, HashSet, VecDeque};
 
     #[test]
     fn get_pinned_reg_has_lowering_side_effect() {

@@ -9,6 +9,7 @@ use crate::emit::{self, CallKind, Emitter, w};
 use crate::locals::Local;
 use crate::lower_float::FloatCmpOps;
 use crate::{Name, Result, SymbolValue, error, wasm_types};
+use alloc::format;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
     GlobalValueData, Inst, InstructionData as D, MemFlags, Opcode, Type, types,

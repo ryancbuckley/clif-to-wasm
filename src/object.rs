@@ -16,7 +16,11 @@
 //! [linking conventions]: https://github.com/WebAssembly/tool-conventions/blob/main/Linking.md
 
 use crate::{AddressType, CompiledFunction, RelocKind, TypeIndex};
-use std::collections::HashMap;
+use alloc::borrow::ToOwned;
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::{format, vec};
+use hashbrown::HashMap;
 use wasm_encoder::{Encode, ValType};
 
 /// An entry of the object's symbol table.

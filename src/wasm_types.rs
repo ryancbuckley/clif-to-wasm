@@ -2,6 +2,8 @@
 
 use crate::config::ModuleLayout;
 use crate::error::{self, Result};
+use alloc::format;
+use alloc::vec::Vec;
 use cranelift_codegen::ir::{AbiParam, Signature, Type, types};
 use wasm_encoder::ValType;
 

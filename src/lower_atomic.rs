@@ -19,6 +19,7 @@
 use crate::emit::{self, Emitter, w};
 use crate::locals::Local;
 use crate::{Result, error};
+use alloc::format;
 use cranelift_codegen::ir::{
     AtomicRmwOp, Inst, InstructionData as D, MemFlags, Opcode, Type, types,
 };

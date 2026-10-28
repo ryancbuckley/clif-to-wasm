@@ -21,6 +21,10 @@ use crate::{
     AddressType, CompiledFunction, Config, Env, Error, FuncIndex, Name, Result, SymbolValue,
     TypeIndex, compile, wasm_types,
 };
+use alloc::boxed::Box;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use alloc::{format, vec};
 use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::{self, ExternalName, InstructionData, LibCall, Opcode};
@@ -30,7 +34,7 @@ use cranelift_module::{
     DataDescription, DataId, FuncId, Init, Linkage, Module, ModuleDeclarations, ModuleError,
     ModuleReloc, ModuleRelocTarget, ModuleResult,
 };
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use wasm_encoder::ValType;
 
 /// The wasm features LLVM declares for `wasm32-wasip1-threads` objects; a
@@ -104,8 +108,8 @@ impl Default for ObjectOptions {
     }
 }
 
-impl std::fmt::Debug for ObjectOptions {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for ObjectOptions {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ObjectOptions")
             .field("config", &self.config)
             .field("threads", &self.threads)
@@ -143,8 +147,8 @@ pub struct WasmObjectModule {
     warnings: Vec<String>,
 }
 
-impl std::fmt::Debug for WasmObjectModule {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for WasmObjectModule {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("WasmObjectModule")
             .field("isa", &self.isa.name())
             .field("obj", &self.obj)
@@ -176,8 +180,8 @@ pub enum DefineDataError {
     },
 }
 
-impl std::fmt::Display for DefineDataError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for DefineDataError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             DefineDataError::Uninitialized { name } => {
                 write!(f, "data {name} is not initialized")
@@ -189,7 +193,7 @@ impl std::fmt::Display for DefineDataError {
     }
 }
 
-impl std::error::Error for DefineDataError {}
+impl core::error::Error for DefineDataError {}
 
 fn unsupported_err(msg: impl Into<String>) -> ModuleError {
     ModuleError::Compilation(CodegenError::Unsupported(msg.into()))

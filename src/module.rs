@@ -16,7 +16,9 @@
 //! [`CompiledFunction::to_wasm_function`].
 
 use crate::{AddressType, CompiledFunction};
-use std::marker::PhantomData;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::marker::PhantomData;
 use wasm_encoder::{
     CodeSection, ConstExpr, ElementSection, Elements, EntityType, ExportKind, ExportSection,
     FunctionSection, GlobalSection, GlobalType, ImportSection, MemorySection, MemoryType, Module,
@@ -41,8 +43,8 @@ macro_rules! define_index {
             }
         }
 
-        impl std::fmt::Display for $name {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        impl core::fmt::Display for $name {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
                 self.0.fmt(f)
             }
         }
@@ -539,6 +541,7 @@ impl ModuleBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::format;
     use proptest::prelude::*;
     use wasm_encoder::Instruction as I;
     use wasmparser::{Validator, WasmFeatures};

@@ -4,6 +4,7 @@ use crate::config::Config;
 use crate::env::Env;
 use crate::error::Result;
 use crate::{analysis, expr_trees, legalize_i128, locals, structure};
+use alloc::vec::Vec;
 use cranelift_codegen::ir::Function;
 use wasm_encoder::ValType;
 

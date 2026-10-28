@@ -28,6 +28,7 @@
 use crate::emit::Emitter;
 use crate::locals::Local;
 use crate::{Result, error, wasm_types};
+use alloc::format;
 use cranelift_codegen::ir::condcodes::FloatCC;
 use cranelift_codegen::ir::{Inst, Opcode, Type, types};
 use wasm_encoder::{BlockType, Ieee32, Ieee64, Instruction as I, ValType};

@@ -7,6 +7,8 @@
 //! function definitions and call sites before `i128` legalization.
 
 use crate::{Result, error};
+use alloc::format;
+use alloc::vec::Vec;
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::{

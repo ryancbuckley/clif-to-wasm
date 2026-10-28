@@ -28,6 +28,9 @@
 //!   `i64` atomic accesses.
 
 use crate::{Result, error};
+use alloc::borrow::Cow;
+use alloc::vec::Vec;
+use alloc::{format, vec};
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::dominator_tree::DominatorTree;
 use cranelift_codegen::entity::SecondaryMap;
@@ -39,7 +42,6 @@ use cranelift_codegen::ir::{
     AbiParam, AtomicRmwOp, Block, BlockArg, BlockCall, Endianness, Function, Inst, InstBuilder,
     InstructionData as D, MemFlagsData, Opcode, Signature, TrapCode, Type, Value,
 };
-use std::borrow::Cow;
 
 type Pair = (Value, Value);
 

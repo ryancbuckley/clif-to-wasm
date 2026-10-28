@@ -28,6 +28,7 @@
 
 use crate::analysis::{self, FuncInfo};
 use crate::wasm_types;
+use alloc::vec::Vec;
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::{Function, Inst, Opcode, Value, ValueDef};
 
@@ -208,6 +209,7 @@ pub(crate) fn build(func: &Function, info: &FuncInfo, stack_values: bool) -> Exp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
     use cranelift_codegen::cursor::{Cursor, FuncCursor};
     use cranelift_codegen::ir::{
         AbiParam, BlockArg, ExtFuncData, ExternalName, InstBuilder, MemFlagsData, Signature,

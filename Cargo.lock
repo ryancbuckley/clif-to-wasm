@@ -161,6 +161,7 @@ dependencies = [
  "cranelift-interpreter",
  "cranelift-module",
  "cranelift-reader",
+ "hashbrown 0.17.1",
  "proptest",
  "target-lexicon",
  "wasm-encoder 0.262.0",

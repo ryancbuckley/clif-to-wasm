@@ -28,6 +28,8 @@ use crate::{
     AddressType, CompiledFunction, Config, Env, FuncIndex, GlobalIndex, Name, Reloc, RelocKind,
     Result, TableIndex, TypeIndex, error, wasm_types,
 };
+use alloc::format;
+use alloc::vec::Vec;
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::{
     AbiParam, ArgumentExtension, ArgumentPurpose, Endianness, FuncRef, Function, Inst,
@@ -363,7 +365,7 @@ impl<'ctx> Emitter<'ctx> {
 
     /// Allocate `N` temporary scratch locals of type `ty`.
     pub(crate) fn scratches<const N: usize>(&mut self, ty: ValType) -> [Local; N] {
-        std::array::from_fn(|_| self.extra.scratch(ty))
+        core::array::from_fn(|_| self.extra.scratch(ty))
     }
 
     /// Record the current scratch stack depth for an inner helper that may be
@@ -745,7 +747,7 @@ impl<'ctx> Emitter<'ctx> {
     /// allocated during lowering are automatically reclaimed on exit.
     pub fn inst(&mut self, inst: Inst) -> Result<()> {
         let start = self.operand_stack.len();
-        let mut ops = std::mem::take(&mut self.ops_tmp);
+        let mut ops = core::mem::take(&mut self.ops_tmp);
         expr_trees::operands(self.func, self.info, inst, &mut ops);
         self.operand_stack.extend(ops.iter().map(|o| o.value));
         self.ops_tmp = ops;
@@ -912,8 +914,9 @@ impl ExtraLocals {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::string::ToString;
+    use hashbrown::HashSet;
     use proptest::prelude::*;
-    use std::collections::HashSet;
     use wasmparser::{BinaryReader, Operator, OperatorsReader};
 
     struct NoEnv;

@@ -4,6 +4,7 @@
 use crate::error::{Error, Result};
 use crate::module::{FuncIndex, GlobalIndex, TagIndex, TypeIndex};
 use crate::object::SymbolId;
+use alloc::format;
 use cranelift_codegen::ir::{
     ExceptionTag, ExternalName, Function, KnownSymbol, LibCall, UserExternalName,
 };
@@ -28,7 +29,7 @@ impl<'func> Name<'func> {
         match name {
             ExternalName::User(r) => Name::User(&func.params.user_named_funcs()[*r]),
             ExternalName::TestCase(t) => {
-                Name::TestCase(std::str::from_utf8(t.raw()).unwrap_or("<invalid>"))
+                Name::TestCase(core::str::from_utf8(t.raw()).unwrap_or("<invalid>"))
             }
             ExternalName::LibCall(l) => Name::LibCall(*l),
             ExternalName::KnownSymbol(k) => Name::KnownSymbol(*k),
@@ -36,8 +37,8 @@ impl<'func> Name<'func> {
     }
 }
 
-impl std::fmt::Display for Name<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Name<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Name::User(u) => write!(f, "u{}:{}", u.namespace, u.index),
             Name::TestCase(s) => write!(f, "%{s}"),

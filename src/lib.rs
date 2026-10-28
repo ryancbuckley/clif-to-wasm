@@ -65,6 +65,9 @@
     clippy::missing_errors_doc,
     clippy::missing_panics_doc
 )]
+#![no_std]
+
+extern crate alloc;
 
 // Re-exported because their types appear in this crate's API, so users can
 // name them without depending on matching versions.

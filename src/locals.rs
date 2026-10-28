@@ -35,10 +35,12 @@
 use crate::analysis::FuncInfo;
 use crate::expr_trees::{self, ExprTrees, Operand};
 use crate::{Result, wasm_types};
+use alloc::collections::BinaryHeap;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::cmp::Reverse;
 use cranelift_codegen::entity::{EntityRef, SecondaryMap};
 use cranelift_codegen::ir::{Block, Function, Inst, Value, ValueDef};
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use wasm_encoder::ValType;
 
 /// Index of a WebAssembly local variable within a function (parameters
@@ -488,8 +490,9 @@ fn new_slot(slots: &mut Vec<Slot>, classes: &mut Vec<Class>, ty: ValType) -> Loc
 mod tests {
     use super::*;
     use crate::analysis;
+    use alloc::collections::BTreeSet;
+    use hashbrown::{HashMap, HashSet};
     use proptest::prelude::*;
-    use std::collections::{BTreeSet, HashMap, HashSet};
 
     fn point_set(segs: &[Segment]) -> BTreeSet<u32> {
         let mut pts = BTreeSet::new();
