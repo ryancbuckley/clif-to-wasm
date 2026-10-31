@@ -62,6 +62,16 @@ pub(crate) struct ByvalCopy {
     size: u32,
 }
 
+/// A function's frame on the shadow stack.
+#[derive(Clone, Copy)]
+struct Frame {
+    /// Holds the frame's address, the stack pointer after allocation.
+    fp: Local,
+    size: u32,
+    /// The stack pointer global.
+    sp: GlobalIndex,
+}
+
 pub(crate) struct Emitter<'ctx> {
     pub func: &'ctx Function,
     pub config: &'ctx Config,
@@ -69,8 +79,8 @@ pub(crate) struct Emitter<'ctx> {
     pub info: &'ctx FuncInfo,
     pub trees: &'ctx ExprTrees,
     pub locals: Locals,
-    /// Shadow-stack frame: `(frame_pointer_local, frame_size)`.
-    frame: Option<(Local, u32)>,
+    /// Shadow-stack frame, if the function needs one.
+    frame: Option<Frame>,
     /// Frame offset of the area where calls copy by-value struct arguments.
     byval_base: u32,
     slot_offset: SecondaryMap<StackSlot, u32>,
@@ -194,7 +204,7 @@ impl<'ctx> Emitter<'ctx> {
             let (byval_base, size) = size;
             self.byval_base = byval_base;
             let fp = self.new_local(config.module.ptr_ty());
-            self.frame = Some((fp, size));
+            self.frame = Some(Frame { fp, size, sp });
             self.global_get(sp);
             self.ptr_const(size as i64);
             self.ins(match config.module.address_type {
@@ -225,17 +235,18 @@ impl<'ctx> Emitter<'ctx> {
     }
 
     pub fn epilogue(&mut self) {
-        if let Some((fp, size)) = self.frame {
+        if let Some(Frame { fp, size, sp }) = self.frame {
             self.local_get(fp);
             self.ptr_const(size as i64);
             self.ptr_add();
-            self.global_set(
-                self.config
-                    .module
-                    .stack_pointer_global
-                    .expect("frame implies a stack pointer"),
-            );
+            self.global_set(sp);
         }
+    }
+
+    /// The frame pointer. The prologue allocates a frame whenever the
+    /// function has stack slots or calls with by-value struct arguments.
+    fn fp(&self) -> Local {
+        self.frame.expect("function has a frame").fp
     }
 
     pub fn ins(&mut self, i: I<'_>) {
@@ -556,8 +567,7 @@ impl<'ctx> Emitter<'ctx> {
         offset: i32,
         ty: Type,
     ) -> Result<()> {
-        let (fp, _) = self.frame.expect("frame for stack slot");
-        self.local_get(fp);
+        self.local_get(self.fp());
         let off = self.slot_offset[stack_slot] as i64 + i64::from(offset);
         self.ptr_const(off);
         self.ptr_add();
@@ -567,7 +577,7 @@ impl<'ctx> Emitter<'ctx> {
     /// Emit `get_stack_pointer` or `get_frame_pointer` with result type `ty`.
     pub(crate) fn stack_pointer(&mut self, op: Opcode, ty: Type) -> Result<()> {
         match (self.frame, self.config.module.stack_pointer_global) {
-            (Some((fp, _)), _) => self.local_get(fp),
+            (Some(frame), _) => self.local_get(frame.fp),
             (None, Some(sp)) => self.global_get(sp),
             (None, None) => return error::unsupported(format!("{op} without a stack pointer")),
         }
@@ -625,7 +635,6 @@ impl<'ctx> Emitter<'ctx> {
                 if tail {
                     return error::unsupported("tail call with a by-value struct argument");
                 }
-                let (fp, _) = self.frame.expect("frame for by-value arguments");
                 // The address in the memory's address type.
                 match (self.config.module.address_type, value_type) {
                     (AddressType::I32, types::I64) => self.ins(I::I32WrapI64),
@@ -639,7 +648,7 @@ impl<'ctx> Emitter<'ctx> {
                     src,
                     size,
                 });
-                self.frame_addr(fp, byval);
+                self.frame_addr(byval);
                 self.ptr_to(value_type)?;
                 byval += size.next_multiple_of(16);
             } else {
@@ -655,8 +664,7 @@ impl<'ctx> Emitter<'ctx> {
     pub(crate) fn byval_copies(&mut self, copies: Vec<ByvalCopy>) {
         let mem = self.config.module.memory_index.0;
         for c in copies {
-            let (fp, _) = self.frame.expect("frame for by-value arguments");
-            self.frame_addr(fp, c.dst);
+            self.frame_addr(c.dst);
             self.local_get(c.src);
             self.ptr_const(c.size as i64);
             self.ins(I::MemoryCopy {
@@ -708,8 +716,8 @@ impl<'ctx> Emitter<'ctx> {
         Ok(())
     }
 
-    fn frame_addr(&mut self, fp: Local, offset: u32) {
-        self.local_get(fp);
+    fn frame_addr(&mut self, offset: u32) {
+        self.local_get(self.fp());
         self.ptr_const(offset as i64);
         self.ptr_add();
     }

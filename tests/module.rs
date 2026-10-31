@@ -333,3 +333,22 @@ block0(v0: i32):
     config.module.atomic_lock_table_addr = Some(4096);
     clif_to_wasm::compile_function(f, &config, &mut SlotsOnly).unwrap();
 }
+
+/// A function declaration passes Cranelift's verifier, so compiling one returns
+/// an error rather than panicking.
+#[test]
+fn function_without_a_body_is_an_error() {
+    let decl = &cranelift_reader::parse_functions("function %decl() -> i32, i32 {\n}").unwrap()[0];
+    let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+    cranelift_codegen::verify_function(decl, &flags).unwrap();
+    let mut config = Config::default();
+    // Also when demoting multi-value returns.
+    for demote in [false, true] {
+        config.module.demote_multi_results = demote;
+        assert_eq!(
+            clif_to_wasm::compile_function(decl, &config, &mut SlotsOnly).unwrap_err(),
+            Error::Unsupported("function without a body".into()),
+            "demote_multi_results = {demote}"
+        );
+    }
+}

@@ -128,7 +128,8 @@ impl_export!(TagIndex, Tag);
 /// config.module.stack_pointer_global = Some(sp);
 /// // ... compile functions with `config`, then declare and define them.
 /// let wasm = builder.finish();
-/// # wasmparser::validate(&wasm).unwrap();
+/// # wasmparser::validate(&wasm)?;
+/// # Ok::<(), wasmparser::BinaryReaderError>(())
 /// ```
 #[derive(Debug, Default)]
 pub struct ModuleBuilder {

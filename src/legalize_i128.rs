@@ -130,6 +130,16 @@ enum Out {
     Value(Value),
 }
 
+/// An `i128` atomic access, with the legalized `(lo, hi)` halves of its
+/// operands.
+enum Access {
+    Load,
+    Store(Pair),
+    /// Expected and replacement values.
+    Cas(Pair, Pair),
+    Rmw(AtomicRmwOp, Pair),
+}
+
 /// The function must be alias-free; aliases are created for replaced
 /// scalar results and must be resolved afterwards.
 fn legalize(func: &mut Function, lock_table_addr: Option<u64>) -> Result<()> {
@@ -909,20 +919,14 @@ impl Legalizer<'_> {
         if table_base & 3 != 0 {
             return error::unsupported("unaligned ModuleLayout::atomic_lock_table_addr");
         }
-        let (flags, addr) = match data {
-            D::LoadNoOffset { flags, .. }
-            | D::AtomicCas { flags, .. }
-            | D::AtomicRmw { flags, .. } => (self.func.dfg.mem_flags[flags], args[0]),
-            D::StoreNoOffset { flags, .. } => (self.func.dfg.mem_flags[flags], args[1]),
-            _ => unreachable!(),
+        let (flags, addr, access) = match data {
+            D::LoadNoOffset { flags, .. } => (flags, args[0], Access::Load),
+            D::StoreNoOffset { flags, .. } => (flags, args[1], Access::Store(p(0)?)),
+            D::AtomicCas { flags, .. } => (flags, args[0], Access::Cas(p(1)?, p(2)?)),
+            D::AtomicRmw { flags, op, .. } => (flags, args[0], Access::Rmw(op, p(1)?)),
+            _ => unreachable!("not an atomic memory access: {inst}"),
         };
-        let operand_pairs = match data.opcode() {
-            Opcode::AtomicLoad => (None, None),
-            Opcode::AtomicStore => (Some(p(0)?), None),
-            Opcode::AtomicRmw => (Some(p(1)?), None),
-            Opcode::AtomicCas => (Some(p(1)?), Some(p(2)?)),
-            _ => unreachable!(),
-        };
+        let flags = self.func.dfg.mem_flags[flags];
 
         let func = &mut *self.func;
         let addr_ty = func.dfg.value_type(addr);
@@ -960,27 +964,18 @@ impl Legalizer<'_> {
 
         // Critical section in `cont`: access both 64-bit halves, then unlock.
         let mut pos = FuncCursor::new(func).at_inst(inst);
-        let outs: Option<Pair> = match data {
-            D::LoadNoOffset {
-                opcode: Opcode::AtomicLoad,
-                ..
-            } => {
+        let outs: Option<Pair> = match access {
+            Access::Load => {
                 let lo = pos.ins().atomic_load(I64, flags, lo_addr);
                 let hi = pos.ins().atomic_load(I64, flags, hi_addr);
                 Some((lo, hi))
             }
-            D::StoreNoOffset {
-                opcode: Opcode::AtomicStore,
-                ..
-            } => {
-                let (lo, hi) = operand_pairs.0.expect("stored pair");
+            Access::Store((lo, hi)) => {
                 pos.ins().atomic_store(flags, lo, lo_addr);
                 pos.ins().atomic_store(flags, hi, hi_addr);
                 None
             }
-            D::AtomicCas { .. } => {
-                let exp = operand_pairs.0.expect("expected pair");
-                let new = operand_pairs.1.expect("replacement pair");
+            Access::Cas(exp, new) => {
                 let old_lo = pos.ins().atomic_load(I64, flags, lo_addr);
                 let old_hi = pos.ins().atomic_load(I64, flags, hi_addr);
                 let old = (old_lo, old_hi);
@@ -990,8 +985,7 @@ impl Legalizer<'_> {
                 pos.ins().atomic_store(flags, store_hi, hi_addr);
                 Some(old)
             }
-            D::AtomicRmw { op, .. } => {
-                let x = operand_pairs.0.expect("operand pair");
+            Access::Rmw(op, x) => {
                 let old_lo = pos.ins().atomic_load(I64, flags, lo_addr);
                 let old_hi = pos.ins().atomic_load(I64, flags, hi_addr);
                 let old = (old_lo, old_hi);
@@ -1028,7 +1022,6 @@ impl Legalizer<'_> {
                 pos.ins().atomic_store(flags, new_hi, hi_addr);
                 Some(old)
             }
-            _ => unreachable!(),
         };
         let zero = pos.ins().iconst(I32, 0);
         pos.ins()

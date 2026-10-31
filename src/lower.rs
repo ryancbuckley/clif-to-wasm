@@ -223,7 +223,7 @@ impl Emitter<'_> {
                 let signed = op == Opcode::Smulhi;
                 match ty {
                     types::I8 | types::I16 => {
-                        let bits = emit::narrow_bits(ty).expect("i8 and i16 are narrow");
+                        let bits = ty.bits();
                         self.operand()?;
                         if signed {
                             self.sext(ty);
@@ -569,7 +569,7 @@ impl Emitter<'_> {
             {
                 // Saturate to i32, then clamp to the narrow range.
                 let signed = op == Opcode::FcvtToSintSat;
-                let bits = emit::narrow_bits(ty).expect("i8 and i16 are narrow");
+                let bits = ty.bits();
                 let f64 = self.float_operand()? == types::F64;
                 self.ins(match (f64, signed) {
                     (false, true) => I::I32TruncSatF32S,
@@ -838,14 +838,14 @@ impl Emitter<'_> {
                 _ => (4, true),
             };
             let m = self.memarg(off, flags, bytes);
-            let raw = Type::int_with_byte_size(bytes as u16).expect("1, 2, 4, or 8 bytes");
-            self.ins(match bytes {
-                1 => I::I32Load8U(m),
-                2 => I::I32Load16U(m),
-                4 => I::I32Load(m),
-                8 => I::I64Load(m),
+            let (raw, load) = match bytes {
+                1 => (types::I8, I::I32Load8U(m)),
+                2 => (types::I16, I::I32Load16U(m)),
+                4 => (types::I32, I::I32Load(m)),
+                8 => (types::I64, I::I64Load(m)),
                 _ => return error::unsupported(format!("{op}.{ty}")),
-            });
+            };
+            self.ins(load);
             self.bswap(raw)?;
             if signed {
                 self.sext(raw);
@@ -908,15 +908,15 @@ impl Emitter<'_> {
                 t if t == types::F16 || (t.is_int() && !t.is_vector()) => {}
                 _ => return error::unsupported(format!("{op}.{vty}")),
             }
-            let raw = Type::int_with_byte_size(bytes as u16).expect("1, 2, 4, or 8 bytes");
-            self.bswap(raw)?;
             let m = self.memarg(off, flags, bytes);
-            self.ins(match bytes {
-                1 => I::I32Store8(m),
-                2 => I::I32Store16(m),
-                4 => I::I32Store(m),
-                _ => I::I64Store(m),
-            });
+            let (raw, store) = match bytes {
+                1 => (types::I8, I::I32Store8(m)),
+                2 => (types::I16, I::I32Store16(m)),
+                4 => (types::I32, I::I32Store(m)),
+                _ => (types::I64, I::I64Store(m)),
+            };
+            self.bswap(raw)?;
+            self.ins(store);
             return Ok(());
         }
 

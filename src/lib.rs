@@ -52,8 +52,7 @@
 //!          v2 = iadd v0, v1
 //!          return v2
 //!      }",
-//! )
-//! .unwrap();
+//! )?;
 //!
 //! // `%add` calls nothing, so its environment resolves no names.
 //! struct NoCalls;
@@ -71,8 +70,8 @@
 //! builder.define_function(add, compiled);
 //! builder.export("add", add);
 //! let wasm = builder.finish();
-//! # wasmparser::validate(&wasm).unwrap();
-//! # Ok::<(), Error>(())
+//! # wasmparser::validate(&wasm)?;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
 #![warn(
@@ -122,3 +121,8 @@ pub use module::{
 };
 pub use object::SymbolId;
 pub use wasm_types::{wasm_signature, wasm_type};
+
+// Compile-test the README's examples.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

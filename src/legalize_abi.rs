@@ -13,7 +13,7 @@ use cranelift_codegen::cursor::{Cursor, FuncCursor};
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::{
     AbiParam, ArgumentPurpose, Function, Inst, InstBuilder, InstructionData, MemFlagsData, Opcode,
-    Signature, StackSlotData, StackSlotKind, Type, Value, types,
+    Signature, StackSlot, StackSlotData, StackSlotKind, Type, Value, types,
 };
 
 /// Number of wasm scalar values needed to represent `ps`.
@@ -65,10 +65,9 @@ pub(crate) fn demote(func: &mut Function, ptr: Type) -> Result<()> {
     let own = func.signature.returns.clone();
     let mut ret_ptr: Option<Value> = None;
     if needs_demotion(&func.signature) {
-        let entry = func
-            .layout
-            .entry_block()
-            .expect("function has an entry block");
+        let Some(entry) = func.layout.entry_block() else {
+            return error::unsupported("function without a body");
+        };
         let old = func.dfg.detach_block_params(entry);
         let old: Vec<Value> = old.as_slice(&func.dfg.value_lists).to_vec();
         ret_ptr = Some(func.dfg.append_block_param(entry, ptr));
@@ -87,27 +86,9 @@ pub(crate) fn demote(func: &mut Function, ptr: Type) -> Result<()> {
         }
     }
 
-    // One stack slot, sized for the largest, serves every call: results are
+    // One stack slot, grown to the largest, serves every call: results are
     // loaded right after it.
-    let mut area_size = 0;
-    for b in func.layout.blocks() {
-        for inst in func.layout.block_insts(b) {
-            if let Some(sig_ref) = func.dfg.call_signature(inst)
-                && demoted_sigs[sig_ref]
-            {
-                let results = func.dfg.inst_results(inst);
-                let (_, size) = layout(results.iter().map(|&r| func.dfg.value_type(r)));
-                area_size = area_size.max(size);
-            }
-        }
-    }
-    let area = (area_size > 0).then(|| {
-        func.create_sized_stack_slot(StackSlotData::new(
-            StackSlotKind::ExplicitSlot,
-            area_size,
-            4,
-        ))
-    });
+    let mut area: Option<StackSlot> = None;
 
     let mut pos = FuncCursor::new(func);
     while pos.next_block().is_some() {
@@ -132,12 +113,18 @@ pub(crate) fn demote(func: &mut Function, ptr: Type) -> Result<()> {
             match op {
                 Opcode::Call | Opcode::CallIndirect => {
                     let results = pos.func.dfg.inst_results(inst).to_vec();
-                    let (offsets, _) = layout(results.iter().map(|&r| pos.func.dfg.value_type(r)));
-                    let addr = pos.ins().stack_addr(
-                        ptr,
-                        area.expect("return area for multi-result calls"),
-                        0,
-                    );
+                    let (offsets, size) =
+                        layout(results.iter().map(|&r| pos.func.dfg.value_type(r)));
+                    let slot = *area.get_or_insert_with(|| {
+                        pos.func.create_sized_stack_slot(StackSlotData::new(
+                            StackSlotKind::ExplicitSlot,
+                            0,
+                            4,
+                        ))
+                    });
+                    let data = &mut pos.func.sized_stack_slots[slot];
+                    data.size = data.size.max(size);
+                    let addr = pos.ins().stack_addr(ptr, slot, 0);
                     insert_first_arg(pos.func, inst, addr);
                     pos.func.dfg.detach_inst_results(inst);
                     pos.next_inst();

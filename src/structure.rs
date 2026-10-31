@@ -24,8 +24,8 @@ use alloc::vec::Vec;
 use core::cmp::Reverse;
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::{
-    ArgumentPurpose, Block, BlockArg, BlockCall, ExceptionTableItem, ExceptionTag, Function, Inst,
-    InstructionData, Opcode, types,
+    ArgumentPurpose, Block, BlockArg, BlockCall, ExceptionTable, ExceptionTableItem, ExceptionTag,
+    FuncRef, Function, Inst, InstructionData, JumpTable, Value, types,
 };
 use wasm_encoder::{BlockType, Catch, Instruction as I, ValType};
 
@@ -219,13 +219,12 @@ impl Structurer<'_> {
         let info = self.e.info;
         let term = func.layout.last_inst(b).expect("block has a terminator");
         let dests = &info.dests[b];
-        match func.dfg.insts[term].opcode() {
-            Opcode::Jump => self.tasks.push(Task::Branch {
+        match func.dfg.insts[term] {
+            InstructionData::Jump { .. } => self.tasks.push(Task::Branch {
                 src: b,
                 call: dests[0],
             }),
-            Opcode::Brif => {
-                let cond = func.dfg.inst_args(term)[0];
+            InstructionData::Brif { arg: cond, .. } => {
                 self.e.value(cond)?;
                 if dests.len() == 1 {
                     self.e.ins(I::Drop);
@@ -247,18 +246,24 @@ impl Structurer<'_> {
                 self.tasks.push(Task::Else);
                 self.tasks.push(Task::Branch { src: b, call: then });
             }
-            Opcode::BrTable => self.br_table(b, term)?,
-            Opcode::TryCall | Opcode::TryCallIndirect => self.try_call(b, term)?,
+            InstructionData::BranchTable { arg, table, .. } => self.br_table(b, arg, table)?,
+            InstructionData::TryCall {
+                func_ref,
+                exception,
+                ..
+            } => self.try_call(b, term, Some(func_ref), exception)?,
+            InstructionData::TryCallIndirect { exception, .. } => {
+                self.try_call(b, term, None, exception)?
+            }
             _ => self.e.root(term)?,
         }
         Ok(())
     }
 
-    fn br_table(&mut self, b: Block, term: Inst) -> Result<()> {
+    fn br_table(&mut self, b: Block, index: Value, table: JumpTable) -> Result<()> {
         let func = self.e.func;
         let dfg = &func.dfg;
         let dests = &self.e.info.dests[b];
-        let index = dfg.inst_args(term)[0];
         let ity = dfg.value_type(index);
         if dests.len() == 1 {
             self.e.value(index)?;
@@ -269,9 +274,6 @@ impl Structurer<'_> {
             });
             return Ok(());
         }
-        let InstructionData::BranchTable { table, .. } = dfg.insts[term] else {
-            unreachable!()
-        };
         let jt = &dfg.jump_tables[table];
         let pos = |call: &BlockCall| {
             dests
@@ -338,19 +340,16 @@ impl Structurer<'_> {
     /// Context items of the exception table are ignored: they tell a native
     /// unwinder how to interpret tags, which `Env::exception_tag` resolves
     /// statically here.
-    fn try_call(&mut self, b: Block, term: Inst) -> Result<()> {
+    fn try_call(
+        &mut self,
+        b: Block,
+        term: Inst,
+        func_ref: Option<FuncRef>,
+        et: ExceptionTable,
+    ) -> Result<()> {
         let func = self.e.func;
         let dfg = &func.dfg;
         let pool = &dfg.value_lists;
-        let (func_ref, et) = match dfg.insts[term] {
-            InstructionData::TryCall {
-                func_ref,
-                exception,
-                ..
-            } => (Some(func_ref), exception),
-            InstructionData::TryCallIndirect { exception, .. } => (None, exception),
-            _ => unreachable!(),
-        };
         let table = &dfg.exception_tables[et];
         let sig_ref = table.signature();
         let sig = &dfg.signatures[sig_ref];

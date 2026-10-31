@@ -20,18 +20,18 @@ Compile a function and assemble it into a module with `ModuleBuilder`:
 
 ```rust
 use clif_to_wasm::{
-    Config, Env, Error, FuncIndex, ModuleBuilder, Name, Result, compile_function, wasm_signature,
+    Config, Env, Error, FuncIndex, ModuleBuilder, Name, compile_function, wasm_signature,
 };
 
-// Our CLIF code doesn't call nothing, so the environment resolves no names.
+// Our CLIF code doesn't call anything, so the environment resolves no names.
 struct NoCalls;
 impl Env for NoCalls {
-    fn func_index(&mut self, name: Name<'_>) -> Result<FuncIndex> {
+    fn func_index(&mut self, name: Name<'_>) -> clif_to_wasm::Result<FuncIndex> {
         Err(Error::Env(format!("unknown function {name}")))
     }
 }
 
-fn build_module() -> Result<Vec<u8>> {
+fn build_module() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     // Frontends usually build functions with `cranelift-frontend`; this one is
     // parsed from text with `cranelift-reader`.
     let funcs = cranelift_reader::parse_functions(
@@ -40,8 +40,7 @@ fn build_module() -> Result<Vec<u8>> {
              v2 = iadd v0, v1
              return v2
          }",
-    )
-    .unwrap();
+    )?;
 
     let config = Config::default();
     let mut builder = ModuleBuilder::new();

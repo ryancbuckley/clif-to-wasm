@@ -254,11 +254,11 @@ fn compute_live_ranges(func: &Function, info: &FuncInfo, trees: &ExprTrees) -> L
             let Some(root) = trees.root(inst) else {
                 continue;
             };
-            let at_block = func.layout.inst_block(root).expect("instruction in layout");
+            // Trees never span blocks, so `root` is in `b` too.
             expr_trees::operands(func, info, inst, &mut ops);
             for o in &ops {
                 if is_local(o.value) {
-                    use_list.push((o.value, at_block, pos[root]));
+                    use_list.push((o.value, b, pos[root]));
                 }
             }
         }

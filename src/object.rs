@@ -223,7 +223,8 @@ struct Segment {
 ///     DataDef::new(b"hello\0".to_vec(), 1, Mutability::Immutable),
 /// );
 /// let object_file = obj.finish();
-/// # wasmparser::validate(&object_file).unwrap();
+/// # wasmparser::validate(&object_file)?;
+/// # Ok::<(), wasmparser::BinaryReaderError>(())
 /// ```
 #[derive(Debug)]
 pub struct ObjectBuilder {
@@ -486,13 +487,13 @@ impl ObjectBuilder {
         let mut table_imports = Vec::new();
         for (i, s) in self.symbols.iter().enumerate() {
             match s.kind {
-                SymKind::Func { def: None, .. } => {
+                SymKind::Func { def: None, ty } => {
                     index[i] = func_imports.len() as u32;
-                    func_imports.push(i);
+                    func_imports.push((i, ty));
                 }
-                SymKind::Global { .. } => {
+                SymKind::Global { ty, mutability } => {
                     index[i] = global_imports.len() as u32;
-                    global_imports.push(i);
+                    global_imports.push((i, ty, mutability));
                 }
                 SymKind::Table => {
                     index[i] = table_imports.len() as u32;
@@ -542,22 +543,16 @@ impl ObjectBuilder {
             page_size_log2: None,
         };
         imports.import("env", "__linear_memory", mem_ty);
-        for &i in &func_imports {
+        for &(i, ty) in &func_imports {
             let s = &self.symbols[i];
-            let SymKind::Func { ty, .. } = s.kind else {
-                unreachable!()
-            };
             let (module, field) = match &s.import {
                 Some((m, f)) => (m.as_str(), f.as_str()),
                 None => ("env", s.name.as_str()),
             };
             imports.import(module, field, wasm_encoder::EntityType::Function(ty.0));
         }
-        for &i in &global_imports {
+        for &(i, ty, mutability) in &global_imports {
             let s = &self.symbols[i];
-            let SymKind::Global { ty, mutability } = s.kind else {
-                unreachable!()
-            };
             let gt = wasm_encoder::GlobalType {
                 val_type: ty,
                 mutable: mutability == Mutability::Mutable,
