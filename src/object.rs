@@ -16,12 +16,12 @@
 //! [linking conventions]: https://github.com/WebAssembly/tool-conventions/blob/main/Linking.md
 
 use crate::{AddressType, CompiledFunction, RelocKind, TypeIndex};
-use alloc::borrow::ToOwned;
+use alloc::borrow::{Cow, ToOwned};
 use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::{format, vec};
 use hashbrown::HashMap;
-use wasm_encoder::{Encode, ValType};
+use wasm_encoder::{CustomSection, Encode, Section, ValType};
 
 /// An entry of the object's symbol table.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -524,14 +524,18 @@ impl ObjectBuilder {
         out.extend_from_slice(b"\0asm");
         out.extend_from_slice(&1u32.to_le_bytes());
 
+        // `finish` always writes the type, import, function, code and data
+        // sections in that order, so relocation sections can name the code and
+        // data sections by their predetermined indexes.
+        const CODE_SECTION: u32 = 3;
+        const DATA_SECTION: u32 = 4;
+
         // Type section.
         let mut types = wasm_encoder::TypeSection::new();
         for (p, r) in &self.types {
             types.ty().function(p.iter().copied(), r.iter().copied());
         }
-        let mut section_index = 0u32;
-        section(&mut out, 1, &encoded(&types));
-        section_index += 1;
+        types.append_to(&mut out);
 
         // Import section.
         let mut imports = wasm_encoder::ImportSection::new();
@@ -570,8 +574,7 @@ impl ObjectBuilder {
             };
             imports.import("env", &self.symbols[i].name, tt);
         }
-        section(&mut out, 2, &encoded(&imports));
-        section_index += 1;
+        imports.append_to(&mut out);
 
         // Function section.
         let mut funcs = wasm_encoder::FunctionSection::new();
@@ -581,8 +584,7 @@ impl ObjectBuilder {
             };
             funcs.function(ty.0);
         }
-        section(&mut out, 3, &encoded(&funcs));
-        section_index += 1;
+        funcs.append_to(&mut out);
 
         // Code section, with relocated fields filled in.
         let mut code = Vec::new();
@@ -614,9 +616,7 @@ impl ObjectBuilder {
             }
             code.extend_from_slice(&body);
         }
-        let code_section = section_index;
         section(&mut out, 10, &code);
-        section_index += 1;
 
         // Data section: one active segment per data object.
         let mut data = Vec::new();
@@ -664,7 +664,6 @@ impl ObjectBuilder {
             }
             data.extend_from_slice(&bytes);
         }
-        let data_section = section_index;
         section(&mut out, 11, &data);
 
         // The linking section.
@@ -698,7 +697,7 @@ impl ObjectBuilder {
                 }
                 flags.encode(&mut sub);
             }
-            subsection(&mut linking, 5, &sub);
+            section(&mut linking, 5, &sub);
         }
         if !self.init_funcs.is_empty() {
             let mut sub = Vec::new();
@@ -707,7 +706,7 @@ impl ObjectBuilder {
                 prio.encode(&mut sub);
                 sym.0.encode(&mut sub);
             }
-            subsection(&mut linking, 6, &sub);
+            section(&mut linking, 6, &sub);
         }
         {
             let mut sub = Vec::new();
@@ -760,13 +759,13 @@ impl ObjectBuilder {
                     }
                 }
             }
-            subsection(&mut linking, 8, &sub);
+            section(&mut linking, 8, &sub);
         }
         custom(&mut out, "linking", &linking);
 
         for (name, target, relocs) in [
-            ("reloc.CODE", code_section, &code_relocs),
-            ("reloc.DATA", data_section, &data_relocs),
+            ("reloc.CODE", CODE_SECTION, &code_relocs),
+            ("reloc.DATA", DATA_SECTION, &data_relocs),
         ] {
             if relocs.is_empty() {
                 continue;
@@ -800,36 +799,20 @@ impl ObjectBuilder {
     }
 }
 
-/// The payload of a `wasm_encoder` section, whose `Encode` writes it with
-/// a length prefix.
-fn encoded(s: &impl Encode) -> Vec<u8> {
-    let mut v = Vec::new();
-    s.encode(&mut v);
-    let prefix = v
-        .iter()
-        .position(|&b| b & 0x80 == 0)
-        .map_or(v.len(), |i| i + 1);
-    v.drain(..prefix);
-    v
-}
-
+/// Appends a section or a linking subsection with its id the payload length,
+/// and finally the payload bytes.
 fn section(out: &mut Vec<u8>, id: u8, payload: &[u8]) {
     out.push(id);
     (payload.len() as u32).encode(out);
     out.extend_from_slice(payload);
 }
 
-fn subsection(out: &mut Vec<u8>, id: u8, payload: &[u8]) {
-    out.push(id);
-    (payload.len() as u32).encode(out);
-    out.extend_from_slice(payload);
-}
-
 fn custom(out: &mut Vec<u8>, name: &str, payload: &[u8]) {
-    let mut content = Vec::new();
-    name.encode(&mut content);
-    content.extend_from_slice(payload);
-    section(out, 0, &content);
+    CustomSection {
+        name: name.into(),
+        data: Cow::Borrowed(payload),
+    }
+    .append_to(out);
 }
 
 /// Overwrite the relocated field of kind `kind` at `at` with `value`.
