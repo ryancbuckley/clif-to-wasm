@@ -14,6 +14,15 @@
 //! `UPSTREAM_RUNTESTS` is set.
 //!
 //! Set `BENCH_QUICK=1` for fewer repetitions and smaller corpora.
+//!
+//! ```sh
+//! cargo bench --bench codegen
+//! UPSTREAM_RUNTESTS=wasmtime/cranelift/filetests/filetests/runtests cargo bench --bench codegen
+//! cargo run --example wasm2wat -- target/bench/kernels-default.wasm  # inspect output
+//! cargo run --release --example compile_loop  # compile in a loop, for profiling
+//! ```
+//!
+//! See the README's Testing section for checking out the upstream runtests.
 
 #[path = "../tests/harness/mod.rs"]
 mod harness;

@@ -1,27 +1,43 @@
 //! A WebAssembly backend for Cranelift.
 //!
-//! Translates a Cranelift [`ir::Function`](cranelift_codegen::ir::Function)
-//! into a WebAssembly function body.
-//! Rather than implementing `TargetIsa` (which centers on register allocation),
-//! this crate operates directly on CLIF in five stages:
+//! Compiles a Cranelift [`ir::Function`](cranelift_codegen::ir::Function)
+//! into a WebAssembly function body, so anything that produces Cranelift IR
+//! (CLIF) can target wasm. This may be useful for:
 //!
-//! 0. **Preparation & Legalization** (`legalize_i128`, `legalize_abi`):
-//!    resolves value aliases, splits `i128`/`f128` values into `(lo, hi)` `i64`
-//!    pairs, and optionally demotes multi-result returns to memory.
-//! 1. **Analysis** (`analysis`): computes reachability, RPO, CFG edges,
-//!    dominators, loop headers, merge nodes, and single-pass backward liveness
-//!    and use counts.
-//! 2. **Expression trees** (`expr_trees`): folds single-use definitions into
-//!    their consumer within each block when side-effect order is preserved
-//!    (checked in O(1) via effect colors). Constants are rematerialized at each
-//!    use.
-//! 3. **Local allocation** (`locals`): assigns wasm locals to remaining
-//!    values by coloring per-block live-range segments, preferring to coalesce
-//!    block arguments with their target parameters.
-//! 4. **Structuring and emission** (`structure`, `emit`, `lower`):
-//!    reconstructs structured control flow from the dominator tree via Ramsey's
-//!    "Beyond Relooper" (ICFP 2022) and lowers instructions with a `local.tee`
-//!    peephole. Irreducible CFGs fall back to a dispatch loop.
+//! - **JITs running inside wasm**, which emit wasm for the host engine to
+//!   compile and link into the running module, or
+//! - **Ahead-of-time compilers built on Cranelift**, such as
+//!   `rustc_codegen_cranelift`, which emit relocatable wasm objects for a
+//!   linker.
+//!
+//! Like Cranelift itself, this crate tries to prioritize compile speed over the
+//! size or performance of generated code. Users may consider incorporating
+//! `wasm-opt` into their toolchain if they need faster or smaller generated
+//! code.
+//!
+//! # Usage
+//!
+//! [`compile_function`] compiles one function. Its output depends on two
+//! inputs:
+//!     1. a [`Config`] describing:
+//!        - the target module's layout,
+//!        - the engine features available, and
+//!        - which optimizations to run; and
+//!     2. an [`Env`] mapping names in the function (callees, symbols, exception tags) to
+//! wasm indices.
+//!
+//! The result is a [`CompiledFunction`] that can be placed in a module in several ways:
+//!
+//! - [`ModuleBuilder`] assembles a module that is either self-contained or
+//!   imports its memory and function table from a host program.
+//! - [`CompiledFunction::to_wasm_function`] produces a
+//!   [`wasm_encoder::Function`] for a module you assemble yourself.
+//! - [`object::ObjectBuilder`] writes a relocatable object for a linker, such as `wasm-ld`
+//!   or `wild` (with [`ModuleLayout::relocatable`] enabled).
+//! - With the `module` feature, `object_module::WasmObjectModule` implements
+//!   `cranelift_module::Module` on top of `ObjectBuilder`.
+//!
+//! Unsupported operations return [`Error::Unsupported`].
 //!
 //! # Example
 //!
