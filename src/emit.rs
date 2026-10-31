@@ -36,7 +36,7 @@ use cranelift_codegen::ir::{
     InstructionData as D, MemFlags, Opcode, SigRef, Signature, StackSlot, Type, Value, ValueDef,
     types,
 };
-use wasm_encoder::{BlockType, Encode, Instruction as I, MemArg, ValType};
+use wasm_encoder::{BlockType, Encode, Instruction as I, MemArg, MemArgTarget, ValType};
 
 /// Saved position on the emitter's active scratch-local stack, returned by
 /// [`Emitter::scratch_mark`] and passed to [`Emitter::free_scratches`].
@@ -525,7 +525,8 @@ impl<'ctx> Emitter<'ctx> {
             } else {
                 0
             },
-            memory_index: self.config.module.memory_index.0,
+            target: MemArgTarget::Memory(self.config.module.memory_index.0),
+            ordering: None,
         }
     }
 

@@ -23,7 +23,7 @@ use alloc::format;
 use cranelift_codegen::ir::{
     AtomicRmwOp, Inst, InstructionData as D, MemFlags, Opcode, Type, types,
 };
-use wasm_encoder::{BlockType, Instruction as I, MemArg, ValType};
+use wasm_encoder::{BlockType, Instruction as I, MemArg, MemArgTarget, Ordering, ValType};
 
 impl Emitter<'_> {
     pub(crate) fn lower_atomic(&mut self, inst: Inst) -> Result<()> {
@@ -41,7 +41,7 @@ impl Emitter<'_> {
             D::NullAry {
                 opcode: Opcode::Fence,
             } => {
-                self.ins(I::AtomicFence);
+                self.ins(I::AtomicFence(Ordering::SeqCst));
                 return Ok(());
             }
             _ if !matches!(ty, types::I8 | types::I16 | types::I32 | types::I64) => {
@@ -108,7 +108,8 @@ impl Emitter<'_> {
         MemArg {
             offset: 0,
             align: ty.bytes().trailing_zeros(),
-            memory_index: self.config.module.memory_index.0,
+            target: MemArgTarget::Memory(self.config.module.memory_index.0),
+            ordering: None,
         }
     }
 
