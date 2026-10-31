@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 2b49a1eb71aa54c10ad38c313b66d2f25ac9b9bf0a0764e1d82af4d96fab2333 # shrinks to (spec, args) = (Spec { tys: [types::F32X2, types::I16, types::I8X8, types::I16X4], blocks: [BlockSpec { ops: [VBitcast(2)], term: Brif(0, Edge { target: 1, args: [2, 2, 7, 1] }, Edge { target: 2, args: [2, 3, 0, 3] }) }, BlockSpec { ops: [Select(18, 24, 27)], term: Return([4, 13, 10, 4]) }, BlockSpec { ops: [CallWrite(6, 211)], term: Jump(Edge { target: 1, args: [21, 28, 1, 2] }) }] }, [I32(1), V64([0, 0, 0, 0, 0, 0, 0, 0]), I16(0), V64([0, 0, 0, 0, 0, 0, 0, 0]), V64([0, 0, 47, 0, 1, 0, 15, 72])])

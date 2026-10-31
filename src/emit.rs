@@ -817,17 +817,18 @@ impl Body {
     /// A relocated index: a 5-byte LEB holding `index` as a placeholder.
     fn uleb(&mut self, kind: RelocKind, index: u32) {
         self.reloc(kind, index, 0);
-        write_padded_uleb(&mut self.bytes, index);
+        self.bytes.extend_from_slice(&padded_leb::<5>(index as i64));
     }
 
     fn sleb32(&mut self, kind: RelocKind, index: u32, addend: i64) {
         self.reloc(kind, index, addend);
-        write_padded_sleb(&mut self.bytes, addend as i32 as i64, 5);
+        self.bytes
+            .extend_from_slice(&padded_leb::<5>(addend as i32 as i64));
     }
 
     fn sleb64(&mut self, kind: RelocKind, index: u32, addend: i64) {
         self.reloc(kind, index, addend);
-        write_padded_sleb(&mut self.bytes, addend, 10);
+        self.bytes.extend_from_slice(&padded_leb::<10>(addend));
     }
 
     fn ins(&mut self, i: I<'_>) {
@@ -851,25 +852,14 @@ impl Body {
     }
 }
 
-/// Write `v` as an unsigned LEB padded to 5 bytes.
-pub(crate) fn write_padded_uleb(out: &mut Vec<u8>, v: u32) {
-    let mut v = v;
-    for i in 0..5 {
-        let byte = (v & 0x7f) as u8;
+/// Returns `v` as a signed LEB padded to `N` bytes.
+pub(crate) fn padded_leb<const N: usize>(mut v: i64) -> [u8; N] {
+    let mut out = [0; N];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = (v & 0x7f) as u8 | if i + 1 < N { 0x80 } else { 0 };
         v >>= 7;
-        out.push(if i < 4 { byte | 0x80 } else { byte });
     }
-}
-
-/// Write `v` as a signed LEB padded to `len` bytes (5 for 32-bit fields, 10
-/// for 64-bit ones).
-pub(crate) fn write_padded_sleb(out: &mut Vec<u8>, v: i64, len: usize) {
-    let mut v = v;
-    for i in 0..len {
-        let byte = (v & 0x7f) as u8;
-        v >>= 7;
-        out.push(if i + 1 < len { byte | 0x80 } else { byte });
-    }
+    out
 }
 
 /// Locals created during emission, after the ones assigned to SSA values:

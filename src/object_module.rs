@@ -181,6 +181,13 @@ pub enum DefineDataError {
         /// The requested alignment in bytes.
         align: u64,
     },
+    /// A relocation's pointer-sized field does not fit in the data object.
+    RelocationOutOfBounds {
+        /// The data object's linkage name.
+        name: String,
+        /// The relocation's offset in bytes.
+        offset: u32,
+    },
 }
 
 impl core::fmt::Display for DefineDataError {
@@ -191,6 +198,12 @@ impl core::fmt::Display for DefineDataError {
             }
             DefineDataError::InvalidAlignment { name, align } => {
                 write!(f, "data {name} has invalid alignment {align}")
+            }
+            DefineDataError::RelocationOutOfBounds { name, offset } => {
+                write!(
+                    f,
+                    "data {name} has a relocation at offset {offset} past its end"
+                )
             }
         }
     }
@@ -590,6 +603,16 @@ impl Module for WasmObjectModule {
                 ));
             }
         };
+        let ptr_size = self.config.module.address_type.bytes();
+        let relocs = data.function_relocs.iter().map(|&(offset, _)| offset);
+        let relocs = relocs.chain(data.data_relocs.iter().map(|&(offset, ..)| offset));
+        for offset in relocs {
+            if !crate::object::reloc_fits(offset, ptr_size, bytes.len()) {
+                return Err(ModuleError::Backend(
+                    DefineDataError::RelocationOutOfBounds { name, offset }.into(),
+                ));
+            }
+        }
         let mutability = if decl.writable {
             Mutability::Mutable
         } else {

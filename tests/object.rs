@@ -26,9 +26,14 @@ fn new_module() -> WasmObjectModule {
 }
 
 fn module_with_imports(import_names: Box<ImportNameFn>) -> WasmObjectModule {
+    module_with(AddressType::I32, import_names)
+}
+
+fn module_with(address_type: AddressType, import_names: Box<ImportNameFn>) -> WasmObjectModule {
     let flags = settings::Flags::new(settings::builder());
-    let isa = object_module::frontend_isa(flags, AddressType::I32).unwrap();
+    let isa = object_module::frontend_isa(flags, address_type).unwrap();
     let mut config = Config::default();
+    config.module.address_type = address_type;
     config.module.demote_multi_results = true;
     WasmObjectModule::new(
         isa,
@@ -554,6 +559,42 @@ fn invalid_data_alignment_is_an_error() {
 }
 
 #[test]
+fn data_relocation_out_of_bounds_is_an_error() {
+    let mut m = new_module();
+    let target = m
+        .declare_data("TARGET", Linkage::Export, false, false)
+        .unwrap();
+    let id = m
+        .declare_data("SHORT", Linkage::Export, false, false)
+        .unwrap();
+    // A 4-byte pointer at offset 1 or 4 extends past the 4 bytes of data.
+    for offset in [1, 4] {
+        let mut d = DataDescription::new();
+        d.define_zeroinit(4);
+        let gv = m.declare_data_in_data(target, &mut d);
+        d.write_data_addr(offset, gv, 0);
+        let err = m.define_data(id, &d).unwrap_err();
+        let ModuleError::Backend(e) = &err else {
+            panic!("expected a backend error, got {err}");
+        };
+        assert_eq!(
+            e.downcast_ref::<DefineDataError>(),
+            Some(&DefineDataError::RelocationOutOfBounds {
+                name: "SHORT".into(),
+                offset
+            }),
+            "a relocation at offset {offset} must be rejected"
+        );
+    }
+    // The failed definitions did not count: a valid one still succeeds.
+    let mut d = DataDescription::new();
+    d.define_zeroinit(4);
+    let gv = m.declare_data_in_data(target, &mut d);
+    d.write_data_addr(0, gv, 0);
+    m.define_data(id, &d).unwrap();
+}
+
+#[test]
 fn failed_function_definition_can_be_retried() {
     let mut m = new_module();
     let i32t = types::I32;
@@ -573,4 +614,71 @@ fn failed_function_definition_can_be_retried() {
         let r = b.ins().iconst(i32t, 7);
         b.ins().return_(&[r]);
     });
+}
+
+/// The address and bytes of each active data segment, in order.
+fn data_segments(wasm: &[u8]) -> Vec<(u64, Vec<u8>)> {
+    let mut out = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        if let wasmparser::Payload::DataSection(s) = payload.unwrap() {
+            for seg in s {
+                let seg = seg.unwrap();
+                let wasmparser::DataKind::Active { offset_expr, .. } = seg.kind else {
+                    panic!("passive data segment");
+                };
+                let addr = match offset_expr.get_operators_reader().read().unwrap() {
+                    wasmparser::Operator::I32Const { value } => value as u32 as u64,
+                    wasmparser::Operator::I64Const { value } => value as u64,
+                    op => panic!("unexpected segment offset {op:?}"),
+                };
+                out.push((addr, seg.data.to_vec()));
+            }
+        }
+    }
+    out
+}
+
+/// Before linking, a relocated field holds the value it would have if the
+/// object were a module of its own, as in LLVM's objects. Linkers overwrite
+/// these fields, so linking cannot check them.
+#[test]
+fn unlinked_data_pointers_hold_object_addresses() {
+    for address_type in [AddressType::I32, AddressType::I64] {
+        let mut m = module_with(address_type, Box::new(|_| None));
+        let ptr_size = match address_type {
+            AddressType::I32 => 4,
+            AddressType::I64 => 8,
+        };
+        let declare = |m: &mut WasmObjectModule, name| {
+            m.declare_data(name, Linkage::Export, false, false).unwrap()
+        };
+        // `FIRST` gives `TARGET` a nonzero address.
+        let first = declare(&mut m, "FIRST");
+        let target = declare(&mut m, "TARGET");
+        let ptr = declare(&mut m, "PTR");
+        for id in [first, target] {
+            let mut d = DataDescription::new();
+            d.define(vec![1; 8].into_boxed_slice());
+            m.define_data(id, &d).unwrap();
+        }
+        let mut d = DataDescription::new();
+        d.define(vec![0; ptr_size].into_boxed_slice());
+        d.set_align(ptr_size as u64);
+        let gv = m.declare_data_in_data(target, &mut d);
+        d.write_data_addr(0, gv, 4);
+        m.define_data(ptr, &d).unwrap();
+        let obj = m.finish();
+
+        // Segments are written in definition order.
+        let segs = data_segments(&obj);
+        let [_, (target_addr, _), (_, ptr_bytes)] = &segs[..] else {
+            panic!("expected three data segments, got {}", segs.len());
+        };
+        assert_ne!(*target_addr, 0, "{address_type:?}: TARGET follows FIRST");
+        let got = match address_type {
+            AddressType::I32 => u32::from_le_bytes(ptr_bytes[..4].try_into().unwrap()).into(),
+            AddressType::I64 => u64::from_le_bytes(ptr_bytes[..8].try_into().unwrap()),
+        };
+        assert_eq!(got, target_addr + 4, "{address_type:?}: PTR = &TARGET + 4");
+    }
 }

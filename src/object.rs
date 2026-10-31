@@ -360,14 +360,24 @@ impl ObjectBuilder {
     ///
     /// # Panics
     ///
-    /// Panics if `data.align` is not a power of two, or if `sym` is not a data
-    /// symbol of this object or is already defined.
+    /// Panics if `data.align` is not a power of two, if a relocation's
+    /// pointer-sized field does not fit in `data.bytes`, or if `sym` is not a
+    /// data symbol of this object or is already defined.
     pub fn define_data(&mut self, sym: SymbolId, data: DataDef) {
         assert!(
             data.align.is_power_of_two(),
             "define_data: alignment {} is not a power of two",
             data.align
         );
+        let ptr_size = self.address_type.bytes();
+        for r in &data.relocs {
+            assert!(
+                reloc_fits(r.offset, ptr_size, data.bytes.len()),
+                "define_data: relocation at offset {} does not fit in {} bytes",
+                r.offset,
+                data.bytes.len()
+            );
+        }
         let n = self.segments.len();
         match &mut self.symbols[sym.0 as usize].kind {
             SymKind::Data { def, .. } => {
@@ -815,22 +825,131 @@ fn custom(out: &mut Vec<u8>, name: &str, payload: &[u8]) {
     .append_to(out);
 }
 
+/// Whether a `size`-byte relocated field at `offset` fits in `len` bytes.
+pub(crate) fn reloc_fits(offset: u32, size: u32, len: usize) -> bool {
+    (offset as usize)
+        .checked_add(size as usize)
+        .is_some_and(|end| end <= len)
+}
+
 /// Overwrite the relocated field of kind `kind` at `at` with `value`.
 fn patch(buf: &mut [u8], at: usize, kind: RelocKind, value: i64) {
     use RelocKind::*;
-    let mut tmp = Vec::new();
+    let mut put = |bytes: &[u8]| buf[at..at + bytes.len()].copy_from_slice(bytes);
     match kind {
         FunctionIndexLeb | TypeIndexLeb | GlobalIndexLeb | TableNumberLeb | TagIndexLeb => {
-            crate::emit::write_padded_uleb(&mut tmp, value as u32)
+            put(&crate::emit::padded_leb::<5>(value as u32 as i64));
         }
         TableIndexSleb | MemoryAddrSleb | MemoryAddrTlsSleb => {
-            crate::emit::write_padded_sleb(&mut tmp, value as i32 as i64, 5)
+            put(&crate::emit::padded_leb::<5>(value as i32 as i64));
         }
         TableIndexSleb64 | MemoryAddrSleb64 | MemoryAddrTlsSleb64 => {
-            crate::emit::write_padded_sleb(&mut tmp, value, 10)
+            put(&crate::emit::padded_leb::<10>(value));
         }
-        TableIndexI32 | MemoryAddrI32 => tmp.extend_from_slice(&(value as u32).to_le_bytes()),
-        TableIndexI64 | MemoryAddrI64 => tmp.extend_from_slice(&(value as u64).to_le_bytes()),
+        TableIndexI32 | MemoryAddrI32 => {
+            put(&(value as u32).to_le_bytes());
+        }
+        TableIndexI64 | MemoryAddrI64 => {
+            put(&(value as u64).to_le_bytes());
+        }
     }
-    buf[at..at + tmp.len()].copy_from_slice(&tmp);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Decode the relocated field of kind `kind` at the start of `field`.
+    /// Returns its value and width in bytes.
+    fn read_field(field: &[u8], kind: RelocKind) -> (i64, usize) {
+        use RelocKind::*;
+        let mut r = wasmparser::BinaryReader::new(field, 0);
+        let (value, width) = match kind {
+            FunctionIndexLeb | TypeIndexLeb | GlobalIndexLeb | TableNumberLeb | TagIndexLeb => {
+                (r.read_var_u32().unwrap().into(), 5)
+            }
+            TableIndexSleb | MemoryAddrSleb | MemoryAddrTlsSleb => {
+                (r.read_var_i32().unwrap().into(), 5)
+            }
+            TableIndexSleb64 | MemoryAddrSleb64 | MemoryAddrTlsSleb64 => {
+                (r.read_var_i64().unwrap(), 10)
+            }
+            TableIndexI32 | MemoryAddrI32 => {
+                let bytes = field[..4].try_into().unwrap();
+                return (u32::from_le_bytes(bytes).into(), 4);
+            }
+            TableIndexI64 | MemoryAddrI64 => {
+                let bytes = field[..8].try_into().unwrap();
+                return (i64::from_le_bytes(bytes), 8);
+            }
+        };
+        assert_eq!(
+            r.current_position(),
+            width,
+            "{kind:?}: LEB padded to full width"
+        );
+        (value, width)
+    }
+
+    /// `patch` writes exactly the field of each relocation kind. The buffer
+    /// starts nonzero so that a field left unwritten cannot pass.
+    #[test]
+    fn patch_writes_every_kind() {
+        use RelocKind::*;
+        // `read_field` matches exhaustively; add new kinds here too.
+        let kinds = [
+            FunctionIndexLeb,
+            TypeIndexLeb,
+            GlobalIndexLeb,
+            TableNumberLeb,
+            TagIndexLeb,
+            TableIndexSleb,
+            MemoryAddrSleb,
+            MemoryAddrTlsSleb,
+            TableIndexSleb64,
+            MemoryAddrSleb64,
+            MemoryAddrTlsSleb64,
+            TableIndexI32,
+            MemoryAddrI32,
+            TableIndexI64,
+            MemoryAddrI64,
+        ];
+        let at = 3;
+        for kind in kinds {
+            let wide = matches!(
+                kind,
+                TableIndexSleb64
+                    | MemoryAddrSleb64
+                    | MemoryAddrTlsSleb64
+                    | TableIndexI64
+                    | MemoryAddrI64
+            );
+            // 0x8000_0010 is a 32-bit address that a signed LEB stores as
+            // a negative `i32`.
+            let values: [i64; 2] = if wide {
+                [0x1234_5678_9abc_def0, -0x10]
+            } else {
+                [0x1234_5678, 0x8000_0010]
+            };
+            for value in values {
+                let mut buf = [0xaa; 16];
+                patch(&mut buf, at, kind, value);
+                // Decoding also checks the LEB is well formed, including
+                // the sign bits of its last byte.
+                let (got, width) = read_field(&buf[at..], kind);
+                if wide {
+                    assert_eq!(got, value, "{kind:?}: field value");
+                } else {
+                    assert_eq!(got as u32, value as u32, "{kind:?}: field value");
+                }
+                assert!(
+                    buf[..at]
+                        .iter()
+                        .chain(&buf[at + width..])
+                        .all(|&b| b == 0xaa),
+                    "{kind:?}: bytes outside the field are untouched"
+                );
+            }
+        }
+    }
 }

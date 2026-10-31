@@ -83,6 +83,14 @@ impl AddressType {
             AddressType::I64 => ValType::I64,
         }
     }
+
+    /// The size of an address in bytes.
+    pub(crate) fn bytes(self) -> u32 {
+        match self {
+            AddressType::I32 => 4,
+            AddressType::I64 => 8,
+        }
+    }
 }
 
 /// Wasm features available in the target engine.
