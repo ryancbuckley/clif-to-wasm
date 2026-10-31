@@ -12,8 +12,6 @@
 //! pointer width so frontends can query pointer size, endianness, and shared
 //! flags.
 
-#![allow(clippy::result_large_err, clippy::type_complexity)]
-
 use crate::object::{
     Binding, DataDef, DataReloc, DataStorage, Mutability, ObjectBuilder, SymbolFlags, SymbolId,
 };
@@ -29,13 +27,18 @@ use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::entity::SecondaryMap;
 use cranelift_codegen::ir::{self, ExternalName, InstructionData, LibCall, Opcode};
 use cranelift_codegen::isa::{OwnedTargetIsa, TargetIsa};
-use cranelift_codegen::{CodegenError, Context, settings};
+use cranelift_codegen::{CodegenError, CodegenResult, Context, settings};
 use cranelift_module::{
     DataDescription, DataId, FuncId, Init, Linkage, Module, ModuleDeclarations, ModuleError,
     ModuleReloc, ModuleRelocTarget, ModuleResult,
 };
 use hashbrown::HashMap;
 use wasm_encoder::ValType;
+
+/// Maps an imported function's symbol name to the wasm module name and field name it will
+/// be imported as. Returns None to keep the default import name and import the function
+/// from the module `env`.
+pub type ImportNameFn = dyn Fn(&str) -> Option<(String, String)> + Send + Sync;
 
 /// The wasm features LLVM declares for `wasm32-wasip1-threads` objects; a
 /// linker producing shared memory requires `atomics` and `bulk-memory`.
@@ -56,18 +59,18 @@ pub const THREADS_FEATURES: &[&str] = &[
 ///
 /// # Errors
 ///
-/// Returns [`ModuleError::Compilation`] if Pulley rejects `flags`.
+/// Returns a [`CodegenError`] if Pulley rejects `flags`.
 pub fn frontend_isa(
     flags: settings::Flags,
     address_type: AddressType,
-) -> ModuleResult<OwnedTargetIsa> {
+) -> CodegenResult<OwnedTargetIsa> {
     let name = match address_type {
         AddressType::I32 => "pulley32",
         AddressType::I64 => "pulley64",
     };
     let builder = cranelift_codegen::isa::lookup_by_name(name)
-        .map_err(|e| ModuleError::Compilation(CodegenError::Unsupported(e.to_string())))?;
-    builder.finish(flags).map_err(ModuleError::Compilation)
+        .map_err(|e| CodegenError::Unsupported(e.to_string()))?;
+    builder.finish(flags)
 }
 
 /// Settings for a [`WasmObjectModule`].
@@ -87,10 +90,10 @@ pub struct ObjectOptions {
     pub stub_unsupported: bool,
     /// The symbol names of libcalls.
     pub libcall_names: Box<dyn Fn(LibCall) -> String + Send + Sync>,
-    /// For the symbol name of an imported function, the wasm module and
-    /// field to import it as, if not `env` and the symbol name (Rust's
-    /// `#[link(wasm_import_module = "...")]`).
-    pub import_names: Box<dyn Fn(&str) -> Option<(String, String)> + Send + Sync>,
+    /// Overrides where imported functions come from, for those not imported
+    /// from module `env` under their symbol name (as with Rust's
+    /// `#[link(wasm_import_module = "...")]`). See [`ImportNameFn`].
+    pub import_names: Box<ImportNameFn>,
 }
 
 impl Default for ObjectOptions {
@@ -137,7 +140,7 @@ pub struct WasmObjectModule {
     threads: bool,
     stub_unsupported: bool,
     libcall_names: Box<dyn Fn(LibCall) -> String + Send + Sync>,
-    import_names: Box<dyn Fn(&str) -> Option<(String, String)> + Send + Sync>,
+    import_names: Box<ImportNameFn>,
     funcs: SecondaryMap<FuncId, Option<SymbolId>>,
     data: SecondaryMap<DataId, Option<SymbolId>>,
     defined_funcs: SecondaryMap<FuncId, bool>,
@@ -196,7 +199,18 @@ impl core::fmt::Display for DefineDataError {
 impl core::error::Error for DefineDataError {}
 
 fn unsupported_err(msg: impl Into<String>) -> ModuleError {
-    ModuleError::Compilation(CodegenError::Unsupported(msg.into()))
+    Error::Unsupported(msg.into()).into()
+}
+
+/// Wraps the error in [`ModuleError::Compilation`] as [`CodegenError::Unsupported`].
+impl From<Error> for ModuleError {
+    fn from(e: Error) -> Self {
+        let msg = match e {
+            Error::Unsupported(msg) => msg,
+            env @ Error::Env(_) => env.to_string(),
+        };
+        ModuleError::Compilation(CodegenError::Unsupported(msg))
+    }
 }
 
 fn flags_for(linkage: Linkage) -> SymbolFlags {
@@ -264,12 +278,11 @@ impl WasmObjectModule {
         &self.warnings
     }
 
-    fn wasm_sig(&self, sig: &ir::Signature) -> ModuleResult<(Vec<ValType>, Vec<ValType>)> {
+    fn wasm_sig(&self, sig: &ir::Signature) -> Result<(Vec<ValType>, Vec<ValType>)> {
         wasm_types::wasm_signature(sig, &self.config.module)
-            .map_err(|e| unsupported_err(e.to_string()))
     }
 
-    fn func_symbol(&mut self, id: FuncId) -> ModuleResult<SymbolId> {
+    fn func_symbol(&mut self, id: FuncId) -> Result<SymbolId> {
         if let Some(s) = self.funcs[id] {
             return Ok(s);
         }
@@ -309,7 +322,7 @@ impl WasmObjectModule {
         s
     }
 
-    fn libcall_symbol(&mut self, lc: LibCall, sig: &ir::Signature) -> ModuleResult<SymbolId> {
+    fn libcall_symbol(&mut self, lc: LibCall, sig: &ir::Signature) -> Result<SymbolId> {
         if let Some(&s) = self.libcalls.get(&lc) {
             return Ok(s);
         }
@@ -322,7 +335,7 @@ impl WasmObjectModule {
         Ok(s)
     }
 
-    fn reloc_target(&mut self, target: &ModuleRelocTarget) -> ModuleResult<SymbolId> {
+    fn reloc_target(&mut self, target: &ModuleRelocTarget) -> Result<SymbolId> {
         match *target {
             ModuleRelocTarget::User {
                 namespace: 0,
@@ -332,7 +345,7 @@ impl WasmObjectModule {
                 namespace: 1,
                 index,
             } => Ok(self.data_symbol(DataId::from_u32(index))),
-            ref t => Err(unsupported_err(format!("relocation to {t}"))),
+            ref t => Err(Error::Unsupported(format!("relocation to {t}"))),
         }
     }
 
@@ -373,7 +386,7 @@ struct ObjEnv<'module> {
 
 impl ObjEnv<'_> {
     fn symbol(&mut self, name: Name<'_>) -> Result<SymbolId> {
-        let r = match name {
+        match name {
             Name::User(u) if u.namespace == 0 => self.m.func_symbol(FuncId::from_u32(u.index)),
             Name::User(u) if u.namespace == 1 => Ok(self.m.data_symbol(DataId::from_u32(u.index))),
             Name::LibCall(lc) => self
@@ -381,10 +394,9 @@ impl ObjEnv<'_> {
                 .libcalls
                 .get(&lc)
                 .copied()
-                .ok_or_else(|| unsupported_err(format!("libcall {lc}"))),
-            _ => Err(unsupported_err(format!("reference to {name}"))),
-        };
-        r.map_err(|e| Error::Env(e.to_string()))
+                .ok_or_else(|| Error::Env(format!("undeclared libcall {lc}"))),
+            _ => Err(Error::Env(format!("reference to {name}"))),
+        }
     }
 }
 
