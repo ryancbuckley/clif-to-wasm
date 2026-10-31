@@ -131,7 +131,7 @@ impl_export!(TagIndex, Tag);
 /// # wasmparser::validate(&wasm)?;
 /// # Ok::<(), wasmparser::BinaryReaderError>(())
 /// ```
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ModuleBuilder {
     types: Vec<(Vec<ValType>, Vec<ValType>)>,
     imports: Vec<(String, String, EntityType)>,
@@ -154,7 +154,7 @@ pub struct ModuleBuilder {
 /// In every WebAssembly index space, imports precede definitions, so all
 /// imports of a given kind must be registered before any definition of that
 /// kind; otherwise indices already handed out would shift.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct IndexSpace<Idx, D, I = ()> {
     imported: Vec<I>,
     defined: Vec<D>,

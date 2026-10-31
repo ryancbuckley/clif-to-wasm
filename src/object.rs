@@ -171,7 +171,7 @@ impl DataDef {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum SymKind {
     Func {
         ty: TypeIndex,
@@ -190,7 +190,7 @@ enum SymKind {
     Table,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Symbol {
     name: String,
     flags: SymbolFlags,
@@ -200,7 +200,7 @@ struct Symbol {
     import: Option<(String, String)>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Segment {
     symbol: SymbolId,
     def: DataDef,
@@ -226,7 +226,7 @@ struct Segment {
 /// # wasmparser::validate(&object_file)?;
 /// # Ok::<(), wasmparser::BinaryReaderError>(())
 /// ```
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ObjectBuilder {
     address_type: AddressType,
     types: Vec<(Vec<ValType>, Vec<ValType>)>,
