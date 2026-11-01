@@ -2,12 +2,18 @@
 name = "clif-to-wasm"
 version = "0.1.0"
 edition = "2024"
+# Cranelift 0.137 requires 1.97.
+rust-version = "1.97"
 description = "A WebAssembly backend for Cranelift IR"
 readme = "README.md"
 repository = "https://github.com/ryancbuckley/clif-to-wasm"
 license = "Apache-2.0 WITH LLVM-exception"
 keywords = ["cranelift", "wasm", "webassembly", "compiler", "jit"]
 categories = ["compilers", "wasm"]
+
+[package.metadata.docs.rs]
+# Document `object_module` too, which needs the `module` feature.
+all-features = true
 
 [dependencies]
 cranelift-codegen = { version = "0.137.1", default-features = false }
