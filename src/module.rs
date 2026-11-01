@@ -340,9 +340,10 @@ impl ModuleBuilder {
     /// `func` differs from the declared one.
     pub fn define_function(&mut self, index: FuncIndex, func: CompiledFunction) {
         let (ty, body) = self.funcs.defined_mut(index);
+        let (params, results) = &self.types[ty.0 as usize];
         assert_eq!(
-            self.types[ty.0 as usize],
-            (func.params.clone(), func.results.clone()),
+            (params, results),
+            (&func.params, &func.results),
             "define_function: {index:?} defined with a signature other than its declared one"
         );
         *body = Some(func);
