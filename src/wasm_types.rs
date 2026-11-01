@@ -43,7 +43,7 @@ pub fn wasm_type(ty: Type) -> Result<ValType> {
 }
 
 /// Maps a dynamic vector type (e.g. `i32x4*gv0`) to its fixed-size base vector
-/// (scale 1), or return `ty` unchanged.
+/// (scale 1), or returns `ty` unchanged.
 pub(crate) fn fixed_type(ty: Type) -> Type {
     if ty.is_dynamic_vector() {
         ty.dynamic_to_vector().unwrap_or(ty)

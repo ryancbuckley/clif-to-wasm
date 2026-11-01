@@ -809,8 +809,8 @@ impl ObjectBuilder {
     }
 }
 
-/// Appends a section or a linking subsection with its id the payload length,
-/// and finally the payload bytes.
+/// Appends a section or a linking subsection: its id, the payload length, and
+/// then the payload.
 fn section(out: &mut Vec<u8>, id: u8, payload: &[u8]) {
     out.push(id);
     (payload.len() as u32).encode(out);

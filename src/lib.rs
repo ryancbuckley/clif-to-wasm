@@ -10,21 +10,21 @@
 //!   `rustc_codegen_cranelift`, which emit relocatable wasm objects for a
 //!   linker.
 //!
-//! Like Cranelift itself, this crate tries to prioritize compile speed over the
-//! size or performance of generated code. Users may consider incorporating
-//! `wasm-opt` into their toolchain if they need faster or smaller generated
-//! code.
+//! Like Cranelift itself, this crate prioritizes compile speed over the size or
+//! performance of generated code. Users may consider incorporating `wasm-opt`
+//! into their toolchain if they need faster or smaller generated code.
 //!
 //! # Usage
 //!
 //! [`compile_function`] compiles one function. Its output depends on two
 //! inputs:
-//!     1. a [`Config`] describing:
-//!        - the target module's layout,
-//!        - the engine features available, and
-//!        - which optimizations to run; and
-//!     2. an [`Env`] mapping names in the function (callees, symbols, exception tags) to
-//! wasm indices.
+//!
+//!   1. a [`Config`] describing:
+//!      - the target module's layout,
+//!      - the engine features available, and
+//!      - which optimizations to run; and
+//!   2. an [`Env`] mapping names in the function (callees, symbols, exception tags) to
+//!      wasm indices.
 //!
 //! The result is a [`CompiledFunction`] that can be placed in a module in several ways:
 //!

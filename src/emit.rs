@@ -848,7 +848,8 @@ impl Body {
     }
 }
 
-/// Returns `v` as a signed LEB padded to `N` bytes.
+/// Returns `v` as a signed LEB padded to `N` bytes. With `N` = 5, a `u32`
+/// encodes the same as an unsigned LEB: it is non-negative and fits in 35 bits.
 pub(crate) fn padded_leb<const N: usize>(mut v: i64) -> [u8; N] {
     let mut out = [0; N];
     for (i, b) in out.iter_mut().enumerate() {

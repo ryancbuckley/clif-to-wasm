@@ -2,7 +2,7 @@
 
 A WebAssembly backend for [Cranelift](https://cranelift.dev).
 
-Compiles a Cranelift IR (CLIF) [`Function`] into a WebAssembly (wasm) function body,
+Compiles a Cranelift IR (CLIF) [`Function`](https://docs.rs/cranelift-codegen/latest/cranelift_codegen/ir/function/struct.Function.html) into a WebAssembly (wasm) function body,
 so anything that produces CLIF can target wasm. This may be useful for building:
 
 - a JIT running inside wasm that emits wasm for the host engine to compile
@@ -118,7 +118,7 @@ LLVM-compiled code (such as Rust's standard library):
   a C-layout return area and return nothing (`src/legalize_abi.rs`). Otherwise,
   wasm multi-value returns are used.
 
-## Unsupported features (return `Error::Unsupported`):
+## Unsupported features (return `Error::Unsupported`)
 - `f128` arithmetic and conversions (handled via libcalls in Cranelift).
 - `umulhi`/`smulhi` on `i128`.
 - Big-endian vector loads, stores, and bitcasts; `f16` vector arithmetic.
@@ -318,4 +318,4 @@ cargo run --example runclif  -- tests/clif/control.clif
   main remaining lever.
 
 ## Additional Disclaimer
-This project is not affiliated with the ByteCode Alliance, wasmtime, Cranelift, my current employer, or any of my previous employers.
+This project is not affiliated with the Bytecode Alliance, wasmtime, Cranelift, my current employer, or any of my previous employers.

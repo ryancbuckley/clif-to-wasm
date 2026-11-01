@@ -511,8 +511,9 @@ impl Module for WasmObjectModule {
         }
         let func = &mut ctx.func;
         if !self.threads {
+            // Without threads there is one copy of thread-local data. Through
+            // `stencil`, `layout` and `dfg` can be borrowed separately.
             let f = &mut func.stencil;
-            // Without threads there is one copy of thread-local data.
             for b in f.layout.blocks() {
                 for inst in f.layout.block_insts(b) {
                     if let InstructionData::UnaryGlobalValue { opcode, .. } = &mut f.dfg.insts[inst]
