@@ -2,29 +2,36 @@
 
 A WebAssembly backend for [Cranelift](https://cranelift.dev).
 
-It compiles a Cranelift IR (CLIF) [`Function`](https://docs.rs/cranelift-codegen/latest/cranelift_codegen/ir/function/struct.Function.html)
-into a WebAssembly (wasm) function body, so anything that produces CLIF can
-target wasm. That could be a JIT running inside wasm that emits code for the
-host engine to compile and link into the running module, or an ahead-of-time
-compiler that emits relocatable wasm objects for a linker. The
-[in-browser Rust playground](https://ryancbuckley.github.io/rust-playground-inbrowser-site)
-is an example of the second: it compiles and runs Rust entirely in the browser
-using `rustc_codegen_cranelift` and this crate.
+This crate compiles a Cranelift IR (CLIF)
+[`Function`](https://docs.rs/cranelift-codegen/latest/cranelift_codegen/ir/function/struct.Function.html)
+into a WebAssembly (wasm) function body, so any language that can be compiled to
+CLIF can run on wasm.
 
-Like Cranelift itself, this crate favors compile speed over the size and speed
-of the code it generates. Run `wasm-opt` on the output if you need faster or
-smaller code.
+One use case is ahead-of-time compilation to emit relocatable `.o` wasm object
+files and link them with `wasm-ld` or `wild`. For example, the
+[in-browser Rust playground](https://ryancbuckley.github.io/rust-playground-inbrowser-site)
+uses `rustc_codegen_cranelift` with this crate to compile and run Rust code in
+the browser.
+
+Another use case is JIT compilation inside WebAssembly: a program running in a
+wasm engine can compile CLIF to a wasm module at runtime and ask the host engine
+to instantiate it.
+
+Like Cranelift itself, this crate favors fast compilation over optimal output
+performance. If you need smaller or faster wasm, you might consider running
+`wasm-opt` on the output.
 
 ## Usage
 
-Compile a function and assemble it into a module with `ModuleBuilder`:
+Compile a CLIF function and package it into a runnable wasm module with
+`ModuleBuilder`:
 
 ```rust
 use clif_to_wasm::{
     Config, Env, Error, FuncIndex, ModuleBuilder, Name, compile_function, wasm_signature,
 };
 
-// Our CLIF code doesn't call anything, so the environment resolves no names.
+// Our CLIF code doesn't call any other functions, so its environment resolves no names.
 struct NoCalls;
 impl Env for NoCalls {
     fn func_index(&mut self, name: Name<'_>) -> clif_to_wasm::Result<FuncIndex> {
@@ -33,8 +40,7 @@ impl Env for NoCalls {
 }
 
 fn build_module() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    // Frontends usually build functions with `cranelift-frontend`; this one is
-    // parsed from text with `cranelift-reader`.
+    // Compilers usually build IR with `cranelift-frontend`; here we parse text.
     let funcs = cranelift_reader::parse_functions(
         "function %add(i32, i32) -> i32 {
          block0(v0: i32, v1: i32):
@@ -54,76 +60,82 @@ fn build_module() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 }
 ```
 
-`Env` maps names in the function to wasm indices. Only `func_index` is
-required; functions that use `call_indirect`, `func_addr`, `symbol_value`, or
-`try_call` handlers also need `type_index`, `func_table_slot`, `symbol_value`,
-or `exception_tag` respectively.
+`compile_function` takes two things alongside the CLIF `Function`:
 
-`ModuleBuilder` assembles a module whose indices match your `Config` and `Env`.
-It can build a self-contained module with its own memory, globals and function
-table, or a module that imports the host's memory, table and stack pointer, as
-a JIT inside wasm would (see `tests/module.rs`). To assemble the module
-yourself, `CompiledFunction::to_wasm_function` returns a
-`wasm_encoder::Function`.
+- [`Config`](https://docs.rs/clif-to-wasm/latest/clif_to_wasm/struct.Config.html):
+  describes the target module layout (`ModuleLayout`, such as which global holds
+  the stack pointer and which table holds function pointers), engine features
+  (`EngineFeatures`), and compiler optimizations (`Optimizations`).
+- [`Env`](https://docs.rs/clif-to-wasm/latest/clif_to_wasm/trait.Env.html):
+  a trait you implement to resolve external references in the function (callee
+  functions, global symbols, indirect call signatures, and exception tags) to
+  wasm indices. Only `Env::func_index` is required if the function does not use
+  indirect calls, global symbols, or exceptions.
 
-`Config` describes the module the code will live in (`ModuleLayout`: which
-memory, table and globals to use, and so on), which wasm features the engine
-supports (`EngineFeatures`), and which optimizations to run (`Optimizations`,
-all on by default). For example, `config.module.stack_pointer_global = Some(sp)`
-enables stack slots and `config.module.table_index = Some(t)` enables
-`call_indirect`. The [API docs](https://docs.rs/clif-to-wasm) describe each
-setting.
+Once compiled, a `CompiledFunction` can be turned into wasm in a few ways:
 
-## Relocatable objects
+- `ModuleBuilder` builds a standalone wasm module (defining its own memory,
+  globals, and function table) or a JIT module that imports them from a host
+  instance (see `tests/module.rs`).
+- `CompiledFunction::to_wasm_function` returns a `wasm_encoder::Function` if you
+  are assembling a module yourself with `wasm-encoder`.
+- `object::ObjectBuilder` writes a relocatable `.o` wasm file for a linker.
 
-With `ModuleLayout::relocatable` set, the output follows the
-[WebAssembly linking conventions] used by `wasm-ld` and `wild`, and
-`object::ObjectBuilder` writes it out as a relocatable object file. The `module`
-Cargo feature adds `object_module::WasmObjectModule`, a
-`cranelift_module::Module` that compiles functions into such an object; this
-is what `rustc_codegen_cranelift` uses to compile Rust to wasm.
+## Relocatable object files and `cranelift-module`
 
-Calls follow LLVM's Basic C ABI for WebAssembly, so the output can link with
-LLVM-compiled code such as Rust's standard library. Set
-`ModuleLayout::demote_multi_results` when linking with LLVM code, which returns
-multiple values through memory rather than with wasm multi-value returns.
+When `config.module.relocatable` is enabled, `compile_function` emits
+relocation records (`CompiledFunction::relocs`) for function calls, globals,
+memory addresses, and table indices, following the
+[WebAssembly tool conventions](https://github.com/WebAssembly/tool-conventions/blob/main/Linking.md)
+expected by `wasm-ld` and `wild`.
 
-[WebAssembly linking conventions]: https://github.com/WebAssembly/tool-conventions/blob/main/Linking.md
+Enabling the `module` Cargo feature provides `object_module::WasmObjectModule`,
+an implementation of `cranelift_module::Module` built on `ObjectBuilder`.
+Existing `cranelift-module` frontends (such as `rustc_codegen_cranelift`) can
+plug it in directly to emit wasm object files.
 
-## Unsupported features
+Function calls follow LLVM's Basic C ABI for WebAssembly so output can be linked
+with C or Rust code compiled by LLVM. When linking with LLVM-compiled code, set
+`config.module.demote_multi_results = true` so functions with multiple return
+values pass them through a return pointer in linear memory, matching LLVM's C
+ABI.
+
+## Unsupported CLIF features
 
 These return `Error::Unsupported`:
 
-- `f128` arithmetic and conversions (handled via libcalls in Cranelift).
-- `umulhi`/`smulhi` on `i128`.
+- `f128` arithmetic and conversions (Cranelift frontends lower these to libcalls).
+- `umulhi` and `smulhi` on `i128`.
 - Big-endian vector loads, stores, and bitcasts; `f16` vector arithmetic.
-- `try_call` with `i128`/`f128` arguments, results, or payloads, or with
-  by-value struct arguments; `catch_all` handlers that use the payload.
-- Tail calls with by-value struct arguments.
+- `try_call` with `i128`/`f128` arguments, results, or exception payloads, or
+  with by-value struct arguments; `catch_all` blocks that read a payload.
+- Tail calls (`return_call`, `return_call_indirect`) with by-value struct
+  arguments.
 - Dynamic stack slots, stack slots aligned to more than 16 bytes, and
   `get_return_address`.
-- In relocatable objects: `try_call`. `WasmObjectModule` also rejects `i128`
-  atomics, as it sets no `atomic_lock_table_addr`.
+- `try_call` in relocatable object files (`wasm-ld` does not yet support the
+  required tag relocations).
 
 ## Testing
 
 ```sh
 cargo test --release                     # CLIF runtests + differential fuzzing
-cargo test --release --features module   # also tests relocatable objects with rust-lld
+cargo test --release --features module   # also links object files with rust-lld
 
-# Cranelift's upstream runtests (wasmtime v50.0.1 matches Cranelift 0.137.1):
+# Run Cranelift's upstream test suite (wasmtime v50.0.1 matches Cranelift 0.137.1):
 git clone --depth 1 --branch v50.0.1 --filter=blob:none --sparse \
     https://github.com/bytecodealliance/wasmtime
 (cd wasmtime && git sparse-checkout set cranelift/filetests/filetests/runtests)
 cargo run --release --example upstream -- wasmtime/cranelift/filetests/filetests/runtests
 
-# See what a function compiles to:
+# Print the WAT a CLIF file compiles to:
 cargo run --example clif2wat -- tests/clif/control.clif fib
 ```
 
-[ARCHITECTURE.md](ARCHITECTURE.md) describes how the backend works, with an
-annotated example, and what each test covers.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for a walkthrough of the compiler passes,
+an annotated CLIF-to-WAT example, and details on the test suite.
 
 ## Disclaimer
 
-This project is not affiliated with the Bytecode Alliance, wasmtime, Cranelift, my current employer, or any of my previous employers.
+This project is not affiliated with the Bytecode Alliance, Wasmtime, Cranelift,
+my current employer, or any of my previous employers.
