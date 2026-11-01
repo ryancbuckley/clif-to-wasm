@@ -716,7 +716,6 @@ mod tests {
 
                     // Walk instructions in `b` backwards.
                     let mut cur = out_set;
-                    let term = func.layout.last_inst(b).unwrap();
                     // At terminator, remove block-arg uses that were added in `out_set`
                     // and re-apply terminator operands accurately.
                     for inst in func.layout.block_insts(b).rev() {
@@ -736,7 +735,6 @@ mod tests {
                                 }
                             }
                         }
-                        let _ = term;
                     }
                     if b == info.rpo[0] {
                         for &p in func.dfg.block_params(b) {
