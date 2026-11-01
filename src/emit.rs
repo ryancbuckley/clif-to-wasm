@@ -624,7 +624,6 @@ impl<'ctx> Emitter<'ctx> {
         let mut byval = self.byval_base;
         let mut copies = Vec::new();
         for i in 0..n {
-            self.operand()?;
             let p = sig.params.get(i);
             if let Some(&AbiParam {
                 purpose: ArgumentPurpose::StructArgument(size),
@@ -635,12 +634,8 @@ impl<'ctx> Emitter<'ctx> {
                 if tail {
                     return error::unsupported("tail call with a by-value struct argument");
                 }
-                // The address in the memory's address type.
-                match (self.config.module.address_type, value_type) {
-                    (AddressType::I32, types::I64) => self.ins(I::I32WrapI64),
-                    (AddressType::I64, types::I32) => self.ins(I::I64ExtendI32U),
-                    _ => {}
-                }
+                // The struct's address, in the memory's address type.
+                self.address()?;
                 let src = self.scratch(self.config.module.ptr_ty());
                 self.local_set(src);
                 copies.push(ByvalCopy {
@@ -652,6 +647,7 @@ impl<'ctx> Emitter<'ctx> {
                 self.ptr_to(value_type)?;
                 byval += size.next_multiple_of(16);
             } else {
+                self.operand()?;
                 self.extend_for_abi(p);
             }
         }
