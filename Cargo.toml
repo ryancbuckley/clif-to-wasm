@@ -1,6 +1,6 @@
 [package]
 name = "clif-to-wasm"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 # Cranelift 0.137 requires 1.97.
 rust-version = "1.97"
