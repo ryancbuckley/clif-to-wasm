@@ -808,15 +808,17 @@ impl Emitter<'_> {
     /// lanes when `src` is narrower than 128 bits: `[x.., y..]`.
     fn join_narrowed(&mut self, src: Type) -> Result<()> {
         let n = src.lane_count();
-        let full = 16 / Lane::of(src)?.bytes();
+        let src_lane_bytes = Lane::of(src)?.bytes();
+        let full = 16 / src_lane_bytes;
         if n < full {
             let s = self.scratch(ValType::V128);
-            // The result's lanes are half the size: `full` of them per
-            // input.
-            let bytes = Lane::of(src)?.bytes() / 2;
             self.local_tee(s);
             self.local_get(s);
-            self.ins(I::I8x16Shuffle(shuffle_bytes(bytes, |i| {
+            // The narrowing put each input in its own half of the result
+            // (`full` lanes each), but only the first `n` lanes of each half
+            // are used. Move the second input's `n` lanes (from lane `full`)
+            // down to follow the first's.
+            self.ins(I::I8x16Shuffle(shuffle_bytes(src_lane_bytes / 2, |i| {
                 if i < n { i } else { full + i - n }
             })));
         }
