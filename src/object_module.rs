@@ -302,8 +302,7 @@ impl WasmObjectModule {
         let decl = self.declarations.get_function_decl(id);
         let name = decl.linkage_name(id).into_owned();
         let flags = flags_for(decl.linkage);
-        let sig = decl.signature.clone();
-        let (p, r) = self.wasm_sig(&sig)?;
+        let (p, r) = self.wasm_sig(&decl.signature)?;
         let import = match decl.linkage {
             Linkage::Import => (self.import_names)(&name),
             _ => None,
@@ -512,11 +511,11 @@ impl Module for WasmObjectModule {
         }
         let func = &mut ctx.func;
         if !self.threads {
+            let f = &mut func.stencil;
             // Without threads there is one copy of thread-local data.
-            for b in func.layout.blocks().collect::<Vec<_>>() {
-                for inst in func.layout.block_insts(b).collect::<Vec<_>>() {
-                    if let InstructionData::UnaryGlobalValue { opcode, .. } =
-                        &mut func.dfg.insts[inst]
+            for b in f.layout.blocks() {
+                for inst in f.layout.block_insts(b) {
+                    if let InstructionData::UnaryGlobalValue { opcode, .. } = &mut f.dfg.insts[inst]
                         && *opcode == Opcode::TlsValue
                     {
                         *opcode = Opcode::SymbolValue;
@@ -538,13 +537,8 @@ impl Module for WasmObjectModule {
             Ok(c) => c,
             Err(e) if self.stub_unsupported => {
                 self.warnings.push(format!("{name}: {e}"));
-                let (params, results) = self.wasm_sig(
-                    &self
-                        .declarations
-                        .get_function_decl(func_id)
-                        .signature
-                        .clone(),
-                )?;
+                let (params, results) =
+                    self.wasm_sig(&self.declarations.get_function_decl(func_id).signature)?;
                 CompiledFunction {
                     params,
                     results,
