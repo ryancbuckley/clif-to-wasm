@@ -5,7 +5,10 @@
 //! Functions are compiled as they are defined with
 //! [`crate::ModuleLayout::relocatable`] enabled. Like LLVM objects, the output
 //! imports `__stack_pointer`, `__indirect_function_table`, and (when threads
-//! are enabled) `__tls_base` from the linker.
+//! are enabled) `__tls_base` from the linker. With
+//! [`ObjectOptions::stack_limit`] enabled, it also imports a `__stack_limit`
+//! global for stack-overflow checks (which the runtime must provide, as LLVM
+//! does not define one).
 //!
 //! Because Cranelift has no built-in wasm `TargetIsa` and external crates
 //! cannot implement one, [`frontend_isa`] provides the Pulley ISA of matching
@@ -76,13 +79,18 @@ pub fn frontend_isa(
 /// Settings for a [`WasmObjectModule`].
 pub struct ObjectOptions {
     /// Code generation settings. The module sets the relocatable layout
-    /// (`ModuleLayout::relocatable`, the stack pointer, table and TLS base);
+    /// (`ModuleLayout::relocatable`, the stack pointer and limit, table and
+    /// TLS base);
     /// set `module.demote_multi_results` to link with LLVM-compiled code.
     pub config: Config,
     /// Whether the object is for a program with threads (shared memory):
     /// thread-local data then lives in TLS segments, addressed from
     /// `__tls_base`. Otherwise it is ordinary data.
     pub threads: bool,
+    /// Emit stack-overflow checks against an imported `__stack_limit` global
+    /// before allocating shadow stack frames; see
+    /// [`ModuleLayout::stack_limit_global`](crate::ModuleLayout::stack_limit_global).
+    pub stack_limit: bool,
     /// The wasm features to declare in the `target_features` section.
     pub features: Vec<String>,
     /// Define functions this backend cannot compile as traps instead of
@@ -97,12 +105,14 @@ pub struct ObjectOptions {
 }
 
 impl Default for ObjectOptions {
-    /// Single-threaded, no declared features, unsupported functions fail,
-    /// Cranelift's default libcall names, and every import from `env`.
+    /// Single-threaded, no stack limit, no declared features, unsupported
+    /// functions fail, Cranelift's default libcall names, and every import
+    /// from `env`.
     fn default() -> Self {
         ObjectOptions {
             config: Config::default(),
             threads: false,
+            stack_limit: false,
             features: Vec::new(),
             stub_unsupported: false,
             libcall_names: cranelift_module::default_libcall_names(),
@@ -116,6 +126,7 @@ impl core::fmt::Debug for ObjectOptions {
         f.debug_struct("ObjectOptions")
             .field("config", &self.config)
             .field("threads", &self.threads)
+            .field("stack_limit", &self.stack_limit)
             .field("features", &self.features)
             .field("stub_unsupported", &self.stub_unsupported)
             .finish_non_exhaustive()
@@ -256,6 +267,11 @@ impl WasmObjectModule {
         let table = obj.declare_table("__indirect_function_table");
         config.module.relocatable = true;
         config.module.stack_pointer_global = Some(sp.into());
+        config.module.stack_limit_global = None;
+        if options.stack_limit {
+            let limit = obj.declare_global("__stack_limit", ptr, Mutability::Mutable);
+            config.module.stack_limit_global = Some(limit.into());
+        }
         config.module.table_index = Some(table.into());
         config.module.tls_base_global = None;
         if options.threads {

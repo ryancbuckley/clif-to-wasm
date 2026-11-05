@@ -30,6 +30,14 @@ fn module_with_imports(import_names: Box<ImportNameFn>) -> WasmObjectModule {
 }
 
 fn module_with(address_type: AddressType, import_names: Box<ImportNameFn>) -> WasmObjectModule {
+    module_with_options(address_type, false, import_names)
+}
+
+fn module_with_options(
+    address_type: AddressType,
+    stack_limit: bool,
+    import_names: Box<ImportNameFn>,
+) -> WasmObjectModule {
     let flags = settings::Flags::new(settings::builder());
     let isa = object_module::frontend_isa(flags, address_type).unwrap();
     let mut config = Config::default();
@@ -40,6 +48,7 @@ fn module_with(address_type: AddressType, import_names: Box<ImportNameFn>) -> Wa
         ObjectOptions {
             config,
             threads: false,
+            stack_limit,
             features: vec!["bulk-memory".into(), "sign-ext".into()],
             stub_unsupported: false,
             libcall_names: cranelift_module::default_libcall_names(),
@@ -383,6 +392,52 @@ fn imports_from_other_modules() {
         [("wasi_snapshot_preview1".to_owned(), "random_get".to_owned())]
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The global imports of a wasm module, as (module, field).
+fn global_imports(wasm: &[u8]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        if let wasmparser::Payload::ImportSection(s) = payload.unwrap() {
+            for imp in s.into_imports() {
+                let imp = imp.unwrap();
+                if matches!(imp.ty, wasmparser::TypeRef::Global(_)) {
+                    out.push((imp.module.to_owned(), imp.name.to_owned()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Build an object file containing a function that allocates a stack frame.
+fn object_with_frame(stack_limit: bool) -> Vec<u8> {
+    let mut m = module_with_options(AddressType::I32, stack_limit, Box::new(|_| None));
+    let i32t = types::I32;
+    let f = m
+        .declare_function("framed", Linkage::Export, &sig(&[i32t], &[i32t]))
+        .unwrap();
+    define(&mut m, f, sig(&[i32t], &[i32t]), |_, b| {
+        let x = b.block_params(b.current_block().unwrap())[0];
+        let slot = b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 4, 2));
+        b.ins().stack_store(i32t, x, slot, 0);
+        let y = b.ins().stack_load(i32t, i32t, slot, 0);
+        b.ins().return_(&[y]);
+    });
+    m.finish()
+}
+
+#[test]
+fn stack_limit_is_imported_when_checked() {
+    let env = |name: &str| ("env".to_owned(), name.to_owned());
+    let checked = object_with_frame(true);
+    wasmparser::Validator::new().validate_all(&checked).unwrap();
+    assert_eq!(
+        global_imports(&checked),
+        [env("__stack_pointer"), env("__stack_limit")]
+    );
+    let unchecked = object_with_frame(false);
+    assert_eq!(global_imports(&unchecked), [env("__stack_pointer")]);
 }
 
 /// Object P takes function addresses (`get_seven() = &seven`, data

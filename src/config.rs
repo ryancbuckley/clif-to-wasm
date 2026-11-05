@@ -28,6 +28,14 @@ pub struct ModuleLayout {
     /// Mutable global holding the 16-byte-aligned, downward-growing shadow
     /// stack pointer. When `None`, functions requiring stack slots are rejected.
     pub stack_pointer_global: Option<GlobalIndex>,
+    /// Mutable global holding the lower bound of the downward-growing shadow
+    /// stack (`__stack_limit`). When set, any function that allocates space on
+    /// the shadow stack first checks that `sp >= limit + frame_size` and aborts
+    /// with `unreachable` if the new frame would go below `limit` (assuming
+    /// `limit + frame_size` does not overflow the address space).
+    /// Setting the global to `0` still catches frames large enough to wrap `sp`
+    /// below address `0`. When `None`, no stack-overflow check is emitted.
+    pub stack_limit_global: Option<GlobalIndex>,
     /// Mutable `i64` global backing `get_pinned_reg`/`set_pinned_reg`. When
     /// `None`, functions using the pinned register are rejected.
     pub pinned_reg_global: Option<GlobalIndex>,

@@ -205,12 +205,26 @@ impl<'ctx> Emitter<'ctx> {
             self.byval_base = byval_base;
             let fp = self.new_local(config.module.ptr_ty());
             self.frame = Some(Frame { fp, size, sp });
+            // Trap if allocating `size` bytes would push `sp` below `limit`
+            // (or if `sp` is already below `limit`). Checking `sp < limit + size`
+            // rather than `sp - size < limit` or `sp - limit < size` avoids
+            // unsigned underflow both when `size > sp` (which would wrap `sp - size`)
+            // and when unchecked code has already moved `sp` below `limit`
+            // (which would wrap `sp - limit`).
+            if let Some(limit) = config.module.stack_limit_global {
+                self.global_get(sp);
+                self.global_get(limit);
+                self.ptr_const(size as i64);
+                self.ptr_add();
+                self.ins(match config.module.address_type {
+                    AddressType::I32 => I::I32LtU,
+                    AddressType::I64 => I::I64LtU,
+                });
+                self.trap_if();
+            }
             self.global_get(sp);
             self.ptr_const(size as i64);
-            self.ins(match config.module.address_type {
-                AddressType::I32 => I::I32Sub,
-                AddressType::I64 => I::I64Sub,
-            });
+            self.ptr_sub();
             self.local_tee(fp);
             self.global_set(sp);
         }
@@ -470,6 +484,13 @@ impl<'ctx> Emitter<'ctx> {
         self.ins(match self.config.module.address_type {
             AddressType::I32 => I::I32Add,
             AddressType::I64 => I::I64Add,
+        })
+    }
+
+    pub(crate) fn ptr_sub(&mut self) {
+        self.ins(match self.config.module.address_type {
+            AddressType::I32 => I::I32Sub,
+            AddressType::I64 => I::I64Sub,
         })
     }
 

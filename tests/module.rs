@@ -245,6 +245,129 @@ fn jit_module_links_into_host() {
     );
 }
 
+const FRAMES: &str = "
+; The sum 0 + 1 + ... + n, keeping each term in a 1 KiB frame.
+function %deep(i32) -> i32 {
+    ss0 = explicit_slot 1024
+    fn0 = %deep(i32) -> i32
+block0(v0: i32):
+    v1 = stack_addr.i32 ss0
+    store v0, v1
+    brif v0, block1, block2
+block1:
+    v6 = iconst.i32 1
+    v2 = isub v0, v6
+    v3 = call fn0(v2)
+    v4 = load.i32 v1
+    v5 = iadd v3, v4
+    return v5
+block2:
+    return v0
+}
+
+; A frame larger than the whole stack: allocating it wraps below address 0.
+function %huge(i32) -> i32 {
+    ss0 = explicit_slot 100000
+block0(v0: i32):
+    v1 = stack_addr.i32 ss0
+    store v0, v1
+    v2 = load.i32 v1
+    return v2
+}
+";
+
+/// Instantiate [`FRAMES`] with `__stack_pointer` initialized to `STACK_TOP`
+/// and, when `checked` is true, a `__stack_limit` global initialized to 0.
+fn frames_instance(checked: bool) -> (Store<()>, Instance) {
+    let funcs = cranelift_reader::parse_functions(FRAMES).unwrap();
+    let mut b = ModuleBuilder::new();
+    let mem = b.define_memory(1, AddressType::I32);
+    let sp = b.define_global(ValType::I32, ConstExpr::i32_const(STACK_TOP));
+    let mut config = Config::default();
+    config.module.memory_index = mem;
+    config.module.stack_pointer_global = Some(sp);
+    b.export("sp", sp);
+    if checked {
+        let limit = b.define_global(ValType::I32, ConstExpr::i32_const(0));
+        config.module.stack_limit_global = Some(limit);
+        b.export("limit", limit);
+    }
+    add_functions(
+        &mut b,
+        &funcs,
+        &config,
+        HashMap::new(),
+        HashMap::new(),
+        |_, idx| idx.0 as u64,
+    );
+    let wasm = b.finish();
+    harness::validate(&wasm).unwrap();
+    let engine = Engine::default();
+    let mut store = Store::new(&engine, ());
+    let inst = Instance::new(&mut store, &Module::new(&engine, &wasm).unwrap(), &[]).unwrap();
+    (store, inst)
+}
+
+fn trap(err: wasmtime::Error) -> wasmtime::Trap {
+    *err.downcast_ref::<wasmtime::Trap>().expect("a trap")
+}
+
+#[test]
+fn stack_limit_traps_before_the_frame_crosses_it() {
+    let (mut store, inst) = frames_instance(true);
+    let deep = inst.get_typed_func::<i32, i32>(&mut store, "deep").unwrap();
+    let sp = inst.get_global(&mut store, "sp").unwrap();
+    let limit = inst.get_global(&mut store, "limit").unwrap();
+    // Room for exactly ten frames.
+    limit
+        .set(&mut store, (STACK_TOP - 10 * 1024).into())
+        .unwrap();
+    assert_eq!(deep.call(&mut store, 9).unwrap(), 45, "ten frames fit");
+    assert_eq!(sp.get(&mut store).i32(), Some(STACK_TOP));
+    assert_eq!(
+        trap(deep.call(&mut store, 10).unwrap_err()),
+        wasmtime::Trap::UnreachableCodeReached,
+        "the eleventh frame would cross the limit"
+    );
+}
+
+#[test]
+fn stack_limit_traps_when_already_below_it() {
+    // Simulate an unchecked caller (such as an LLVM-compiled function) that
+    // moved `sp` below `limit` before calling a checked function.
+    let (mut store, inst) = frames_instance(true);
+    let deep = inst.get_typed_func::<i32, i32>(&mut store, "deep").unwrap();
+    let sp = inst.get_global(&mut store, "sp").unwrap();
+    let limit = inst.get_global(&mut store, "limit").unwrap();
+    limit.set(&mut store, (STACK_TOP - 1024).into()).unwrap();
+    sp.set(&mut store, (STACK_TOP - 1040).into()).unwrap();
+    assert_eq!(
+        trap(deep.call(&mut store, 0).unwrap_err()),
+        wasmtime::Trap::UnreachableCodeReached
+    );
+}
+
+#[test]
+fn stack_limit_of_zero_catches_wrapping_frames() {
+    let (mut store, inst) = frames_instance(true);
+    let deep = inst.get_typed_func::<i32, i32>(&mut store, "deep").unwrap();
+    let huge = inst.get_typed_func::<i32, i32>(&mut store, "huge").unwrap();
+    assert_eq!(deep.call(&mut store, 20).unwrap(), 210);
+    assert_eq!(
+        trap(huge.call(&mut store, 1).unwrap_err()),
+        wasmtime::Trap::UnreachableCodeReached
+    );
+    // Without the stack-limit check, subtracting the frame size wraps `sp`
+    // near `u32::MAX`, so the frame allocation succeeds and the subsequent
+    // store traps out of bounds.
+    let (mut store, inst) = frames_instance(false);
+    let huge = inst.get_typed_func::<i32, i32>(&mut store, "huge").unwrap();
+    assert_eq!(
+        trap(huge.call(&mut store, 1).unwrap_err()),
+        wasmtime::Trap::MemoryOutOfBounds
+    );
+}
+
 /// An environment that only knows table slots.
 struct SlotsOnly;
 

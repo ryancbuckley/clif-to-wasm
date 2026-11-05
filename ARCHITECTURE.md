@@ -116,9 +116,13 @@ walking the dominator tree with an explicit task stack:
 `Emitter` walks the structured control-flow tree and emits WebAssembly
 instructions:
 - **Shadow stack frame**: If the function uses `stack_addr` or passes structs by
-  value, the prologue subtracts the frame size from the stack-pointer global
-  (`__stack_pointer`), keeping 16-byte alignment, and the epilogue restores it
-  before every return or tail call.
+  value, it subtracts its frame size from the stack-pointer global
+  (`__stack_pointer`) on entry, keeping 16-byte alignment, and restores it
+  before every return or tail call. Because WebAssembly linear memory has no
+  guard pages, `ModuleLayout::stack_limit_global` (`__stack_limit`) can
+  optionally be set to the lower bound of the stack; the function then traps on
+  entry if `sp < limit + size` instead of overflowing into memory below the
+  stack.
 - **Narrow integers (`i8`, `i16`)**: Stored in `i32` locals with their upper 24
   or 16 bits zeroed. Operations that can set high bits (`iadd`, `isub`, `imul`,
   `ineg`, `bnot`, `ishl`, `sshr`) mask the result back to 8 or 16 bits; signed
