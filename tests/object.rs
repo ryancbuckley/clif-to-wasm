@@ -43,18 +43,12 @@ fn module_with_options(
     let mut config = Config::default();
     config.module.address_type = address_type;
     config.module.demote_multi_results = true;
-    WasmObjectModule::new(
-        isa,
-        ObjectOptions {
-            config,
-            threads: false,
-            stack_limit,
-            features: vec!["bulk-memory".into(), "sign-ext".into()],
-            stub_unsupported: false,
-            libcall_names: cranelift_module::default_libcall_names(),
-            import_names,
-        },
-    )
+    let mut options = ObjectOptions::default();
+    options.config = config;
+    options.stack_limit = stack_limit;
+    options.features = vec!["bulk-memory".into(), "sign-ext".into()];
+    options.import_names = import_names;
+    WasmObjectModule::new(isa, options)
 }
 
 fn sig(params: &[types::Type], returns: &[types::Type]) -> Signature {

@@ -77,6 +77,7 @@ pub fn frontend_isa(
 }
 
 /// Settings for a [`WasmObjectModule`].
+#[non_exhaustive]
 pub struct ObjectOptions {
     /// Code generation settings. The module sets the relocatable layout
     /// (`ModuleLayout::relocatable`, the stack pointer and limit, table and

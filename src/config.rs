@@ -5,6 +5,7 @@ use wasm_encoder::ValType;
 
 /// Code generation settings.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct Config {
     /// Target module layout; must match the surrounding wasm module.
     pub module: ModuleLayout,
@@ -16,6 +17,7 @@ pub struct Config {
 
 /// Layout of the wasm module that will contain compiled functions.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct ModuleLayout {
     /// The address type of linear memory, 32-bit or 64-bit. This is also the wasm type of the
     /// shadow stack pointer.
@@ -103,6 +105,7 @@ impl AddressType {
 
 /// Wasm features available in the target engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct EngineFeatures {
     /// Emit wasm tail calls (`return_call` / `return_call_indirect`). When
     /// false, tail calls lower to a normal call followed by `return`.
@@ -117,6 +120,7 @@ impl Default for EngineFeatures {
 
 /// Codegen optimization switches (all enabled by default).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct Optimizations {
     /// Fold single-use values into expression trees on the operand stack
     /// (`expr_trees.rs`). When false, every non-constant value uses a local.
