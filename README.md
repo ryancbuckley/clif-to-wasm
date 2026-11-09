@@ -122,8 +122,8 @@ These return `Error::Unsupported`:
 cargo test --release                     # CLIF runtests + differential fuzzing
 cargo test --release --features module   # also links object files with rust-lld
 
-# Run Cranelift's upstream test suite (wasmtime v50.0.1 matches Cranelift 0.137.1):
-git clone --depth 1 --branch v50.0.1 --filter=blob:none --sparse \
+# Run Cranelift's upstream test suite from wasmtime's main branch:
+git clone --depth 1 --filter=blob:none --sparse \
     https://github.com/bytecodealliance/wasmtime
 (cd wasmtime && git sparse-checkout set cranelift/filetests/filetests/runtests)
 cargo run --release --example upstream -- wasmtime/cranelift/filetests/filetests/runtests
@@ -131,6 +131,10 @@ cargo run --release --example upstream -- wasmtime/cranelift/filetests/filetests
 # Print the WAT a CLIF file compiles to:
 cargo run --example clif2wat -- tests/clif/control.clif fib
 ```
+
+As of wasmtime commit `0eb6d77` (November 2026), all 24,099 `; run:` checks
+pass in 410 of the 411 upstream runtest files. The skipped file, `throw.clif`,
+uses `get_return_address` to test native stack unwinding.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for a walkthrough of the compiler passes,
 an annotated CLIF-to-WAT example, and details on the test suite.

@@ -257,7 +257,6 @@ block4(v16: i32):
 - `tests/object.rs` (`--features module`): Compiles functions and data into
   relocatable `.o` files via `WasmObjectModule`, links them with
   `rust-lld -flavor wasm`, and runs the linked module in Wasmtime.
-- `examples/upstream.rs`: Runs Cranelift's upstream filetest suite (14,043
-  `; run:` checks pass across 396 of 398 files; the two skipped files test
-  native stack unwinding via `get_return_address` and an interpreter-only
-  saturating float-to-`i128` behavior).
+- `examples/upstream.rs`: Runs Cranelift's upstream filetest suite (at wasmtime
+  commit `0eb6d77`, 24,099 `; run:` checks pass across 410 of 411 files; the
+  skipped file tests native stack unwinding via `get_return_address`).
