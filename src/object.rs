@@ -15,7 +15,7 @@
 //!
 //! [linking conventions]: https://github.com/WebAssembly/tool-conventions/blob/main/Linking.md
 
-use crate::{AddressType, CompiledFunction, RelocKind, TypeIndex};
+use crate::{AddendKind, AddressType, CompiledFunction, RelocKind, TypeIndex};
 use alloc::borrow::{Cow, ToOwned};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -619,7 +619,10 @@ impl ObjectBuilder {
                     | RelocKind::TableNumberLeb
                     | RelocKind::TagIndexLeb => index[r.index as usize] as i64,
                     RelocKind::TableIndexSleb | RelocKind::TableIndexSleb64 => 0,
-                    _ => sym_addr(r.index) as i64 + r.addend,
+                    // Do a wrapping add to avoid panicking if the addend is too big.
+                    // The field keeps only the low 32 or 64 bits of the sum, and
+                    // those don't depend on bits lost to i64 overflow.
+                    _ => (sym_addr(r.index) as i64).wrapping_add(r.addend),
                 };
                 patch(&mut body, r.offset as usize, r.kind, value);
                 code_relocs.push((base + r.offset, *r));
@@ -659,7 +662,8 @@ impl ObjectBuilder {
                 let value = if func {
                     0
                 } else {
-                    sym_addr(r.symbol.0) as i64 + r.addend
+                    // Do a wrapping add to avoid panicking if the addend is too big.
+                    (sym_addr(r.symbol.0) as i64).wrapping_add(r.addend)
                 };
                 patch(&mut bytes, r.offset as usize, kind, value);
                 data_relocs.push((
@@ -668,7 +672,11 @@ impl ObjectBuilder {
                         offset: r.offset,
                         kind,
                         index: r.symbol.0,
-                        addend: if func { 0 } else { r.addend },
+                        addend: match kind.addend_kind() {
+                            None => 0,
+                            Some(AddendKind::I32) => r.addend as i32 as i64,
+                            Some(AddendKind::I64) => r.addend,
+                        },
                     },
                 ));
             }
@@ -789,8 +797,10 @@ impl ObjectBuilder {
                 payload.push(r.kind as u8);
                 offset.encode(&mut payload);
                 r.index.encode(&mut payload);
-                if r.kind.has_addend() {
-                    r.addend.encode(&mut payload);
+                match r.kind.addend_kind() {
+                    Some(AddendKind::I32) => (r.addend as i32).encode(&mut payload),
+                    Some(AddendKind::I64) => r.addend.encode(&mut payload),
+                    None => (),
                 }
             }
             custom(&mut out, name, &payload);
@@ -950,6 +960,157 @@ mod tests {
                     "{kind:?}: bytes outside the field are untouched"
                 );
             }
+        }
+    }
+
+    /// An object with a data symbol `target` at a nonzero address and three
+    /// memory-address relocations against it: a data field with addend 0
+    /// (giving `target`'s address), and a data field and a code field
+    /// (`i32.const` / `i64.const`) both with addend `addend`.
+    fn object_with_addend(address_type: AddressType, addend: i64) -> Vec<u8> {
+        let wide = address_type == AddressType::I64;
+        let w = if wide { 8 } else { 4 };
+        let mut obj = ObjectBuilder::new(address_type);
+        // Placed first, so that `target` does not start at address 0.
+        let first = obj.declare_data("first", SymbolFlags::default(), DataStorage::Static);
+        obj.define_data(first, DataDef::new(vec![0; 8], 1, Mutability::Immutable));
+
+        // Two address fields and 4 spare bytes; the length tells the segment
+        // apart from `first`'s.
+        let target = obj.declare_data("target", SymbolFlags::default(), DataStorage::Static);
+        let mut def = DataDef::new(vec![0; 2 * w as usize + 4], 1, Mutability::Immutable);
+        def.relocs = vec![
+            DataReloc::new(0, target, 0),
+            DataReloc::new(w, target, addend),
+        ];
+        obj.define_data(target, def);
+
+        let ptr = if wide { ValType::I64 } else { ValType::I32 };
+        let f = obj.declare_function("addr", SymbolFlags::default(), &[], &[ptr]);
+        // `i32.const 0` or `i64.const 0` with a padded LEB at offset 1, then `end`.
+        let (op, kind, leb_len) = if wide {
+            (0x42, RelocKind::MemoryAddrSleb64, 10)
+        } else {
+            (0x41, RelocKind::MemoryAddrSleb, 5)
+        };
+        let mut body = vec![op];
+        body.extend(core::iter::repeat_n(0x80, leb_len - 1));
+        body.extend([0x00, 0x0b]);
+        obj.define_function(
+            f,
+            CompiledFunction {
+                params: Vec::new(),
+                results: vec![ptr],
+                locals: Vec::new(),
+                body,
+                relocs: vec![crate::Reloc {
+                    offset: 1,
+                    kind,
+                    index: target.0,
+                    addend,
+                }],
+            },
+        );
+        let bytes = obj.finish();
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&bytes)
+            .unwrap();
+        bytes
+    }
+
+    /// The pre-linked values in an object from [`object_with_addend`]:
+    /// `target`'s address, then the data field and the code field that add
+    /// `addend` to it.
+    fn prelinked_addresses(bytes: &[u8], address_type: AddressType) -> (u64, u64, u64) {
+        use wasmparser::{Operator, Payload};
+        let wide = address_type == AddressType::I64;
+        let w = if wide { 8 } else { 4 };
+        let read = |b: &[u8]| match wide {
+            true => u64::from_le_bytes(b[..8].try_into().unwrap()),
+            false => u32::from_le_bytes(b[..4].try_into().unwrap()).into(),
+        };
+        let (mut data, mut code) = (None, None);
+        for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+            match payload.unwrap() {
+                Payload::DataSection(s) => {
+                    for seg in s {
+                        let seg = seg.unwrap();
+                        if seg.data.len() == 2 * w + 4 {
+                            data = Some((read(seg.data), read(&seg.data[w..])));
+                        }
+                    }
+                }
+                Payload::CodeSectionEntry(body) => {
+                    let mut ops = body.get_operators_reader().unwrap();
+                    code = Some(match ops.read().unwrap() {
+                        Operator::I32Const { value } => u64::from(value as u32),
+                        Operator::I64Const { value } => value as u64,
+                        op => panic!("unexpected {op:?}"),
+                    });
+                }
+                _ => {}
+            }
+        }
+        let (base, data) = data.expect("target's data segment");
+        (base, data, code.expect("a function body"))
+    }
+
+    /// Addends of 32-bit memory-address relocations are `varint32` in
+    /// `reloc.*` sections, wrapped like the 32-bit address they add to;
+    /// 64-bit ones are `varint64` and kept whole.
+    #[test]
+    fn reloc_addend_encoding_matches_kind() {
+        let addend = 0x8000_0010;
+        for (address_type, encoded) in [
+            (AddressType::I32, i64::from(addend as u32 as i32)),
+            (AddressType::I64, addend),
+        ] {
+            let bytes = object_with_addend(address_type, addend);
+            let mut addends = Vec::new();
+            for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+                if let wasmparser::Payload::CustomSection(c) = payload.unwrap()
+                    && let wasmparser::KnownCustom::Reloc(reloc) = c.as_known()
+                {
+                    for entry in reloc.entries() {
+                        // Fails on an addend too long for its kind.
+                        addends.push(entry.unwrap().addend);
+                    }
+                }
+            }
+            addends.sort();
+            let mut want = vec![0, encoded, encoded];
+            want.sort();
+            assert_eq!(addends, want, "{address_type:?}: reloc addends");
+
+            // The pre-linked fields agree with the encoded addend.
+            let (base, data, code) = prelinked_addresses(&bytes, address_type);
+            let expected = match address_type {
+                AddressType::I32 => u64::from((base as u32).wrapping_add(addend as u32)),
+                AddressType::I64 => base.wrapping_add(addend as u64),
+            };
+            assert_eq!(data, expected, "{address_type:?}: data field");
+            assert_eq!(code, expected, "{address_type:?}: code field");
+        }
+    }
+
+    /// Adding an addend to a symbol's address wraps rather than overflowing
+    /// `i64`, as address arithmetic does at run time.
+    #[test]
+    fn reloc_address_arithmetic_wraps() {
+        let addend = i64::MAX;
+        for address_type in [AddressType::I32, AddressType::I64] {
+            let bytes = object_with_addend(address_type, addend);
+            let (base, data, code) = prelinked_addresses(&bytes, address_type);
+            assert_ne!(
+                base, 0,
+                "target must not be at address 0, or nothing overflows"
+            );
+            let expected = match address_type {
+                AddressType::I32 => u64::from((base as u32).wrapping_add(addend as u32)),
+                AddressType::I64 => base.wrapping_add(addend as u64),
+            };
+            assert_eq!(data, expected, "{address_type:?}: data field");
+            assert_eq!(code, expected, "{address_type:?}: code field");
         }
     }
 }

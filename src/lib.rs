@@ -112,7 +112,7 @@ pub mod object_module;
 mod structure;
 mod wasm_types;
 
-pub use compile::{CompiledFunction, Reloc, RelocKind, compile_function};
+pub use compile::{AddendKind, CompiledFunction, Reloc, RelocKind, compile_function};
 pub use config::{AddressType, Config, EngineFeatures, ModuleLayout, Optimizations};
 pub use env::{Env, Name, SymbolValue};
 pub use error::{Error, Result};

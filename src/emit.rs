@@ -838,9 +838,9 @@ impl Body {
     }
 
     fn sleb32(&mut self, kind: RelocKind, index: u32, addend: i64) {
+        let addend = addend as i32 as i64;
         self.reloc(kind, index, addend);
-        self.bytes
-            .extend_from_slice(&padded_leb::<5>(addend as i32 as i64));
+        self.bytes.extend_from_slice(&padded_leb::<5>(addend));
     }
 
     fn sleb64(&mut self, kind: RelocKind, index: u32, addend: i64) {
@@ -1142,5 +1142,127 @@ mod tests {
             crate::Error::Unsupported("stack frame size overflow".into()),
             "a frame larger than the address space must be rejected"
         );
+    }
+
+    /// `symbol_value` adds the global value's offset to a constant symbol
+    /// value with wrapping arithmetic, like `iadd`, instead of overflowing.
+    #[test]
+    fn symbol_value_const_offset_wraps() {
+        use cranelift_codegen::cursor::{Cursor, FuncCursor};
+        use cranelift_codegen::ir::immediates::Imm64;
+        use cranelift_codegen::ir::{AbiParam, ExternalName, GlobalValueData, InstBuilder};
+
+        struct ConstEnv;
+        impl Env for ConstEnv {
+            fn func_index(&mut self, name: Name<'_>) -> Result<FuncIndex> {
+                Err(crate::Error::Env(name.to_string()))
+            }
+            fn symbol_value(&mut self, _: Name<'_>) -> Result<crate::SymbolValue> {
+                // Adding a positive offset overflows `i64` (the `c as i64` in
+                // `lower.rs`), not just `u64`.
+                Ok(crate::SymbolValue::Const(i64::MAX as u64))
+            }
+        }
+
+        let mut func = Function::new();
+        func.signature.returns.push(AbiParam::new(types::I64));
+        let gv = func.create_global_value(GlobalValueData::Symbol {
+            name: ExternalName::testcase("sym"),
+            offset: Imm64::new(8),
+            colocated: true,
+            tls: false,
+        });
+        let b0 = func.dfg.make_block();
+        func.layout.append_block(b0);
+        let mut pos = FuncCursor::new(&mut func).at_bottom(b0);
+        let v = pos.ins().symbol_value(types::I64, gv);
+        pos.ins().return_(&[v]);
+
+        let compiled = crate::compile_function(&func, &Config::default(), &mut ConstEnv).unwrap();
+        let consts: Vec<i64> = OperatorsReader::new(BinaryReader::new(&compiled.body, 0))
+            .into_iter()
+            .filter_map(|op| match op.unwrap() {
+                Operator::I64Const { value } => Some(value),
+                _ => None,
+            })
+            .collect();
+        // i64::MAX + 8 wraps to i64::MIN + 7.
+        assert_eq!(consts, [i64::MIN + 7], "the symbol's value plus its offset");
+    }
+
+    /// A 32-bit address relocation records its addend wrapped to `i32`, the
+    /// value its field holds, so `CompiledFunction::relocs` never carries an
+    /// addend too large for its kind. 64-bit ones keep the whole addend.
+    #[test]
+    fn reloc_addend_fits_its_kind() {
+        use cranelift_codegen::cursor::{Cursor, FuncCursor};
+        use cranelift_codegen::ir::immediates::Imm64;
+        use cranelift_codegen::ir::{AbiParam, ExternalName, GlobalValueData, InstBuilder};
+
+        struct SymbolEnv;
+        impl Env for SymbolEnv {
+            fn func_index(&mut self, name: Name<'_>) -> Result<FuncIndex> {
+                Err(crate::Error::Env(name.to_string()))
+            }
+            fn symbol_value(&mut self, _: Name<'_>) -> Result<crate::SymbolValue> {
+                Ok(crate::SymbolValue::Symbol(crate::SymbolId(3)))
+            }
+        }
+
+        let offset = 0x8000_0010;
+        for (address_type, ty, kind, addend) in [
+            (
+                crate::AddressType::I32,
+                types::I32,
+                RelocKind::MemoryAddrSleb,
+                i64::from(offset as u32 as i32),
+            ),
+            (
+                crate::AddressType::I64,
+                types::I64,
+                RelocKind::MemoryAddrSleb64,
+                offset,
+            ),
+        ] {
+            let mut func = Function::new();
+            func.signature.returns.push(AbiParam::new(ty));
+            let gv = func.create_global_value(GlobalValueData::Symbol {
+                name: ExternalName::testcase("sym"),
+                offset: Imm64::new(offset),
+                colocated: true,
+                tls: false,
+            });
+            let b0 = func.dfg.make_block();
+            func.layout.append_block(b0);
+            let mut pos = FuncCursor::new(&mut func).at_bottom(b0);
+            let v = pos.ins().symbol_value(ty, gv);
+            pos.ins().return_(&[v]);
+
+            let mut config = Config::default();
+            config.module.address_type = address_type;
+            config.module.relocatable = true;
+            let compiled = crate::compile_function(&func, &config, &mut SymbolEnv).unwrap();
+
+            let [r] = &compiled.relocs[..] else {
+                panic!(
+                    "{address_type:?}: expected one relocation, got {:?}",
+                    compiled.relocs
+                );
+            };
+            assert_eq!(r.kind, kind, "{address_type:?}: relocation kind");
+            assert_eq!(r.index, 3, "{address_type:?}: relocation symbol");
+            assert_eq!(r.addend, addend, "{address_type:?}: relocation addend");
+
+            // The relocated field holds the same addend before linking.
+            let consts: Vec<i64> = OperatorsReader::new(BinaryReader::new(&compiled.body, 0))
+                .into_iter()
+                .filter_map(|op| match op.unwrap() {
+                    Operator::I32Const { value } => Some(value.into()),
+                    Operator::I64Const { value } => Some(value),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(consts, [addend], "{address_type:?}: relocated field");
+        }
     }
 }

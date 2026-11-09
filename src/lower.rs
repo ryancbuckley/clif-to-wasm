@@ -685,7 +685,8 @@ impl Emitter<'_> {
                     self.ptr_to(ty)?;
                 }
                 match self.env.symbol_value(Name::resolve(func, name))? {
-                    SymbolValue::Const(c) => self.iconst(ty, c as i64 + offset),
+                    // Use wrapping_add because CLIF offset arithmetic wraps.
+                    SymbolValue::Const(c) => self.iconst(ty, (c as i64).wrapping_add(offset)),
                     SymbolValue::Global(g) => {
                         self.global_get(g);
                         if offset != 0 {

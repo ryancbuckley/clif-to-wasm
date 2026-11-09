@@ -66,6 +66,15 @@ pub struct Reloc {
     pub addend: i64,
 }
 
+/// For a reloc with an addend, whether the addend is 32 or 64 bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AddendKind {
+    /// 32-bit addend.
+    I32,
+    /// 64-bit addend.
+    I64,
+}
+
 /// Relocation type codes from the [WebAssembly linking conventions](https://github.com/WebAssembly/tool-conventions/blob/main/Linking.md#relocation-sections).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -110,18 +119,22 @@ pub enum RelocKind {
 }
 
 impl RelocKind {
-    /// Whether this relocation kind carries an addend in the binary format.
-    pub fn has_addend(self) -> bool {
+    /// The width of this kind's addend, or `None` if it has none.
+    ///
+    /// Memory-address kinds carry an addend. In `reloc.*` sections it is a
+    /// `varint32` for 32-bit addresses ([`AddendKind::I32`]) and a `varint64`
+    /// for 64-bit ones ([`AddendKind::I64`]). A 32-bit address is computed
+    /// modulo 2^32 so only the addend's low 32 bits matter. Index and
+    /// table-slot kinds have no addend.
+    pub fn addend_kind(self) -> Option<AddendKind> {
+        use AddendKind::*;
         use RelocKind::*;
-        matches!(
-            self,
-            MemoryAddrSleb
-                | MemoryAddrI32
-                | MemoryAddrSleb64
-                | MemoryAddrI64
-                | MemoryAddrTlsSleb
-                | MemoryAddrTlsSleb64
-        )
+        match self {
+            MemoryAddrSleb | MemoryAddrI32 | MemoryAddrTlsSleb => Some(I32),
+            MemoryAddrSleb64 | MemoryAddrI64 | MemoryAddrTlsSleb64 => Some(I64),
+            FunctionIndexLeb | TableIndexSleb | TableIndexI32 | TypeIndexLeb | GlobalIndexLeb
+            | TagIndexLeb | TableIndexSleb64 | TableIndexI64 | TableNumberLeb => None,
+        }
     }
 }
 
