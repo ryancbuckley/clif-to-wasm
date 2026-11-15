@@ -33,7 +33,7 @@ cranelift-interpreter = "0.137.1"
 cranelift-module = "0.137.1"
 cranelift-reader = "0.137.1"
 proptest = "1.12.0"
-target-lexicon = "0.13.5"
+target-lexicon = "0.13.6"
 wasmparser = "0.263"
 wasmprinter = "0.263"
 wasmtime = { version = "50.0.1", default-features = false, features = ["cranelift", "runtime", "std", "threads", "gc", "gc-drc"] }
